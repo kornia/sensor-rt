@@ -1,0 +1,17 @@
+[workspace]
+name = "sensor-rt"
+channels = ["conda-forge"]
+platforms = ["linux-aarch64"]
+
+# GStreamer + libnvbufsurface (for sensor-rtsp / nvbuf-sys) are SYSTEM/JetPack,
+# not conda — so there are no conda [dependencies] here. pixi only pins the build
+# job cap and the convenience tasks.
+
+[activation.env]
+# Orin Nano ~7.4 GB RAM — cap parallel cargo so heavy template builds don't OOM.
+CARGO_BUILD_JOBS = "2"
+
+[tasks]
+build = "cargo build --release"
+check = "cargo check"
+fmt = "cargo fmt --all"
