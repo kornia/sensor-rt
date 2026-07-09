@@ -1,0 +1,10 @@
+/target/
+**/*.rs.bk
+.DS_Store
+
+# generated PNGs from rtsp_grab
+/*.png
+/out.png
+
+# pixi / local
+.pixi/
