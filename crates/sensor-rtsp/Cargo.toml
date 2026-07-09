@@ -1,0 +1,24 @@
+[package]
+name = "sensor-rtsp"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish = false
+description = "RTSP/H.264 camera source with Jetson NVMM decode (GStreamer); produces a kornia Image"
+
+[lib]
+name = "sensor_rtsp"
+
+[dependencies]
+nvbuf-sys     = { workspace = true }
+gstreamer     = { workspace = true }
+gstreamer-app = { workspace = true }
+kornia-image  = { workspace = true }
+kornia-tensor = { workspace = true }
+thiserror     = { workspace = true }
+cudarc        = { workspace = true }
+
+# Examples only (crates/sensor-rtsp/examples/). `rtsp_grab` saves a PNG.
+[dev-dependencies]
+kornia-io  = { workspace = true }
+env_logger = { workspace = true }
