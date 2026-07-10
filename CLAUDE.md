@@ -37,6 +37,13 @@ sink pad (`parse_bin_from_description(.., true)`) — a direct cross-bin link
 silently drops all frames. Non-video pads (e.g. a camera's audio) are drained to a
 `fakesink` so an unlinked pad can't stall the pipeline.
 
+`examples/rtsp_rfdetr` shows the full `source → model` pipeline: the RGB frame
+goes straight to RF-DETR on the same stream, one sync/frame (the source already
+emits model-ready RGB, so no preprocess copy). It's gated behind the
+**`rfdetr-example`** feature, which pulls the private `vrt-rfdetr` (optional dep,
+feature `hub`) — so the default build/test stays vrt-free and hosted-CI-buildable.
+Run with `--features rfdetr-example` and `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
+
 ## Hard constraints
 
 - **GStreamer + libnvbufsurface are system/JetPack** (build + runtime) — NOT conda.

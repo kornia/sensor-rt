@@ -17,8 +17,21 @@ kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
 thiserror     = { workspace = true }
 cudarc        = { workspace = true }
+# Only the `rtsp_rfdetr` example uses this (the library is vrt-free). Optional +
+# feature-gated so the default build/test never pulls the private git dep + CUDA —
+# keeps the hosted CI (`cargo test --lib`) buildable off-Jetson.
+vrt-rfdetr = { workspace = true, features = ["hub"], optional = true }
 
-# Examples only (crates/sensor-rtsp/examples/). `rtsp_grab` saves a PNG.
+[features]
+# Enables the `rtsp_rfdetr` example — pulls the private vrt-rfdetr git dep + its
+# prebuilt HF engine (needs CARGO_NET_GIT_FETCH_WITH_CLI=true).
+rfdetr-example = ["dep:vrt-rfdetr"]
+
+# Examples in crates/sensor-rtsp/examples/. `rtsp_grab` saves a PNG (vrt-free).
 [dev-dependencies]
 kornia-io  = { workspace = true }
 env_logger = { workspace = true }
+
+[[example]]
+name = "rtsp_rfdetr"
+required-features = ["rfdetr-example"]

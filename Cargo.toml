@@ -33,6 +33,11 @@ cudarc = { version = "0.19", default-features = false, features = [
 kornia-image  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-tensor = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-io     = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
+# vision-rt models (private) — pinned to a fixed rev. Used ONLY by the model
+# example crates/sensor-rtsp/examples/rtsp_rfdetr.rs (a dev-dependency); the
+# sensor-rtsp library itself stays vrt-free. Cloning needs the git CLI creds:
+#   export CARGO_NET_GIT_FETCH_WITH_CLI=true
+vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "7804fa8d5942b8bf44e50badeded752668bf722f" }
 # sensor-rt internal crates
 nvbuf-sys   = { path = "crates/nvbuf-sys" }
 sensor-rtsp = { path = "crates/sensor-rtsp" }

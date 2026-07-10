@@ -26,6 +26,7 @@ Examples live inside the `sensor-rtsp` crate (`crates/sensor-rtsp/examples/`):
 | Example | Role |
 |---------|------|
 | `rtsp_grab` | Minimal, **vrt-free**: connect, grab a few frames, save one PNG |
+| `rtsp_rfdetr` | RTSP → **RF-DETR** detection, device end-to-end (`source → model`, one sync/frame; dev-dep on the private [`vrt-rfdetr`](https://github.com/kornia/vision-rt)) |
 
 ## Usage
 
@@ -66,6 +67,12 @@ and runtime), not conda:
 export CARGO_BUILD_JOBS=2               # 7.4 GB Orin OOMs on parallel native builds
 cargo build -j2                         # library + nvbuf-sys (vrt-free)
 cargo run --release -p sensor-rtsp --example rtsp_grab -- rtsp://<camera>/stream out.png
+
+# rtsp_rfdetr is gated behind the `rfdetr-example` feature — it pulls the private
+# vrt-rfdetr dep + its prebuilt HF engine (so default builds/tests stay vrt-free):
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+cargo run --release -p sensor-rtsp --example rtsp_rfdetr \
+    --features rfdetr-example -- rtsp://<camera>/stream 0.5
 ```
 
 CI on a hosted runner: `cargo fmt --all --check` + the pure-logic **unit tests**
