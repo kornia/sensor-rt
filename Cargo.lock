@@ -5484,7 +5484,7 @@ dependencies = [
 [[package]]
 name = "trt-sys"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=52eb7fca47ec1af7d3525773125438690b4b3606#52eb7fca47ec1af7d3525773125438690b4b3606"
+source = "git+https://github.com/kornia/vision-rt?rev=4875aa1d6e24f67f0335f46f89ecea0391e1bfa1#4875aa1d6e24f67f0335f46f89ecea0391e1bfa1"
 dependencies = [
  "bindgen",
  "cc",
@@ -5685,7 +5685,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vrt"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=52eb7fca47ec1af7d3525773125438690b4b3606#52eb7fca47ec1af7d3525773125438690b4b3606"
+source = "git+https://github.com/kornia/vision-rt?rev=4875aa1d6e24f67f0335f46f89ecea0391e1bfa1#4875aa1d6e24f67f0335f46f89ecea0391e1bfa1"
 dependencies = [
  "cudarc",
  "half",
@@ -5698,7 +5698,7 @@ dependencies = [
 [[package]]
 name = "vrt-hub"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=52eb7fca47ec1af7d3525773125438690b4b3606#52eb7fca47ec1af7d3525773125438690b4b3606"
+source = "git+https://github.com/kornia/vision-rt?rev=4875aa1d6e24f67f0335f46f89ecea0391e1bfa1#4875aa1d6e24f67f0335f46f89ecea0391e1bfa1"
 dependencies = [
  "cudarc",
  "hf-hub",
@@ -5710,7 +5710,7 @@ dependencies = [
 [[package]]
 name = "vrt-rfdetr"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=52eb7fca47ec1af7d3525773125438690b4b3606#52eb7fca47ec1af7d3525773125438690b4b3606"
+source = "git+https://github.com/kornia/vision-rt?rev=4875aa1d6e24f67f0335f46f89ecea0391e1bfa1#4875aa1d6e24f67f0335f46f89ecea0391e1bfa1"
 dependencies = [
  "cudarc",
  "kornia-image",
@@ -5723,7 +5723,7 @@ dependencies = [
 [[package]]
 name = "vrt-xfeat"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=52eb7fca47ec1af7d3525773125438690b4b3606#52eb7fca47ec1af7d3525773125438690b4b3606"
+source = "git+https://github.com/kornia/vision-rt?rev=4875aa1d6e24f67f0335f46f89ecea0391e1bfa1#4875aa1d6e24f67f0335f46f89ecea0391e1bfa1"
 dependencies = [
  "cudarc",
  "kornia-image",
