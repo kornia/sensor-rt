@@ -1,19 +1,17 @@
-//! OAK-D camera source: synced **device RGB + aligned depth (host, uint16 mm) +
-//! factory intrinsics**, plus a stereo-pair + IMU modality (see [`stereo`]).
+//! OAK-D camera source: synced **host RGB + aligned depth (uint16 mm) + factory
+//! intrinsics**, plus a stereo-pair + IMU modality (see [`stereo`]).
 //! Safe wrapper over the bundled depthai-core C shim (`oak_bridge.h`).
 //!
 //! Same shape as the RTSP source: a `next_frame()` loop. The OAK computes stereo
-//! depth on its own VPU, so there is no depth model on the host. RGB is uploaded
-//! H2D into a reused device buffer; depth stays on the CPU (sampled per-box —
-//! cheap). 3D points are in the **camera frame**.
+//! depth on its own VPU, so there is no depth model on the host. **Nothing here
+//! touches CUDA**: frames come out on the host and the consumer owns any upload.
+//! 3D points are in the **camera frame**.
 
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
 
-use cudarc::driver::CudaStream;
-use kornia_image::Image;
-use kornia_tensor::Tensor;
+use kornia_image::{Image, ImageSize};
 use sensor_types::FrameMeta;
+
 /// Boxed error, `Send + Sync` so a source can be moved between threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -41,22 +39,20 @@ mod stereo;
 pub use depth::OakDepthMap;
 pub use stereo::{ImuSample, StereoFrame};
 
-/// One synced OAK frame: RGB on the device, optional aligned depth on the host.
+/// One synced OAK frame: RGB plus optional aligned depth, both on the host.
 ///
 /// **Both buffers are borrowed from the source and only valid until the next
 /// [`OakSource::next_frame`].** The `'a` lifetime ties this frame to the `&mut
 /// OakSource` borrow, so the borrow checker forbids pulling the next frame while
 /// this one (or anything it lent out) is still held — preventing use-after-free
-/// of the reused RGB device buffer and the borrowed depth buffer.
+/// of the borrowed device buffers.
 pub struct OakFrame<'a> {
-    // All views are borrowed from the source and valid only until the next poll (so they must
-    // NOT be movable out of the frame). `rgb_host` is the shim's RGB888 span (always present);
-    // `rgb_device` is the H2D-uploaded image, built only on the upload (detection) path.
+    // Borrowed from the source and valid only until the next poll, so they must NOT
+    // be movable out of the frame.
     rgb_host: &'a [u8],
     meta: FrameMeta,
     width: u32,
     height: u32,
-    rgb_device: Option<&'a Image<u8, 3>>,
     depth: Option<OakDepthMap>,
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
@@ -77,17 +73,23 @@ impl OakFrame<'_> {
     pub fn height(&self) -> u32 {
         self.height
     }
-    /// RGB as a device kornia [`Image`] (uploaded H2D) — present only when opened with
-    /// [`OakSource::open`] (the detection path); `None` for the host-only
-    /// [`OakSource::open_host`] path. Pair with [`OakFrame::meta`] for the stamp.
-    pub fn rgb_device(&self) -> Option<&Image<u8, 3>> {
-        self.rgb_device
-    }
-    /// Device RGB image. Panics if the source was opened host-only; kept for the detection
-    /// examples that always upload. Borrowed — valid only while this frame is held.
-    pub fn rgb(&self) -> &Image<u8, 3> {
-        self.rgb_device
-            .expect("OakFrame::rgb() needs OakSource::open (upload); use rgb_host()/rgb_device()")
+    /// RGB as an owned **host** kornia [`Image`], ready to hand to CPU code or to
+    /// push to the GPU with kornia's `to_cuda_image(&stream)`.
+    ///
+    /// This **copies** `w*h*3` bytes, because a kornia `Image` owns its buffer while
+    /// [`rgb_host`](Self::rgb_host) only borrows the device's. For a per-frame hot
+    /// loop, prefer `rgb_host()` straight into your own reused device buffer — that
+    /// path stays copy-free on the host. Use this when the convenience is worth one
+    /// memcpy (~2.7 MB at 1280x720).
+    pub fn rgb_image(&self) -> Result<Image<u8, 3>, BoxError> {
+        Image::new(
+            ImageSize {
+                width: self.width as usize,
+                height: self.height as usize,
+            },
+            self.rgb_host.to_vec(),
+        )
+        .map_err(|e| format!("build host Image<u8,3>: {e}").into())
     }
     /// Aligned depth map, if the device has a stereo pair. Borrowed — same "valid only while this
     /// frame is held" contract as [`rgb_host`](Self::rgb_host).
@@ -99,9 +101,6 @@ impl OakFrame<'_> {
 /// OAK-D source. `open` then `next_frame()` in a loop (like `RtspSource`).
 pub struct OakSource {
     dev: *mut ffi::OakDevice,
-    stream: Option<Arc<CudaStream>>, // Some only on the upload (detection) path; None for pure encoders
-    rgb_img: Option<Image<u8, 3>>,   // reused device RGB888 image; None when host-only
-    upload: bool,                    // upload RGB H2D (detection) vs host-only (pure encoders)
     h264: bool, // device also runs a standalone H.264 colour stream (next_video)
     width: u32,
     height: u32,
@@ -122,51 +121,15 @@ pub struct OakSource {
 unsafe impl Send for OakSource {}
 
 impl OakSource {
-    /// Open an OAK device and start an RGB(+aligned depth) pipeline, uploading each RGB frame H2D into
-    /// a reused device buffer (the detection path). `device` selects the camera: `None` = first
-    /// available; `Some(id)` = a specific MxId (USB or PoE) or IP (PoE). `stream` is the shared CUDA
-    /// stream.
-    pub fn open(
-        device: Option<&str>,
-        width: u32,
-        height: u32,
-        fps: u32,
-        stream: Arc<CudaStream>,
-    ) -> Result<Self, BoxError> {
-        Self::open_inner(
-            device,
-            width,
-            height,
-            fps,
-            Some(stream),
-            true,
-            false,
-            true,
-            false,
-        )
-    }
-
-    /// Open host-only: skip the GPU alloc + the per-frame H2D. Frames expose [`OakFrame::rgb_host`]
-    /// (the shim's raw RGB888 span) but not a device image — for nodes that never touch CUDA, so there
-    /// are zero device copies. `device`: see [`OakSource::open`].
-    pub fn open_host(
-        device: Option<&str>,
-        width: u32,
-        height: u32,
-        fps: u32,
-        stream: Arc<CudaStream>,
-    ) -> Result<Self, BoxError> {
-        Self::open_inner(
-            device,
-            width,
-            height,
-            fps,
-            Some(stream),
-            false,
-            false,
-            true,
-            false,
-        )
+    /// Open an OAK device and start an RGB(+aligned depth) pipeline. `device` selects the camera:
+    /// `None` = first available; `Some(id)` = a specific MxId (USB or PoE) or IP (PoE).
+    ///
+    /// Takes **no CUDA stream**: this driver never touches the GPU. Frames arrive on the host —
+    /// [`OakFrame::rgb_host`] (borrowed, copy-free) or [`OakFrame::rgb_image`] (owned) — and a
+    /// consumer that wants them on the device owns that upload and the stream it runs on. That keeps
+    /// the driver a plain producer and keeps CUDA out of processes that only want pixels.
+    pub fn open(device: Option<&str>, width: u32, height: u32, fps: u32) -> Result<Self, BoxError> {
+        Self::open_inner(device, width, height, fps, false, true, false)
     }
 
     /// Open **no-stereo**: the on-device H.264 encoder plus a raw RGB888 stream, and NO StereoDepth —
@@ -187,7 +150,7 @@ impl OakSource {
         height: u32,
         fps: u32,
     ) -> Result<Self, BoxError> {
-        Self::open_inner(device, width, height, fps, None, false, true, false, true)
+        Self::open_inner(device, width, height, fps, true, false, true)
     }
 
     /// Open host-only **plus an on-device hardware H.264 colour stream**: the synced [`OakFrame`] carries
@@ -204,7 +167,7 @@ impl OakSource {
         fps: u32,
         depth: bool,
     ) -> Result<Self, BoxError> {
-        Self::open_inner(device, width, height, fps, None, false, true, depth, false)
+        Self::open_inner(device, width, height, fps, true, depth, false)
     }
 
     // Private funnel for the open_* variants; the trailing bools are all set by
@@ -215,8 +178,6 @@ impl OakSource {
         width: u32,
         height: u32,
         fps: u32,
-        stream: Option<Arc<CudaStream>>,
-        upload: bool,
         h264: bool,
         depth: bool,
         video_only: bool,
@@ -244,15 +205,7 @@ impl OakSource {
                 .into_owned();
             return Err(format!("oak_open failed: {e}").into());
         }
-        let rgb_img = if upload {
-            let s = stream
-                .as_ref()
-                .ok_or("upload path requires a CUDA stream (use OakSource::open)")?;
-            Some(alloc_rgb_image(s, width, height)?)
-        } else {
-            None
-        };
-        Self::from_open_device(dev, width, height, stream, rgb_img, upload)
+        Self::from_open_device(dev, width, height)
     }
 
     /// Wrap a device the shim has already opened, reading every capability back
@@ -268,17 +221,11 @@ impl OakSource {
         dev: *mut ffi::OakDevice,
         width: u32,
         height: u32,
-        stream: Option<Arc<CudaStream>>,
-        rgb_img: Option<Image<u8, 3>>,
-        upload: bool,
     ) -> Result<Self, BoxError> {
         let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
         unsafe { ffi::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
         Ok(Self {
             dev,
-            stream,
-            rgb_img,
-            upload,
             // Read back, not assumed: the shim may decline to build the encoder.
             h264: unsafe { ffi::oak_has_video(dev) } != 0,
             width,
@@ -305,18 +252,6 @@ impl OakSource {
     pub fn intrinsics(&self) -> OakIntrinsics {
         self.intr
     }
-    /// The shared CUDA stream the RGB upload runs on. **Build the consuming model
-    /// with this stream** (e.g. `RfDetr::new(engine, cam.cuda_stream(), …)`): the
-    /// per-frame H2D upload is enqueued async on it, so a consumer on the same
-    /// stream sees a completed transfer after the usual single per-frame sync,
-    /// while a consumer on a *different* stream would race the upload.
-    /// Only the upload path ([`OakSource::open`] / [`OakSource::open_host`]) carries a stream;
-    /// panics on a video-only / decoupled source, which never touches the GPU.
-    pub fn cuda_stream(&self) -> Arc<CudaStream> {
-        self.stream
-            .clone()
-            .expect("cuda_stream() is only valid on an upload OakSource (open/open_host)")
-    }
     pub fn has_depth(&self) -> bool {
         self.has_depth
     }
@@ -333,14 +268,14 @@ impl OakSource {
         self.height
     }
 
-    /// Pull the next synced frame: RGB888 uploaded H2D into a reused device
-    /// `VrtImage` (valid until the next call), plus the borrowed aligned depth map.
+    /// Pull the next synced frame: the borrowed RGB888 span plus the borrowed
+    /// aligned depth map, both valid only until the next call.
     ///
-    /// This is the **only copy** in the OAK path: one host→device upload of the
-    /// 3-channel RGB. The shim hands out depthai's RGB and depth buffers directly
-    /// (no host repack, no depth copy), and the detector preprocessor consumes
-    /// RGB888 natively (no 3→4 expansion). Both borrowed buffers are valid only
-    /// until the next `next_frame`.
+    /// **Zero copies.** The shim hands out depthai's RGB and depth buffers directly
+    /// (no host repack, no depth copy) and this driver adds nothing on top. A
+    /// consumer that wants the frame on the GPU uploads the span into its own
+    /// buffer — see [`OakFrame::rgb_host`] — or takes an owned host image via
+    /// [`OakFrame::rgb_image`] at the cost of one memcpy.
     pub fn next_frame(&mut self) -> Option<OakFrame<'_>> {
         let mut rgb: *const u8 = std::ptr::null();
         let mut depth: *const u16 = std::ptr::null();
@@ -395,35 +330,12 @@ impl OakSource {
             source_id: None,
         };
 
-        // Detection path only: upload RGB888 H2D into the reused device image (tightly
-        // packed RGB8 — exactly what kornia's Preprocessor + the vrt models consume).
-        // Host-only callers skip this entirely (no alloc, no copy, no device image).
-        let rgb_device = if self.upload {
-            // The upload path requires raw RGB888 (w*h*3). If the shim ever hands
-            // back a different length (e.g. an encoded stream), skip the upload
-            // rather than copy a mismatched byte count into the device buffer.
-            if host.len() != npx * 3 {
-                return None;
-            }
-            // `upload` is only ever set by the stream-carrying constructors, so this is Some.
-            let stream = self.stream.as_ref()?;
-            let need = self
-                .rgb_img
-                .as_ref()
-                .and_then(|i| i.as_cudaslice())
-                .is_none_or(|s| s.len() != npx * 3);
-            if need {
-                self.rgb_img = Some(alloc_rgb_image(stream, w, h).ok()?);
-            }
-            let img = self.rgb_img.as_mut().unwrap();
-            let dst = img.as_cudaslice_mut()?;
-            stream.memcpy_htod(host, dst).ok()?;
-            // Borrow the persistent image for this frame; valid until the next
-            // next_frame() overwrites it (the `'a` borrow enforces that).
-            self.rgb_img.as_ref()
-        } else {
-            None
-        };
+        // Raw frames must be RGB888 (w*h*3). If the shim ever hands back a different
+        // length (e.g. an encoded stream), refuse the frame rather than hand out a
+        // span whose documented shape is a lie.
+        if host.len() != npx * 3 {
+            return None;
+        }
 
         // Zero-copy: borrow the OAK's aligned depth buffer (valid until next poll). Depth carries its OWN
         // dims (dw×dh) — it may be a downscaled grid aligned to the RGB, so consumers scale by w/dw.
@@ -435,7 +347,6 @@ impl OakSource {
             meta,
             width: w,
             height: h,
-            rgb_device,
             depth,
             _src: std::marker::PhantomData,
         })
@@ -561,19 +472,6 @@ impl VideoTap {
             None
         }
     }
-}
-
-/// Build a zeroed, device-resident RGB888 kornia image of `w×h` (tight, 3 B/px) —
-/// the layout kornia's `Preprocessor` and the `vrt` models consume, and the one the
-/// OAK already hands us on the host, so uploads are a straight `memcpy_htod`.
-///
-/// Public so consumers that own their own upload (notably the stereo modality, which
-/// deliberately takes no CUDA stream) allocate an identically-shaped destination
-/// rather than restating the layout contract.
-pub fn alloc_rgb_image(stream: &Arc<CudaStream>, w: u32, h: u32) -> Result<Image<u8, 3>, BoxError> {
-    let slice = stream.alloc_zeros::<u8>(w as usize * h as usize * 3)?;
-    let t = Tensor::from_cudaslice(slice, [h as usize, w as usize, 3], stream.clone());
-    Image::try_from(t).map_err(|e| format!("build device Image<u8,3>: {e}").into())
 }
 
 impl Drop for OakSource {

@@ -8,7 +8,6 @@
 //! Optional: `OAK_W=640 OAK_H=400 OAK_FPS=15` to drop resolution (USB2 fallback).
 
 use sensor_oak::OakSource;
-use vrt::Stream;
 
 fn main() -> Result<(), vrt::BoxError> {
     let w: u32 = std::env::var("OAK_W")
@@ -25,8 +24,7 @@ fn main() -> Result<(), vrt::BoxError> {
         .unwrap_or(30);
 
     println!("opening OAK at {w}×{h}@{fps} ...");
-    let stream = Stream::new_standalone()?.cuda_stream().clone();
-    let mut src = OakSource::open(None, w, h, fps, stream)?;
+    let mut src = OakSource::open(None, w, h, fps)?;
     let intr = src.intrinsics();
     println!(
         "device up: {}×{}  depth={}  intrinsics fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
@@ -46,9 +44,8 @@ fn main() -> Result<(), vrt::BoxError> {
             continue;
         };
         got += 1;
-        let img = frame.rgb();
-        let cx = img.width() as u32 / 2;
-        let cy = img.height() as u32 / 2;
+        let cx = frame.width() / 2;
+        let cy = frame.height() / 2;
 
         let (center_mm, valid_pct) = match frame.depth() {
             Some(d) => {
@@ -60,7 +57,7 @@ fn main() -> Result<(), vrt::BoxError> {
 
         println!(
             "frame {got:2} (attempt {attempt:2})  rgb {}×{}  pts={:?}  center_depth={}  depth_valid={:.1}%",
-            img.width(), img.height(), frame.meta().pts_ns,
+            frame.width(), frame.height(), frame.meta().pts_ns,
             center_mm.map_or("none".to_string(), |mm| format!("{mm} mm")),
             valid_pct,
         );

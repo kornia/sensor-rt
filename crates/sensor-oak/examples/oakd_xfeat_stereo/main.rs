@@ -35,12 +35,31 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kornia_image::Image;
-use sensor_oak::{alloc_rgb_image, ImuSample, OakSource};
+use sensor_oak::{ImuSample, OakSource};
 use vrt::{BoxError, Engine, Logger, Runtime, Stream};
 use vrt_xfeat::{Matcher, XFeat, XFeatParams, XFeatResult};
 
 mod viz;
 use viz::StereoMatchViz;
+
+/// Build a zeroed, device-resident RGB888 image (tight, 3 B/px) — the layout the
+/// `vrt` models consume, and the one the OAK already hands us on the host, so the
+/// upload is a straight `memcpy_htod`.
+///
+/// Lives here rather than in `sensor-oak`: the driver is deliberately CUDA-free, so
+/// choosing *where* frames land on the GPU is the consumer's job. Reused across
+/// frames, which is why this example uploads the borrowed span directly instead of
+/// going through `OakFrame::rgb_image()` — that would add a host copy per frame.
+fn alloc_rgb_image(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    w: u32,
+    h: u32,
+) -> Result<Image<u8, 3>, BoxError> {
+    let slice = stream.alloc_zeros::<u8>(w as usize * h as usize * 3)?;
+    let t =
+        kornia_tensor::Tensor::from_cudaslice(slice, [h as usize, w as usize, 3], stream.clone());
+    Image::try_from(t).map_err(|e| format!("build device Image<u8,3>: {e}").into())
+}
 
 fn env_u32(key: &str, default: u32) -> u32 {
     std::env::var(key)

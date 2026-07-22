@@ -119,12 +119,7 @@ impl OakSource {
         // Capabilities (including whether the IMU actually started) are read back from
         // the device by `from_open_device`, not assumed here. In this modality the shim
         // reports CAM_B (left) intrinsics — the stereo reference camera.
-        //
-        // host-only: no CUDA stream, no device image — the consumer owns the upload.
-        Self::from_open_device(
-            dev, width, height, /*stream=*/ None, /*rgb_img=*/ None,
-            /*upload=*/ false,
-        )
+        Self::from_open_device(dev, width, height)
     }
 
     /// Whether this source runs the stereo-pair pipeline (so

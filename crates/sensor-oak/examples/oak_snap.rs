@@ -11,15 +11,13 @@
 use kornia_image::{Image, ImageSize};
 use kornia_io::png::write_image_png_rgba8;
 use sensor_oak::{BoxError, OakSource};
-use vrt::Stream;
 
 fn main() -> Result<(), BoxError> {
     let (w, h, fps) = (1280i32, 720i32, 30i32);
     let out = std::env::var("OAK_OUT").unwrap_or_else(|_| "/tmp/oak".into());
 
-    // Host-only: this diagnostic never touches the GPU, it just needs the frames.
-    let stream = Stream::new_standalone()?.cuda_stream().clone();
-    let mut src = OakSource::open_host(None, w as u32, h as u32, fps as u32, stream)?;
+    // The driver is host-only, so this diagnostic needs no CUDA context at all.
+    let mut src = OakSource::open(None, w as u32, h as u32, fps as u32)?;
 
     let mut saved = false;
     for attempt in 1..=20 {

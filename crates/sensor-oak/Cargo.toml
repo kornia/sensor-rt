@@ -16,20 +16,20 @@ build = "build.rs"
 name = "sensor_oak"
 
 [dependencies]
-# NOTE: no `vrt` here on purpose — this driver is a plain producer, so nothing that
-# only wants camera frames should have to build a TensorRT runtime. `vrt` is a
-# dev-dependency for the examples that actually run models.
-cudarc        = { workspace = true }
-kornia-image  = { workspace = true }
-kornia-tensor = { workspace = true }
-sensor-types  = { workspace = true }
+# Deliberately minimal: this driver is a plain producer that never touches CUDA or
+# an inference runtime, so a process that only wants camera frames builds neither.
+# `cudarc` / `kornia-tensor` / `vrt` are dev-dependencies, for the examples that do.
+kornia-image = { workspace = true }
+sensor-types = { workspace = true }
 
 [build-dependencies]
 cmake = { workspace = true }
 
 [dev-dependencies]
-vrt        = { workspace = true }
-kornia-io  = { workspace = true }
+vrt           = { workspace = true }
+cudarc        = { workspace = true }
+kornia-tensor = { workspace = true }
+kornia-io     = { workspace = true }
 vrt-xfeat  = { workspace = true }
 vrt-hub    = { workspace = true, features = ["builder"] }
 env_logger = { workspace = true }
