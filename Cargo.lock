@@ -4684,7 +4684,6 @@ dependencies = [
  "cudarc",
  "env_logger",
  "kornia-image",
- "kornia-io",
  "rerun",
  "sensor-types",
  "vrt",

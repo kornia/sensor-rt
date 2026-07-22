@@ -26,11 +26,11 @@ sensor-types = { workspace = true }
 cmake = { workspace = true }
 
 [dev-dependencies]
-vrt           = { workspace = true }
-cudarc        = { workspace = true }
-kornia-io     = { workspace = true }
-argh          = { workspace = true }
-rerun         = { workspace = true }
+# Examples only. The driver itself needs none of this — see the note above.
+vrt        = { workspace = true }
 vrt-xfeat  = { workspace = true }
 vrt-hub    = { workspace = true, features = ["builder"] }
+cudarc     = { workspace = true }
+rerun      = { workspace = true }
+argh       = { workspace = true }
 env_logger = { workspace = true }
