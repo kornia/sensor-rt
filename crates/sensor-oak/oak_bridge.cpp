@@ -133,48 +133,19 @@ extern "C" oak_device* oak_open(const char* device_id, int width, int height, in
         auto& pipeline = *dev->pipeline;
 
         // Auto-fall-back to video-only when depth was requested but the device can't actually produce it
-        // (mono camera, or wiped/blank calibration → fx=0). Pulling raw RGB over XLink for a "synced RGBD"
-        // pair that has no usable depth just caps the H.264 stream for nothing — so build the lean
-        // video-only pipeline instead. Policy: always ship compressed video; add RGBD only when depth works.
-        bool want_video_only = (video_only != 0) ||
-                               (enable_depth != 0 && !device_has_stereo(dev->device, width, height));
-
-        // NO-STEREO path (flag still spelled `video_only`): H.264 encoder + a raw RGB888 output, and
-        // no StereoDepth. Raw RGB is kept on purpose — these cameras feed ONBOARD COMPUTE, which needs
-        // real frames, so oak_poll DOES yield frames here (RGB, no depth) and oak_poll_video runs
-        // alongside. Costs w*h*3 per frame over XLink; that is an accepted trade, not an oversight.
-        if (want_video_only) {
-            auto color = pipeline.create<dai::node::Camera>();
-            color->build(dai::CameraBoardSocket::CAM_A);
-            // Raw RGB output (mirrors the full pipeline) so a NO-DEPTH camera still provides frames for
-            // calibration snapshots + fusion colouring — not only the H.264 stream. The lean video-only
-            // path omitted this purely to save XLink bandwidth (RGB888 is ~691KB/frame); it's worth it
-            // for a camera you need to calibrate. Depth stays OFF (no stereo/calibration); oak_poll now
-            // yields RGB and skips depth (has_depth=false, depth_q=null — already guarded there).
-            auto* rgb_out = color->requestOutput(
-                std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
-                dai::ImgFrame::Type::RGB888i, dai::ImgResizeMode::CROP, (float)fps,
-                /*enableUndistortion=*/true);
-            dev->rgb_q = rgb_out->createOutputQueue(4, false);
-            dev->has_sync = true;
-            auto* nv12_out = color->requestOutput(
-                std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
-                dai::ImgFrame::Type::NV12, dai::ImgResizeMode::CROP, (float)fps, /*undistort=*/true);
-            auto enc = pipeline.create<dai::node::VideoEncoder>();
-            enc->setDefaultProfilePreset((float)fps, dai::VideoEncoderProperties::Profile::H264_BASELINE);
-            enc->setKeyframeFrequency(fps > 0 ? std::max(fps / 4, 4) : 8); // ~4 keyframes/s → fast decoder start
-            enc->setBitrateKbps(h264_kbps());
-            nv12_out->link(enc->input);
-            dev->video_q = enc->bitstream.createOutputQueue(30, false);
-            dev->has_video = true;
-            dev->has_depth = false;
-            pipeline.start();
-            try {
-                auto calib = dev->device->readCalibration();
-                auto k = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, width, height);
-                dev->fx = k[0][0]; dev->fy = k[1][1]; dev->cx = k[0][2]; dev->cy = k[1][2];
-            } catch (const std::exception&) { /* intrinsics stay zero — irrelevant for viewing */ }
-            return dev.release();
+        // (mono camera, or wiped/blank calibration → fx=0). Building StereoDepth there would fail at
+        // runtime and take the pipeline down, so depth is simply switched off and we still ship RGB +
+        // H.264. Policy: always ship compressed video; add depth only when depth actually works.
+        //
+        // `video_only` no longer means "no RGB" — that path also streams raw frames now, because these
+        // cameras feed onboard compute, which needs real frames rather than a bitstream to look at. What
+        // it means today is NO DEPTH, so it is folded into the same pipeline builder below rather than
+        // duplicating the camera/encoder/queue construction in a branch of its own.
+        const bool no_depth = (video_only != 0) ||
+                              (enable_depth != 0 && !device_has_stereo(dev->device, width, height));
+        if (no_depth) {
+            enable_depth = 0;
+            enable_h264 = 1;   // the whole point of this path is the compressed stream
         }
 
         // DECOUPLED build: depth and raw-RGB are SEPARATE streams (no on-device Sync node), each pulled at
@@ -187,7 +158,11 @@ extern "C" oak_device* oak_open(const char* device_id, int width, int height, in
         if (fps > 0) dfps = std::min(dfps, fps);
         // Raw-RGB rate (its own stream, for local compute). Low by default to spare XLink + ISP; the H.264
         // video is a separate 30fps output unaffected by this.
-        int rfps = 10;
+        // Raw-RGB rate. With depth on, RGB is only needed for local compute and competes with the
+        // depth stream for XLink, so it is throttled (OAK_RGB_FPS, default 10). With no depth there is
+        // nothing to compete with, so RGB runs at full capture rate. Explicit, rather than an accident
+        // of which pipeline branch was taken.
+        int rfps = no_depth ? fps : 10;
         if (const char* s = std::getenv("OAK_RGB_FPS")) { int v = std::atoi(s); if (v >= 1) rfps = v; }
         if (fps > 0) rfps = std::min(rfps, fps);
 

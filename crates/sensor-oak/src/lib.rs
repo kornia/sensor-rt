@@ -166,6 +166,12 @@ impl OakSource {
     /// frames here — RGB with no depth — and [`OakSource::next_video`] drains the encoded stream
     /// alongside it. Budget for the raw stream: `w*h*3` bytes/frame over XLink.
     ///
+    /// **Versus [`open_video`](Self::open_video) with `depth = false`:** both build the same nodes — the
+    /// only difference is the raw-RGB rate. This path runs RGB at the full capture `fps` because nothing
+    /// competes with it; the depth-capable path throttles RGB to `OAK_RGB_FPS` (default 10) so it does not
+    /// starve the depth stream. If you want depth when the device supports it, use `open_video`; it falls
+    /// back to exactly this pipeline when the device turns out to have no usable stereo.
+    ///
     /// `device`: see [`OakSource::open`]. Takes NO CUDA stream — nothing on this path uploads to the
     /// GPU, so no CUDA context is created.
     pub fn open_video_only(
