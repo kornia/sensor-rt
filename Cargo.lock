@@ -1676,28 +1676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oak-sys"
-version = "0.1.0"
-dependencies = [
- "cmake",
-]
-
-[[package]]
-name = "oakd_xfeat_stereo"
-version = "0.1.0"
-dependencies = [
- "cudarc",
- "env_logger",
- "kornia-image",
- "kornia-io",
- "kornia-tensor",
- "sensor-oak",
- "vrt",
- "vrt-hub",
- "vrt-xfeat",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2248,14 +2226,16 @@ dependencies = [
 name = "sensor-oak"
 version = "0.1.0"
 dependencies = [
+ "cmake",
  "cudarc",
+ "env_logger",
  "kornia-image",
  "kornia-io",
  "kornia-tensor",
- "oak-sys",
  "sensor-types",
  "vrt",
- "vrt-types",
+ "vrt-hub",
+ "vrt-xfeat",
 ]
 
 [[package]]
@@ -2891,17 +2871,6 @@ dependencies = [
  "kornia-tensor",
  "thiserror 2.0.18",
  "vrt",
-]
-
-[[package]]
-name = "vrt-types"
-version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=61e1dbcc42351cd62d89850aba384f2c0c53ba2a#61e1dbcc42351cd62d89850aba384f2c0c53ba2a"
-dependencies = [
- "cudarc",
- "kornia-image",
- "kornia-tensor",
- "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
 //!
 //! This is the raw stereo + inertial source for VIO / stereo-feature work — the
 //! counterpart to the colour/depth path in [`crate`], not a variant of it. It
-//! builds a completely separate device pipeline ([`oak_sys::oak_open_stereo`]):
+//! builds a completely separate device pipeline ([`crate::ffi::oak_open_stereo`]):
 //! no colour camera, no `StereoDepth`, no encoder.
 //!
 //! **The frames are host-only and this source takes no [`CudaStream`].** That is
@@ -17,8 +17,8 @@
 
 use std::ffi::CStr;
 
+use crate::BoxError;
 use sensor_types::FrameMeta;
-use vrt::BoxError;
 
 use crate::OakSource;
 
@@ -102,7 +102,7 @@ impl OakSource {
         let id_c = Self::device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let dev = unsafe {
-            oak_sys::oak_open_stereo(
+            crate::ffi::oak_open_stereo(
                 id_ptr,
                 width as i32,
                 height as i32,
@@ -111,7 +111,7 @@ impl OakSource {
             )
         };
         if dev.is_null() {
-            let e = unsafe { CStr::from_ptr(oak_sys::oak_last_error()) }
+            let e = unsafe { CStr::from_ptr(crate::ffi::oak_last_error()) }
                 .to_string_lossy()
                 .into_owned();
             return Err(format!("oak_open_stereo failed: {e}").into());
@@ -123,7 +123,7 @@ impl OakSource {
         // host-only: no CUDA stream, no device image — the consumer owns the upload.
         Self::from_open_device(
             dev, width, height, /*stream=*/ None, /*rgb_img=*/ None,
-            /*upload=*/ false, /*h264=*/ false,
+            /*upload=*/ false,
         )
     }
 
@@ -157,7 +157,7 @@ impl OakSource {
         let mut tries = 0;
         loop {
             let rc = unsafe {
-                oak_sys::oak_poll_stereo(
+                crate::ffi::oak_poll_stereo(
                     self.dev, &mut left, &mut right, &mut w, &mut h, &mut len, &mut ts,
                 )
             };
@@ -217,11 +217,11 @@ impl OakSource {
         // cap = 512) to receive the handful of samples that actually arrived.
         if self.imu_scratch.len() < cap {
             self.imu_scratch
-                .resize(cap, oak_sys::oak_imu_sample::default());
+                .resize(cap, crate::ffi::OakImuSample::default());
         }
         let mut n: i32 = 0;
         let rc = unsafe {
-            oak_sys::oak_poll_imu(self.dev, self.imu_scratch.as_mut_ptr(), cap as i32, &mut n)
+            crate::ffi::oak_poll_imu(self.dev, self.imu_scratch.as_mut_ptr(), cap as i32, &mut n)
         };
         if rc != 1 || n <= 0 {
             return 0;

@@ -3,56 +3,33 @@
 //!   <out>_rgb.png     — the RGB image
 //!   <out>_depth.png   — colorized depth (grayscale: near=bright, far=dark, holes=black)
 //!   <out>_overlay.png — 50/50 blend; if aligned, depth silhouettes sit exactly on RGB edges
-//! Also prints RGB channel stats + depth coverage. Pure oak-sys FFI.
+//! Also prints RGB channel stats + depth coverage.
 //!
-//!   cargo run -p vrt-oak --example oak_snap            # writes /tmp/oak_*.png
-//!   OAK_OUT=/tmp/foo cargo run -p vrt-oak --example oak_snap
-
-use std::ffi::CStr;
+//!   cargo run -p sensor-oak --example oak_snap            # writes /tmp/oak_*.png
+//!   OAK_OUT=/tmp/foo cargo run -p sensor-oak --example oak_snap
 
 use kornia_image::{Image, ImageSize};
 use kornia_io::png::write_image_png_rgba8;
+use sensor_oak::{BoxError, OakSource};
+use vrt::Stream;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), BoxError> {
     let (w, h, fps) = (1280i32, 720i32, 30i32);
     let out = std::env::var("OAK_OUT").unwrap_or_else(|_| "/tmp/oak".into());
 
-    let dev = unsafe { oak_sys::oak_open(std::ptr::null(), w, h, fps, 0, 1, 0) };
-    if dev.is_null() {
-        let e = unsafe { CStr::from_ptr(oak_sys::oak_last_error()) }
-            .to_string_lossy()
-            .into_owned();
-        return Err(format!("oak_open failed: {e}").into());
-    }
+    // Host-only: this diagnostic never touches the GPU, it just needs the frames.
+    let stream = Stream::new_standalone()?.cuda_stream().clone();
+    let mut src = OakSource::open_host(None, w as u32, h as u32, fps as u32, stream)?;
 
     let mut saved = false;
     for attempt in 1..=20 {
-        let mut rgba: *const u8 = std::ptr::null();
-        let mut depth: *const u16 = std::ptr::null();
-        let (mut fw, mut fh) = (0i32, 0i32);
-        let mut rgb_len = 0i32;
-        let mut ts = 0u64;
-        let (mut dw, mut dh) = (0i32, 0i32);
-        let rc = unsafe {
-            oak_sys::oak_poll(
-                dev,
-                &mut rgba,
-                &mut depth,
-                &mut fw,
-                &mut fh,
-                &mut rgb_len,
-                &mut ts,
-                &mut dw,
-                &mut dh,
-            )
-        };
-        if rc != 1 || rgba.is_null() {
+        let Some(frame) = src.next_frame() else {
             continue;
-        }
-        let (fw, fh) = (fw as usize, fh as usize);
+        };
+        let (fw, fh) = (frame.width() as usize, frame.height() as usize);
         let npx = fw * fh;
-        // Shim now hands out RGB888 (3 B/px); expand to RGBA for PNG/stat code below.
-        let rgb3 = unsafe { std::slice::from_raw_parts(rgba, npx * 3) };
+        // The shim hands out RGB888 (3 B/px); expand to RGBA for the PNG/stat code below.
+        let rgb3 = frame.rgb_host();
         let mut rgb = vec![0u8; npx * 4];
         for i in 0..npx {
             rgb[i * 4] = rgb3[i * 3];
@@ -60,10 +37,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             rgb[i * 4 + 2] = rgb3[i * 3 + 2];
             rgb[i * 4 + 3] = 255;
         }
-        let dep: Vec<u16> = if depth.is_null() {
-            vec![0; npx]
-        } else {
-            unsafe { std::slice::from_raw_parts(depth, npx) }.to_vec()
+        // Depth is aligned to the RGB grid but may be a SMALLER one (downscaled
+        // on-device before transport), so resample it to RGB resolution by nearest
+        // neighbour before overlaying — indexing it as if it were RGB-sized would
+        // read the wrong pixels and make an aligned camera look misaligned.
+        let (dims_match, dep): (bool, Vec<u16>) = match frame.depth() {
+            None => (false, vec![0; npx]),
+            Some(d) => {
+                let (dw, dh) = (d.width() as usize, d.height() as usize);
+                let src_mm = d.as_slice();
+                let mut full = vec![0u16; npx];
+                for y in 0..fh {
+                    let sy = y * dh / fh;
+                    for x in 0..fw {
+                        full[y * fw + x] = src_mm[sy * dw + x * dw / fw];
+                    }
+                }
+                (dw == fw && dh == fh, full)
+            }
         };
 
         // RGB channel stats.
@@ -76,8 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n = npx as u64;
         let valid = dep.iter().filter(|&&v| v != 0).count();
         println!(
-            "attempt {attempt:2}: {fw}×{fh}  meanRGB=({},{},{})  depth_valid={:.1}%  depth_dims_match_rgb={}",
-            sr / n, sg / n, sb / n, 100.0 * valid as f32 / npx as f32, dep.len() == npx,
+            "attempt {attempt:2}: {fw}×{fh}  meanRGB=({},{},{})  depth_valid={:.1}%  depth_dims_match_rgb={dims_match}",
+            sr / n, sg / n, sb / n, 100.0 * valid as f32 / npx as f32,
         );
 
         if attempt >= 10 {
@@ -124,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    unsafe { oak_sys::oak_close(dev) };
+    // `src` closes the device on drop — no manual oak_close needed.
     if !saved {
         return Err("no frame captured".into());
     }

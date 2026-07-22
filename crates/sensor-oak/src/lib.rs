@@ -13,15 +13,32 @@ use std::sync::Arc;
 use cudarc::driver::CudaStream;
 use kornia_image::Image;
 use kornia_tensor::Tensor;
-use sensor_types::{DepthMap, FrameMeta};
-use vrt::BoxError;
-use vrt_types::CameraIntrinsics;
+use sensor_types::FrameMeta;
+/// Boxed error, `Send + Sync` so a source can be moved between threads.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-// The depth→3D bridge (`Lifter`/`SizePriors`) is sensor-agnostic and lives in
-// `vrt-lift`; camera `CameraIntrinsics` are a `vrt` core type. This crate is just the
-// OAK sensor driver and no longer depends on the tracker.
+/// Pinhole intrinsics of an OAK camera, in pixels, at the streamed resolution.
+///
+/// Defined here rather than pulled from an inference crate: this driver is a plain
+/// producer and must not drag a TensorRT runtime into anything that merely wants
+/// camera frames. Consumers that need a richer camera model (unprojection,
+/// distortion) convert these four numbers into their own type — it is the same
+/// `fx, fy, cx, cy` everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct OakIntrinsics {
+    pub fx: f32,
+    pub fy: f32,
+    pub cx: f32,
+    pub cy: f32,
+}
 
+// Raw FFI over the depthai-core C shim (`oak_bridge.h`), built by this crate's
+// build.rs. Private: unsafe pointer soup is an implementation detail, and every
+// caller goes through the safe wrappers below.
+mod depth;
+mod ffi;
 mod stereo;
+pub use depth::DepthMap;
 pub use stereo::{ImuSample, StereoFrame};
 
 /// One synced OAK frame: RGB on the device, optional aligned depth on the host.
@@ -81,7 +98,7 @@ impl OakFrame<'_> {
 
 /// OAK-D source. `open` then `next_frame()` in a loop (like `RtspSource`).
 pub struct OakSource {
-    dev: *mut oak_sys::oak_device,
+    dev: *mut ffi::OakDevice,
     stream: Option<Arc<CudaStream>>, // Some only on the upload (detection) path; None for pure encoders
     rgb_img: Option<Image<u8, 3>>,   // reused device RGB888 image; None when host-only
     upload: bool,                    // upload RGB H2D (detection) vs host-only (pure encoders)
@@ -89,7 +106,7 @@ pub struct OakSource {
     width: u32,
     height: u32,
     seq: u64,
-    intr: CameraIntrinsics,
+    intr: OakIntrinsics,
     has_depth: bool,
     has_sync: bool,
     // Stereo+IMU modality (`open_stereo`) — see `stereo.rs`. Both false on every other path.
@@ -97,7 +114,7 @@ pub struct OakSource {
     has_imu: bool,
     /// Reused staging buffer for `next_imu`, so draining inertial samples every
     /// frame costs no allocation once it has grown.
-    imu_scratch: Vec<oak_sys::oak_imu_sample>,
+    imu_scratch: Vec<ffi::OakImuSample>,
 }
 
 // SAFETY: the device handle is used single-threaded by the owning loop; the CUDA
@@ -211,7 +228,7 @@ impl OakSource {
             .map_err(|e| format!("bad device id: {e}"))?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let dev = unsafe {
-            oak_sys::oak_open(
+            ffi::oak_open(
                 id_ptr,
                 width as i32,
                 height as i32,
@@ -222,7 +239,7 @@ impl OakSource {
             )
         };
         if dev.is_null() {
-            let e = unsafe { CStr::from_ptr(oak_sys::oak_last_error()) }
+            let e = unsafe { CStr::from_ptr(ffi::oak_last_error()) }
                 .to_string_lossy()
                 .into_owned();
             return Err(format!("oak_open failed: {e}").into());
@@ -235,7 +252,7 @@ impl OakSource {
         } else {
             None
         };
-        Self::from_open_device(dev, width, height, stream, rgb_img, upload, h264)
+        Self::from_open_device(dev, width, height, stream, rgb_img, upload)
     }
 
     /// Wrap a device the shim has already opened, reading every capability back
@@ -244,34 +261,34 @@ impl OakSource {
     /// Shared by `open_inner` and [`open_stereo`](OakSource::open_stereo): those
     /// two build genuinely different pipelines (they share no depthai nodes), but
     /// the "what did we actually get?" half is identical, and hard-coding it per
-    /// constructor is how the two drift. The `oak_has_*` accessors are the source
-    /// of truth — e.g. `has_sync` is false when a mono/uncalibrated device
-    /// auto-fell-back to a video-only pipeline, which the caller cannot predict.
+    /// constructor is how the two drift. Every `oak_has_*` accessor is the source of
+    /// truth — e.g. `has_sync` is false when a mono/uncalibrated device auto-fell-back
+    /// to a video-only pipeline, which the caller cannot predict.
     pub(crate) fn from_open_device(
-        dev: *mut oak_sys::oak_device,
+        dev: *mut ffi::OakDevice,
         width: u32,
         height: u32,
         stream: Option<Arc<CudaStream>>,
         rgb_img: Option<Image<u8, 3>>,
         upload: bool,
-        h264: bool,
     ) -> Result<Self, BoxError> {
         let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
-        unsafe { oak_sys::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
+        unsafe { ffi::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
         Ok(Self {
             dev,
             stream,
             rgb_img,
             upload,
-            h264,
+            // Read back, not assumed: the shim may decline to build the encoder.
+            h264: unsafe { ffi::oak_has_video(dev) } != 0,
             width,
             height,
             seq: 0,
-            intr: CameraIntrinsics { fx, fy, cx, cy },
-            has_depth: unsafe { oak_sys::oak_has_depth(dev) } != 0,
-            has_sync: unsafe { oak_sys::oak_has_sync(dev) } != 0,
-            has_stereo: unsafe { oak_sys::oak_has_stereo(dev) } != 0,
-            has_imu: unsafe { oak_sys::oak_has_imu(dev) } != 0,
+            intr: OakIntrinsics { fx, fy, cx, cy },
+            has_depth: unsafe { ffi::oak_has_depth(dev) } != 0,
+            has_sync: unsafe { ffi::oak_has_sync(dev) } != 0,
+            has_stereo: unsafe { ffi::oak_has_stereo(dev) } != 0,
+            has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
             imu_scratch: Vec::new(),
         })
     }
@@ -285,7 +302,7 @@ impl OakSource {
             .map_err(|e| format!("bad device id: {e}").into())
     }
 
-    pub fn intrinsics(&self) -> CameraIntrinsics {
+    pub fn intrinsics(&self) -> OakIntrinsics {
         self.intr
     }
     /// The shared CUDA stream the RGB upload runs on. **Build the consuming model
@@ -339,7 +356,7 @@ impl OakSource {
         let mut tries = 0;
         loop {
             rc = unsafe {
-                oak_sys::oak_poll(
+                ffi::oak_poll(
                     self.dev,
                     &mut rgb,
                     &mut depth,
@@ -442,7 +459,7 @@ impl OakSource {
         let mut data: *const u8 = std::ptr::null();
         let mut len: i32 = 0;
         let mut ts: u64 = 0;
-        let rc = unsafe { oak_sys::oak_poll_video(self.dev, &mut data, &mut len, &mut ts) };
+        let rc = unsafe { ffi::oak_poll_video(self.dev, &mut data, &mut len, &mut ts) };
         if rc == 1 && !data.is_null() && len > 0 {
             // Copy the bitstream out while the shim still pins it (valid until the next call).
             let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
@@ -459,7 +476,7 @@ impl OakSource {
         let mut rgb: *const u8 = std::ptr::null();
         let (mut w, mut h, mut len, mut ts) = (0i32, 0i32, 0i32, 0u64);
         let rc =
-            unsafe { oak_sys::oak_poll_rgb(self.dev, &mut rgb, &mut w, &mut h, &mut len, &mut ts) };
+            unsafe { ffi::oak_poll_rgb(self.dev, &mut rgb, &mut w, &mut h, &mut len, &mut ts) };
         if rc == 1 && !rgb.is_null() && len > 0 {
             let bytes = unsafe { std::slice::from_raw_parts(rgb, len as usize) }.to_vec();
             Some((bytes, w as u32, h as u32, ts))
@@ -474,8 +491,7 @@ impl OakSource {
     pub fn next_depth(&mut self) -> Option<(Vec<u16>, u32, u32, u64)> {
         let mut depth: *const u16 = std::ptr::null();
         let (mut dw, mut dh, mut ts) = (0i32, 0i32, 0u64);
-        let rc =
-            unsafe { oak_sys::oak_poll_depth(self.dev, &mut depth, &mut dw, &mut dh, &mut ts) };
+        let rc = unsafe { ffi::oak_poll_depth(self.dev, &mut depth, &mut dw, &mut dh, &mut ts) };
         if rc == 1 && !depth.is_null() && dw > 0 && dh > 0 {
             let n = dw as usize * dh as usize;
             let vals = unsafe { std::slice::from_raw_parts(depth, n) }.to_vec();
@@ -510,12 +526,12 @@ pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
         .transpose()
         .map_err(|e| format!("bad kick target: {e}"))?;
     let ptr = c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
-    let rc = unsafe { oak_sys::oak_kick(ptr) };
+    let rc = unsafe { ffi::oak_kick(ptr) };
     match rc {
         1 => Ok(true),
         0 => Ok(false),
         _ => {
-            let e = unsafe { CStr::from_ptr(oak_sys::oak_last_error()) }
+            let e = unsafe { CStr::from_ptr(ffi::oak_last_error()) }
                 .to_string_lossy()
                 .into_owned();
             Err(format!("oak_kick failed: {e}").into())
@@ -525,7 +541,7 @@ pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
 
 /// See [`OakSource::video_tap`]. Holds a raw device handle; `Send` so it can live in the video thread.
 pub struct VideoTap {
-    dev: *mut oak_sys::oak_device,
+    dev: *mut ffi::OakDevice,
 }
 // SAFETY: only ever used to call oak_poll_video (video queue), on one thread at a time, never
 // concurrently with a source drop (the caller serialises via a lock — see `video_tap`).
@@ -537,7 +553,7 @@ impl VideoTap {
         let mut data: *const u8 = std::ptr::null();
         let mut len: i32 = 0;
         let mut ts: u64 = 0;
-        let rc = unsafe { oak_sys::oak_poll_video(self.dev, &mut data, &mut len, &mut ts) };
+        let rc = unsafe { ffi::oak_poll_video(self.dev, &mut data, &mut len, &mut ts) };
         if rc == 1 && !data.is_null() && len > 0 {
             let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
             Some((bytes, ts))
@@ -562,6 +578,6 @@ pub fn alloc_rgb_image(stream: &Arc<CudaStream>, w: u32, h: u32) -> Result<Image
 
 impl Drop for OakSource {
     fn drop(&mut self) {
-        unsafe { oak_sys::oak_close(self.dev) };
+        unsafe { ffi::oak_close(self.dev) };
     }
 }
