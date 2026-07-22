@@ -2,9 +2,13 @@
 **/*.rs.bk
 .DS_Store
 
-# generated PNGs from rtsp_grab
-/*.png
-/out.png
+# depthai-core source is a pinned git submodule at vendor/depthai-core (tracked).
+# The built install prefix + packaged tarball are large build output — not committed.
+/vendor/depthai/
+/vendor/*.tar.gz
 
 # pixi / local
 .pixi/
+
+# depthai build cache (scripts/build_depthai.sh) — build output, not committed.
+/.cache/

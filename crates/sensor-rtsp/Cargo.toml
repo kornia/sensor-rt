@@ -13,12 +13,19 @@ name = "sensor_rtsp"
 nvbuf-sys     = { workspace = true }
 gstreamer     = { workspace = true }
 gstreamer-app = { workspace = true }
+vrt           = { workspace = true }
+sensor-types  = { workspace = true }
 kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
 thiserror     = { workspace = true }
 cudarc        = { workspace = true }
 
-# Examples only (crates/sensor-rtsp/examples/). `rtsp_grab` saves a PNG.
 [dev-dependencies]
-kornia-io  = { workspace = true }
-env_logger = { workspace = true }
+# Examples only: the models they run, plus PNG output and CLI parsing. The driver
+# itself depends on none of this.
+vrt-xfeat    = { workspace = true }
+vrt-rfdetr   = { workspace = true }
+vrt-hub      = { workspace = true, features = ["hub", "builder"] }
+kornia-io    = { workspace = true }
+env_logger   = { workspace = true }
+argh         = { workspace = true }

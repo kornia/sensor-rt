@@ -1,0 +1,102 @@
+/* Pure-C ABI over depthai-core v3 (C++). The Rust side never sees any C++ —
+ * opaque handle + plain types; C++ exceptions are caught and converted to return
+ * codes + oak_last_error().
+ *
+ * Scope: the STEREO + IMU pipeline only. The colour/depth and H.264 paths were
+ * removed while that modality is the one under development. */
+#ifndef OAK_BRIDGE_H
+#define OAK_BRIDGE_H
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct oak_device oak_device;
+
+/* One IMU reading: an accelerometer + gyroscope pair, timestamped on the SAME
+ * host-synced epoch timeline as the image frames (so IMU and frames can be
+ * interpolated against each other directly). */
+typedef struct {
+    uint64_t ts_ns;    /* accelerometer packet capture time, epoch ns */
+    float ax, ay, az;  /* accelerometer, m/s^2 */
+    float gx, gy, gz;  /* gyroscope, rad/s */
+} oak_imu_sample;
+
+/* Open an OAK in the STEREO+IMU modality: the two mono cameras (CAM_B = left,
+ * CAM_C = right) streamed as a time-synced RGB888 pair, plus the on-board IMU on
+ * its own queue. NO colour camera, NO StereoDepth, NO encoder — this is the raw
+ * stereo + inertial source for VIO / stereo-feature work, not the depth path
+ * (for aligned depth use oak_open with enable_depth).
+ *
+ * A separate entry point rather than more flags on oak_open: the pipeline shares
+ * no nodes with it, and the RGBD/H.264 paths must not regress.
+ *
+ *   width/height : per-eye output size. CAM_B/CAM_C are MONOCHROME, so the frames
+ *                  are GRAY8 (one byte per pixel). Requesting RGB888i would make
+ *                  depthai replicate gray across three channels and ship 3x the
+ *                  bytes for no extra information — consumers that need RGB expand
+ *                  it on the GPU instead.
+ *   fps          : stereo pair rate.
+ *   imu_hz       : accelerometer + gyroscope report rate (e.g. 200-400). The IMU
+ *                  is OPTIONAL — a device without one (or whose IMU fails to
+ *                  start) still streams stereo, with oak_has_imu() == 0.
+ *
+ * Returns NULL on failure (reason via oak_last_error). */
+oak_device *oak_open_stereo(const char *device_id, int width, int height,
+                            int fps, int imu_hz);
+
+/* True (1) if the on-board IMU is running (oak_poll_imu yields samples). 0 on a
+ * device with no IMU, or when the IMU node failed to start — the stereo pair is
+ * unaffected either way, so callers should degrade rather than abort. */
+int oak_has_imu(const oak_device *dev);
+
+/* Factory intrinsics of the LEFT (CAM_B) camera at the streamed size — the stereo
+ * reference frame. Returns 0 on success, -1 on error. */
+int oak_intrinsics(const oak_device *dev,
+                   float *fx, float *fy, float *cx, float *cy);
+
+/* Pull the next time-synced stereo pair. On success (return 1) both out-pointers
+ * alias device-internal buffers VALID UNTIL THE NEXT oak_poll_stereo:
+ *   left/right -> width*height bytes each, GRAY8 (tightly packed, 1 byte/px)
+ *   len        -> that byte length (width*height), same for both eyes
+ *   ts_ns      -> capture time of the LEFT frame, epoch ns
+ *   l_hnd/r_hnd-> owned retain handles for the two eyes; the pixel buffers stay valid
+ *                 for as long as these live, independently of later polls. Release each
+ *                 with oak_frame_release exactly once. Never NULL on success.
+ * Blocks up to ~1s for the pair. Returns 1 on a pair, 0 on timeout/no-frame,
+ * -1 on error. */
+int oak_poll_stereo(oak_device *dev,
+                    const uint8_t **left, const uint8_t **right,
+                    int *width, int *height, int *len, uint64_t *ts_ns,
+                    void **l_hnd, void **r_hnd);
+
+/* Release a retain handle from oak_poll_stereo. NULL is a no-op. */
+void oak_frame_release(void *handle);
+
+/* Drain queued IMU samples into the caller's array. NON-BLOCKING: writes up to
+ * `max` samples, sets *n to how many were written (0 when none are queued or the
+ * IMU isn't running). Returns 1 / 0 / -1 (error).
+ *
+ * The IMU reports far faster than the frame rate, so call this in a loop until
+ * *n == 0 (or with a generous `max`) each iteration, otherwise the batch queue
+ * overflows and samples are silently dropped. */
+int oak_poll_imu(oak_device *dev, oak_imu_sample *out, int max, int *n);
+
+/* Recover a PoE OAK wedged in bootloader state: reboot it via a bootloader open+drop so the next
+ * oak_open succeeds. `target` = IP/name or deviceId (NULL = first wedged device). 1 = kicked (wait ~8s),
+ * 0 = nothing to kick, -1 = error. Blocking. */
+int oak_kick(const char *target);
+
+/* Stop the pipeline and free the device. */
+void oak_close(oak_device *dev);
+
+/* Last error message on the calling thread (empty string if none). */
+const char *oak_last_error(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* OAK_BRIDGE_H */

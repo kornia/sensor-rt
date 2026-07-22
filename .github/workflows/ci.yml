@@ -10,8 +10,8 @@ env:
 
 jobs:
   # Formatting gate — pure parse, resolves no dependencies, so it runs on a free
-  # hosted runner even though the crates need Jetson-only native libs (NVMM /
-  # GStreamer).
+  # hosted runner even though the crates need Jetson-only native libs (NVMM,
+  # depthai) and a private git dep (vision-rt).
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -21,33 +21,20 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  # Hosted minimum: the crate can't fully build off-Jetson (nvbuf-sys needs the
-  # Jetson Multimedia API), but `NVBUF_STUB=1` stubs that FFI so the library +
-  # its pure-logic unit tests (URL-credential redaction, frame stamping) compile
-  # and run on a normal runner. GStreamer dev headers come from apt; cudarc/kornia
-  # build via cudarc's dynamic-loading fallback (no CUDA needed).
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: GStreamer dev libs
-        run: sudo apt-get update && sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
-      - name: Unit tests (nvbuf stubbed — no CUDA/NVMM)
-        env:
-          NVBUF_STUB: "1"
-        run: cargo test -p sensor-rtsp --lib
-
-  # Self-hosted Jetson runner: real CUDA + NVMM (GStreamer) to build and test the
-  # RTSP source end-to-end. Register a runner on the Orin with labels
-  # [self-hosted, jetson], then remove the `if: false` guard.
+  # Self-hosted Jetson runner: real CUDA + NVMM (GStreamer) + depthai-core, and
+  # the depthai vendor libs available.
+  # Register a runner on the Orin with labels [self-hosted, jetson] and provide
+  # the depthai vendor libs, then remove the `if: false` guard.
   jetson:
     if: false # enable once a self-hosted Jetson runner is registered
     runs-on: [self-hosted, jetson]
     env:
       CARGO_BUILD_JOBS: "2" # 7.4 GB RAM — parallel native builds OOM the box
+      LD_LIBRARY_PATH: ${{ github.workspace }}/vendor/depthai/lib
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive # depthai-core source for the native shim build
       - name: Build workspace
         run: cargo build -j2
       - name: Clippy

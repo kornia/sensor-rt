@@ -1,12 +1,15 @@
 [workspace]
 resolver = "2"
-# Jetson RTSP camera source. A pure driver: decodes RTSP/H.264 over NVMM and emits
-# a device-resident kornia `Image<u8,3>` — no algorithm dependency. Frame
-# provenance (`stamp`) is vendored into `sensor-rtsp`, so the crate itself has no
-# dependency on vision-rt (`vrt`); models consume these frames from the
-# application side. Examples live inside `crates/sensor-rtsp/examples/`.
+# Isolated Jetson sensor drivers. The driver crates depend on NO inference runtime —
+# a consumer that only wants camera frames should not have to build TensorRT — so
+# they own their device-shaped types (e.g. `OakIntrinsics`) and share only
+# frame timing via the dependency-free `sensor-types` leaf. `vrt` (upstream
+# kornia/vision-rt) appears solely in the examples that actually run models, and has
+# no dependency back on sensors. Sensors emit kornia `Image<u8,3>` (device-resident).
 members = [
     "crates/nvbuf-sys",
+    "crates/sensor-types",
+    "crates/sensor-oak",
     "crates/sensor-rtsp",
 ]
 
@@ -15,12 +18,12 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/kornia/sensor-rt"
-authors = ["Edgar Riba <edgar.riba@gmail.com>", "Kornia AI"]
+authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 
 [workspace.dependencies]
-# One cudarc across the workspace, matching kornia-rs's feature set so cargo
-# unifies to a single build (shared CudaStream/CudaSlice for zero-copy interop
-# with the models that consume these frames downstream).
+# One cudarc across the workspace, matching vision-rt + kornia-rs's feature set so
+# cargo unifies to a single build (shared CudaStream/CudaSlice types → zero-copy
+# interop with the vrt models that consume these frames).
 cudarc = { version = "0.19", default-features = false, features = [
   "cuda-version-from-build-system",
   "driver",
@@ -29,16 +32,45 @@ cudarc = { version = "0.19", default-features = false, features = [
   "fallback-dynamic-loading",
   "fallback-latest",
 ] }
-# kornia GPU image/tensor types (device-resident RGB8 frames + the pack kernel).
-kornia-image  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
-kornia-tensor = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
-kornia-io     = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
+# vision-rt — the PUBLIC upstream (kornia/vision-rt), git-pinned to a fixed rev
+# (Cargo.lock also locks it). Everything here is public — no forks, no patches.
+#
+# Two things worth knowing:
+#   * upstream's vrt-xfeat already exposes the async `submit(img, &mut out)` API, so
+#     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
+# NOTE: upstream's core crate is named `vrt` outright; the fork called it
+# `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
+vrt        = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
+vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
+vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
+vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
+# kornia GPU image/tensor types — pinned to the same rev vision-rt uses.
+kornia-image   = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.5", features = ["cuda"] }
+kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.5", features = ["cuda"] }
+# One `cuda` feature since rc.5 (it merged the old cudarc/gpu-cuda/gpu-cubecl split).
+# It covers both the device backend + custom kernels and the residency-aware colour
+# dispatch this workspace needs for gray -> RGB on device.
+#
+# This tag MUST match the one vision-rt pins: two kornia versions in one graph means
+# two distinct Image/Tensor types, which breaks the shared-type interop. Bump both
+# repos together, or neither.
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.5", features = ["cuda"] }
+kornia-io      = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.5" }
 # sensor-rt internal crates
-nvbuf-sys   = { path = "crates/nvbuf-sys" }
+nvbuf-sys    = { path = "crates/nvbuf-sys" }
+sensor-types = { path = "crates/sensor-types" }
 sensor-rtsp = { path = "crates/sensor-rtsp" }
+sensor-oak  = { path = "crates/sensor-oak" }
 # external
 gstreamer     = "0.20"
 gstreamer-app = "0.20"
 thiserror     = "2.0"
 env_logger    = "0.11"
+# Example CLIs only (dev-dependency): argh over clap — a fraction of the compile
+# time and dependency count, and these binaries need flags, not a framework.
+argh          = "0.1"
+# Example visualisation only. SDK feature just logs / writes .rrd — the native
+# viewer feature would drag in a whole GUI stack we do not want on a Jetson.
+rerun         = { version = "0.34", default-features = false, features = ["sdk"] }
 cc            = "1"
+cmake         = "0.1"

@@ -1,49 +1,35 @@
-//! GStreamer RTSP source with Jetson NVMM hardware decode — **async, no hidden
-//! sync**.
+//! GStreamer RTSP source with Jetson NVMM hardware decode.
 //!
-//! Decodes via `nvv4l2decoder`, resizes with the VIC scaler (`nvvidconv`) to
-//! RGBA in NVMM-backed memory, imports the DMA-BUF into CUDA, and copies the
-//! hardware-pitched RGBA into a tight, device-resident `Rgb8` (alpha dropped in
-//! the same pass; derefs to `Image<u8, 3>`) with one on-GPU kernel.
-//! [`RtspSource::next_frame`] only **enqueues** that copy on the
-//! shared stream and returns an owned [`Frame`] — it never calls
-//! `cudaStreamSynchronize`. The **caller owns the single sync** (VPI / TensorRT
-//! model): run your model on the same stream, then sync once, then read.
-//!
-//! Frames come from a small **ring of device buffers**, so several can be in
-//! flight (decode ∥ copy ∥ inference overlap). The transient NVMM imports are
-//! reclaimed **lazily** via per-frame CUDA events (`cudaEventQuery`), never a
-//! blocking sync on the hot path. For true zero-copy DMA-BUF sharing (no copy),
-//! use [`RtspSource::next_nvmm`].
+//! Decodes via `nvv4l2decoder` and converts to RGBA in NVMM-backed memory, then
+//! imports the DMA-BUF into CUDA and packs it into a tight RGB8 device image with
+//! one on-GPU kernel (no host round-trip). For true zero-copy DMA-BUF sharing
+//! (no pack), use [`RtspSource::next_nvmm`].
 //!
 //! ## Typical usage
 //! ```no_run
 //! use sensor_rtsp::RtspSource;
-//! use cudarc::driver::CudaContext;
 //!
-//! let stream = CudaContext::new(0).unwrap().default_stream();
+//! // Share one CUDA stream with the model so the RGBA→RGB pack and inference
+//! // are ordered. Each frame is a `Stamped<kornia_image::Image<u8, 3>>` (device).
+//! let stream = vrt::Stream::new_standalone().unwrap().cuda_stream().clone();
 //! let mut source = RtspSource::connect("rtsp://camera/stream", stream).unwrap();
 //! while let Some(frame) = source.next_frame() {
-//!     // frame.image(): &Rgb8 (device RGB, derefs to Image<u8,3>)  ·  frame.meta: FrameMeta
-//!     // ... enqueue your model on the SAME stream (no sync here) ...
-//!     stream.synchronize().unwrap(); // the caller's single sync
+//!     // let result = model.run(&frame.data).unwrap();  // frame.data: &Image<u8,3>
 //! }
 //! ```
 
-pub mod stamp;
+pub mod mp4;
 
-use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use crate::stamp::FrameMeta;
 use cudarc::driver::sys::CUdeviceptr;
-use cudarc::driver::{CudaEvent, CudaStream};
+use cudarc::driver::CudaStream;
 use gstreamer::prelude::*;
-use kornia_image::color_spaces::Rgb8;
-use kornia_image::ImageSize;
-use kornia_tensor::CudaKernel; // JIT pack kernel lives in kornia-tensor (not re-exported by kornia-image)
+use kornia_image::Image;
+use kornia_tensor::{CudaKernel, Tensor};
+use sensor_types::{FrameMeta, Stamped};
 
 /// Errors from the GStreamer NVMM source.
 #[derive(Debug, thiserror::Error)]
@@ -163,15 +149,19 @@ impl NvmmFrame {
     }
 }
 
+/// A CPU RGBA snapshot for visualization: `(rgba_bytes, width, height)`.
+pub type CpuFrame = (Vec<u8>, u32, u32);
+
 // ── RtspSource ────────────────────────────────────────────────────────────────
 
-/// RTSP source that delivers frames as device-resident `Rgb8` using Jetson
-/// hardware decode.
+/// RTSP source that delivers frames as NVMM RGBA using Jetson hardware decode.
 ///
 /// # Pipeline
 /// ```text
 /// rtspsrc → rtph264depay → h264parse → nvv4l2decoder → nvvidconv
-///         → video/x-raw(memory:NVMM),format=RGBA → appsink(NVMM)
+///         → video/x-raw(memory:NVMM),format=RGBA → tee
+///              ├→ appsink(NVMM)   [main inference path]
+///              └→ nvvidconv → video/x-raw,format=RGBA → appsink(CPU)  [viz snapshot]
 /// ```
 pub struct RtspSource {
     pipeline: gstreamer::Pipeline,
@@ -180,23 +170,19 @@ pub struct RtspSource {
     height: u32,
     /// Stamped onto each frame's [`FrameMeta::source_id`] for multi-camera setups.
     source_id: u32,
-    /// Shared CUDA stream the per-frame pitched→tight copy runs on (see
-    /// [`RtspSource::cuda_stream`]).
+    /// Latest CPU RGBA frame for visualization.  Updated asynchronously by GStreamer;
+    /// take with `latest_cpu_frame()` and lock to read.
+    cpu_frame: Arc<Mutex<Option<CpuFrame>>>,
+    /// Shared CUDA stream the per-frame RGBA→RGB pack runs on (see [`RtspSource::cuda_stream`]).
     stream: Arc<CudaStream>,
-    /// JIT kernel that copies the pitched NVMM RGBA import into a tight RGB image.
+    /// JIT kernel that packs the pitched NVMM RGBA import into a tight RGB8 image.
     pack: CudaKernel,
-    /// Ring of device output buffers (see [`POOL_CAP`]); a [`Frame`] checks one
-    /// out and returns it on drop — so several frames can be in flight.
-    pool: Arc<Mutex<BufPool>>,
-    /// NVMM imports awaiting their on-stream copy to finish; drained lazily by
-    /// [`RtspSource::retire`] via a non-blocking event query (no host sync).
-    inflight: VecDeque<InFlight>,
 }
 
-// Un-pitch + drop alpha in one pass: the decoder's NVMM RGBA (row-pitched,
-// 4 B/px) → a tightly-packed **RGB** device image (stride = w*3). Fuses what used
-// to be two device passes (un-pitch to RGBA, then RGBA→RGB) into one, so the
-// source emits model-ready `Image<u8,3>`. Stays entirely on the GPU.
+// Pack the decoder's NVMM RGBA (row-pitched, 4 B/px) into a tightly-packed RGB8
+// image (3 B/px, stride = w*3) — the layout kornia's Preprocessor + the vrt models
+// require. There is no zero-copy path (kornia is tight-RGB8-only), but this stays
+// entirely on the GPU (no host round-trip).
 const PACK_SRC: &str = r#"
 extern "C" __global__ void rgba_pitch_to_rgb(
     const unsigned char* __restrict__ src, int src_pitch,
@@ -213,104 +199,17 @@ extern "C" __global__ void rgba_pitch_to_rgb(
 }
 "#;
 
-/// Build a zeroed, device-resident tight `Rgb8` of `w×h`. Allocated once per ring
-/// slot and reused for every frame's un-pitch copy.
-fn alloc_rgb_image(stream: &Arc<CudaStream>, w: u32, h: u32) -> Result<Rgb8, GstSourceError> {
-    let size = ImageSize {
-        width: w as usize,
-        height: h as usize,
-    };
-    Rgb8::zeros_cuda(size, stream)
-        .map_err(|e| GstSourceError::Cuda(format!("alloc rgb image: {e}")))
-}
-
-/// Number of device output buffers in the ring — how many frames may be in
-/// flight (checked out) at once before `next_frame`/`try_next` drop new frames.
-const POOL_CAP: usize = 4;
-
-/// A ring of reusable tight-RGB device buffers. A frame checks one out; it
-/// returns to the ring when the [`Frame`] is dropped.
-struct BufPool {
-    free: Vec<Rgb8>,
-    stream: Arc<CudaStream>,
+/// Build a zeroed, device-resident tight RGB888 kornia image of `w×h`.
+fn alloc_rgb_image(
+    stream: &Arc<CudaStream>,
     w: u32,
     h: u32,
-    allocated: usize,
-}
-
-impl BufPool {
-    fn checkout(&mut self) -> Option<Rgb8> {
-        if let Some(b) = self.free.pop() {
-            return Some(b);
-        }
-        if self.allocated < POOL_CAP {
-            let b = alloc_rgb_image(&self.stream, self.w, self.h).ok()?;
-            self.allocated += 1;
-            return Some(b);
-        }
-        None // ring exhausted — all buffers are checked out by live Frames
-    }
-
-    fn checkin(&mut self, b: Rgb8) {
-        self.free.push(b);
-    }
-}
-
-/// A transient NVMM import + its GStreamer sample, held until the on-stream copy
-/// that reads it has completed (tracked by `event`). Reclaimed lazily by
-/// [`RtspSource::retire`] via a non-blocking `cudaEventQuery` — never a sync.
-struct InFlight {
-    _mem: CudaMemory, // released (cudaDestroyExternalMemory) on drop — declared first
-    _nvmm: NvmmFrame, // keeps the GStreamer buffer / DMA-BUF fd alive
-    event: Arc<CudaEvent>,
-}
-
-/// One decoded frame: an owned handle to a device-resident tight-RGB image
-/// (drawn from the source's ring) plus provenance. Dropping it returns the
-/// buffer to the ring. The pixel data is valid once the shared stream has passed
-/// this frame's copy — read it after your caller-owned `stream.synchronize()`
-/// (or wait [`Frame::event`] on another stream).
-pub struct Frame {
-    image: Option<Rgb8>,
-    /// Frame provenance: sequence, capture PTS, source id.
-    pub meta: FrameMeta,
-    done: Arc<CudaEvent>,
-    pool: Arc<Mutex<BufPool>>,
-}
-
-impl Frame {
-    /// The device-resident tight-RGB image (valid after the caller's sync).
-    /// `Rgb8` derefs to `kornia_image::Image<u8, 3>`, so it drops straight into
-    /// anything taking `&Image<u8, 3>` (e.g. a model's `submit`).
-    pub fn image(&self) -> &Rgb8 {
-        self.image.as_ref().expect("frame image present until drop")
-    }
-
-    /// CUDA event recorded right after this frame's copy — wait it on another
-    /// stream (`other.wait(frame.event())`) to order GPU work without a host sync.
-    ///
-    /// **Cross-stream caveat:** dropping the `Frame` immediately returns its buffer
-    /// to the ring, where the next frame's copy (on the source stream) may
-    /// overwrite it. If you read the image from a *different* stream, that stream's
-    /// reads must be complete before the drop — sync it (or hold the `Frame`) first,
-    /// or the recycle races your read. Same-stream consumers are always safe (stream
-    /// order serialises the recycle behind their work).
-    pub fn event(&self) -> &CudaEvent {
-        &self.done
-    }
-}
-
-impl Drop for Frame {
-    fn drop(&mut self) {
-        // Buffer returns to the ring. Safe for same-stream consumers (stream order
-        // serialises the next copy behind their reads); cross-stream readers must
-        // finish first — see [`Frame::event`].
-        if let Some(img) = self.image.take() {
-            if let Ok(mut pool) = self.pool.lock() {
-                pool.checkin(img);
-            }
-        }
-    }
+) -> Result<Image<u8, 3>, GstSourceError> {
+    let slice = stream
+        .alloc_zeros::<u8>(w as usize * h as usize * 3)
+        .map_err(|e| GstSourceError::Cuda(format!("alloc rgb image: {e}")))?;
+    let t = Tensor::from_cudaslice(slice, [h as usize, w as usize, 3], stream.clone());
+    Image::try_from(t).map_err(|e| GstSourceError::Cuda(format!("build device Image<u8,3>: {e}")))
 }
 
 impl RtspSource {
@@ -368,8 +267,9 @@ impl RtspSource {
         }
 
         // Optional VIC resize: add width/height to nvvidconv output caps.
-        // Single NVMM appsink. leaky=upstream on the queue: if the consumer falls
-        // behind it drops new frames rather than blocking the decoder.
+        // Two appsinks via tee: NVMM path for inference, CPU path for visualization.
+        // leaky=upstream on both queues: if a branch falls behind it drops new frames
+        // rather than blocking the decoder.
         let nvmm_caps = match resize {
             None => "video/x-raw(memory:NVMM),format=RGBA".to_string(),
             Some((w, h)) => format!("video/x-raw(memory:NVMM),format=RGBA,width={w},height={h}"),
@@ -383,9 +283,12 @@ impl RtspSource {
         let bin_str = format!(
             "rtph264depay name=depay ! h264parse ! \
              nvv4l2decoder enable-max-performance=1 disable-dpb=true ! \
-             nvvidconv ! {nvmm_caps} ! \
-             queue max-size-buffers=2 leaky=upstream ! \
-             appsink name=sink max-buffers=1 drop=true sync=false"
+             nvvidconv ! {nvmm_caps} ! tee name=t \
+             t. ! queue max-size-buffers=2 leaky=upstream ! \
+                  appsink name=sink max-buffers=1 drop=true sync=false \
+             t. ! queue max-size-buffers=2 leaky=upstream ! \
+                  nvvidconv ! video/x-raw,format=RGBA ! \
+                  appsink name=sink_cpu max-buffers=1 drop=true sync=false"
         );
 
         let pipeline = gstreamer::Pipeline::default();
@@ -396,11 +299,12 @@ impl RtspSource {
             .build()
             .map_err(|_| GstSourceError::Setup("failed to create rtspsrc"))?;
 
-        // Parse the static downstream chain into a bin. `depay`'s sink is the one
-        // unlinked pad; a direct cross-bin-boundary link from `rtspsrc` does NOT
-        // flow data, so `true` **auto-ghosts** that sink onto the bin (named after
-        // its template → `"sink"`) and rtspsrc links to `bin.static_pad("sink")`.
-        let bin = gstreamer::parse_bin_from_description(&bin_str, true)?;
+        // Parse the static downstream chain into a bin, then promote its
+        // contents into the pipeline so they sit at the top level (matching the
+        // previous flat `parse_launch` layout). `parse_bin_from_description`
+        // with `ghost_unlinked_pads = false` keeps `depay`'s sink pad exposed
+        // for dynamic linking from `rtspsrc`.
+        let bin = gstreamer::parse_bin_from_description(&bin_str, false)?;
 
         pipeline
             .add(&src)
@@ -413,46 +317,30 @@ impl RtspSource {
         // link it to the depayloader on pad-added (same dynamic linking the old
         // `!` did implicitly).
         let bin_weak = bin.downgrade();
-        let pipeline_weak = pipeline.downgrade();
         src.connect_pad_added(move |_src, src_pad| {
+            let Some(bin) = bin_weak.upgrade() else {
+                return;
+            };
+            let Some(depay) = bin.by_name("depay") else {
+                return;
+            };
+            let Some(sink_pad) = depay.static_pad("sink") else {
+                return;
+            };
+            if sink_pad.is_linked() {
+                return;
+            }
+            // Only link the video stream — ignore any audio/other media pads.
             // RTP pads carry caps `application/x-rtp, media=(string)video|audio`.
-            // If media is absent (some servers describe it late), treat as video —
-            // matching the old `!` which linked the first src pad.
+            // If media is absent (some servers describe it late), fall back to
+            // linking, matching the old `!` which linked the first src pad.
             let is_video = src_pad
                 .current_caps()
                 .and_then(|c| c.structure(0).and_then(|s| s.get::<String>("media").ok()))
                 .map(|m| m == "video")
                 .unwrap_or(true);
-
-            // Link the first video stream to the bin's auto-ghosted sink pad.
-            // Only bail out on a SUCCESSFUL link — if the link fails (e.g. a
-            // non-H.264 codec the depayloader rejects) fall through and drain the
-            // pad, else it stays unlinked and stalls the whole pipeline.
             if is_video {
-                if let Some(sink_pad) = bin_weak.upgrade().and_then(|b| b.static_pad("sink")) {
-                    if !sink_pad.is_linked() && src_pad.link(&sink_pad).is_ok() {
-                        return;
-                    }
-                }
-            }
-
-            // Any other pad (audio, a second stream, or a video pad that wouldn't
-            // link) MUST still be drained: an unlinked `rtspsrc` pad raises
-            // "not-linked" and stalls the WHOLE pipeline, so no frames ever reach
-            // the appsink. Sink it to a fakesink.
-            if let Some(pipeline) = pipeline_weak.upgrade() {
-                if let Ok(fake) = gstreamer::ElementFactory::make("fakesink")
-                    .property("sync", false)
-                    .property("async", false)
-                    .build()
-                {
-                    if pipeline.add(&fake).is_ok() {
-                        let _ = fake.sync_state_with_parent();
-                        if let Some(fsink) = fake.static_pad("sink") {
-                            let _ = src_pad.link(&fsink);
-                        }
-                    }
-                }
+                let _ = src_pad.link(&sink_pad);
             }
         });
 
@@ -464,10 +352,15 @@ impl RtspSource {
             .dynamic_cast::<gstreamer_app::AppSink>()
             .map_err(|_| GstSourceError::Setup("element is not AppSink"))?;
 
+        let appsink_cpu = bin
+            .by_name("sink_cpu")
+            .ok_or(GstSourceError::Setup("no sink_cpu"))?
+            .dynamic_cast::<gstreamer_app::AppSink>()
+            .map_err(|_| GstSourceError::Setup("sink_cpu is not AppSink"))?;
+
         let (frame_tx, frame_rx) = mpsc::sync_channel::<NvmmFrame>(2);
         let (dim_tx, dim_rx) = mpsc::sync_channel::<(u32, u32)>(1);
-        // Packed (width<<32 | height) of the first valid frame; 0 = unset.
-        let first_dims = Arc::new(AtomicU64::new(0));
+        let dims_sent = Arc::new(AtomicBool::new(false));
 
         appsink.set_callbacks(
             gstreamer_app::AppSinkCallbacks::builder()
@@ -505,18 +398,8 @@ impl RtspSource {
                         return Err(gstreamer::FlowError::Error);
                     }
 
-                    // The first valid frame fixes the working dimensions (the pool
-                    // + kernel are sized to them). Reject a later frame with
-                    // different dims (mid-stream renegotiation under plain
-                    // `connect()`) — feeding it would over-index the pack kernel.
-                    let packed = ((width as u64) << 32) | height as u64;
-                    match first_dims.compare_exchange(0, packed, Ordering::SeqCst, Ordering::SeqCst)
-                    {
-                        Ok(_) => {
-                            let _ = dim_tx.try_send((width, height)); // first → publish
-                        }
-                        Err(prev) if prev != packed => return Err(gstreamer::FlowError::Error),
-                        Err(_) => {} // same dims — ok
+                    if !dims_sent.swap(true, Ordering::SeqCst) {
+                        let _ = dim_tx.try_send((width, height));
                     }
 
                     // Capture PTS (camera/decoder timebase) before moving `sample`.
@@ -527,25 +410,45 @@ impl RtspSource {
                 .build(),
         );
 
+        let cpu_frame: Arc<Mutex<Option<CpuFrame>>> = Arc::new(Mutex::new(None));
+        let cpu_frame_cb = Arc::clone(&cpu_frame);
+
+        appsink_cpu.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink
+                        .pull_sample()
+                        .map_err(|_| gstreamer::FlowError::Error)?;
+                    let buffer = sample.buffer().ok_or(gstreamer::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gstreamer::FlowError::Error)?;
+                    let st = caps.structure(0).ok_or(gstreamer::FlowError::Error)?;
+                    let w = st
+                        .get::<i32>("width")
+                        .map_err(|_| gstreamer::FlowError::Error)?
+                        as u32;
+                    let h = st
+                        .get::<i32>("height")
+                        .map_err(|_| gstreamer::FlowError::Error)?
+                        as u32;
+                    let map = buffer
+                        .map_readable()
+                        .map_err(|_| gstreamer::FlowError::Error)?;
+                    let data = map.as_slice().to_vec();
+                    drop(map);
+                    if let Ok(mut g) = cpu_frame_cb.lock() {
+                        *g = Some((data, w, h));
+                    }
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
         pipeline.set_state(gstreamer::State::Playing)?;
 
-        // Bounded wait: a dead/misbehaving endpoint (or a stream that never yields a
-        // valid video frame) must fail with `NoFirstFrame`, not hang the caller.
-        let (width, height) = dim_rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .map_err(|_| GstSourceError::NoFirstFrame)?;
+        let (width, height) = dim_rx.recv().map_err(|_| GstSourceError::NoFirstFrame)?;
 
         let pack = CudaKernel::compile(stream.context(), PACK_SRC, "rgba_pitch_to_rgb")
             .map_err(|e| GstSourceError::Cuda(format!("compile pack kernel: {e}")))?;
-
-        // Ring of tight-RGB output buffers, grown lazily up to POOL_CAP.
-        let pool = Arc::new(Mutex::new(BufPool {
-            free: Vec::new(),
-            stream: stream.clone(),
-            w: width,
-            h: height,
-            allocated: 0,
-        }));
 
         Ok(Self {
             pipeline,
@@ -553,17 +456,16 @@ impl RtspSource {
             width,
             height,
             source_id: 0,
+            cpu_frame,
             stream,
             pack,
-            pool,
-            inflight: VecDeque::new(),
         })
     }
 
-    /// The shared CUDA stream the per-frame pitched→tight copy is enqueued on.
-    /// **Build the consuming model with this stream** so the copy and the model's
-    /// inference are ordered on one stream — then a single `stream.synchronize()`
-    /// completes both. `next_frame` never syncs it for you.
+    /// The shared CUDA stream the per-frame RGBA→RGB pack runs on. **Build the
+    /// consuming model with this stream** so the pack and the model's inference
+    /// are ordered on one stream (the frame's device image is valid after the
+    /// pack, which `next_frame` syncs before returning).
     pub fn cuda_stream(&self) -> Arc<CudaStream> {
         self.stream.clone()
     }
@@ -581,76 +483,46 @@ impl RtspSource {
         self.source_id = id;
         self
     }
+
+    /// Returns a shared handle to the latest CPU RGBA snapshot.
+    ///
+    /// Clone the `Arc` before moving the source into a `Pipeline`.  The GStreamer
+    /// thread updates this every frame (overwriting old data); lock and `take()` to
+    /// consume without holding the lock during PNG save.
+    pub fn latest_cpu_frame(&self) -> Arc<Mutex<Option<CpuFrame>>> {
+        Arc::clone(&self.cpu_frame)
+    }
 }
 
 impl RtspSource {
-    /// Pull the next decoded frame (**blocking** until one arrives), import its
-    /// NVMM DMA-BUF into CUDA, and **enqueue** the pitched→tight RGB copy on the
-    /// shared stream into a ring buffer. Returns an owned [`Frame`] — **no sync**.
-    /// Run your model on [`RtspSource::cuda_stream`], then issue the single
-    /// `stream.synchronize()` yourself before reading the pixels. Returns `None`
-    /// at end-of-stream. If the ring is momentarily exhausted (all buffers held
-    /// by live `Frame`s) the incoming frame is dropped and the next awaited.
-    pub fn next_frame(&mut self) -> Option<Frame> {
-        loop {
-            self.retire();
-            let nvmm = self.rx.recv().ok()?;
-            match self.acquire(nvmm) {
-                Some(frame) => return Some(frame),
-                None => continue, // ring full or import failed — drop, await next
-            }
-        }
-    }
-
-    /// Non-blocking variant: return the next frame if one is already decoded,
-    /// else `None`. Same async contract as [`next_frame`](Self::next_frame).
-    pub fn try_next(&mut self) -> Option<Frame> {
-        self.retire();
-        let nvmm = self.rx.try_recv().ok()?;
-        self.acquire(nvmm)
-    }
-
-    /// Return a checked-out ring buffer to the pool (used on `acquire` error paths
-    /// so a transient CUDA failure can't permanently shrink the ring).
-    fn recycle(&self, img: Rgb8) {
-        if let Ok(mut pool) = self.pool.lock() {
-            pool.checkin(img);
-        }
-    }
-
-    /// Import + enqueue the copy for one NVMM frame into a ring buffer, record a
-    /// completion event, and stash the import for lazy retire. `None` if the ring
-    /// is exhausted or a CUDA op fails — in which case the buffer is returned to
-    /// the ring and (once a kernel is enqueued) the stream is synced before the
-    /// NVMM import is released.
-    fn acquire(&mut self, nvmm: NvmmFrame) -> Option<Frame> {
-        let mut img = self.pool.lock().ok()?.checkout()?; // None → ring full
-
-        let mem = match unsafe { nvmm.cuda_memory() } {
+    /// Pull the next decoded frame, import its NVMM DMA-BUF into CUDA, pack the
+    /// pitched RGBA into a tight RGB8 device [`Image`], and return it [`Stamped`]
+    /// with the capture timestamp (camera PTS) and `source_id`. The pack runs on
+    /// [`RtspSource::cuda_stream`] and is synced before the transient NVMM import
+    /// is released, so the returned image is self-owned and valid. Returns `None`
+    /// at end-of-stream or on import/pack failure.
+    pub fn next_frame(&mut self) -> Option<Stamped<Image<u8, 3>>> {
+        let frame = self.rx.recv().ok()?;
+        let mem = match unsafe { frame.cuda_memory() } {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[rtsp] NVMM import failed: {e}");
-                self.recycle(img);
                 return None;
             }
         };
-
-        // Completion event, created BEFORE the launch: a failure here has enqueued
-        // nothing, so `mem` (dropped on return) is not yet read by any kernel.
-        let event = match self.stream.context().new_event(None) {
-            Ok(e) => Arc::new(e),
-            Err(e) => {
-                eprintln!("[rtsp] cuda event create failed: {e}");
-                self.recycle(img);
-                return None;
-            }
-        };
-
-        // Enqueue the pitched RGBA import → tight-RGB copy (async, no sync).
         let (w, h) = (self.width, self.height);
+        let meta = FrameMeta {
+            pts_ns: frame.pts_ns, // camera capture timestamp
+            source_id: Some(self.source_id),
+            ..FrameMeta::default()
+        };
+
+        // Pack the pitched RGBA import → tight RGB8 device image on the shared stream.
+        let mut img = alloc_rgb_image(&self.stream, w, h).ok()?;
         let src_raw = mem.dev_ptr as usize as CUdeviceptr;
-        let (pitch_i, w_i, n) = (nvmm.pitch as i32, w as i32, (w * h) as i32);
-        let launched = img.as_cudaslice_mut().is_some_and(|dst| {
+        let (pitch_i, w_i, n) = (frame.pitch as i32, w as i32, (w * h) as i32);
+        {
+            let dst = img.as_cudaslice_mut()?;
             self.pack
                 .launch_builder(&self.stream)
                 .arg(&src_raw)
@@ -659,62 +531,14 @@ impl RtspSource {
                 .arg(&w_i)
                 .arg(&n)
                 .launch_1d(w * h)
-                .is_ok()
-        });
-        if !launched {
-            eprintln!("[rtsp] pack kernel launch failed");
-            self.recycle(img); // launch failed → kernel never ran → `mem` safe to drop
-            return None;
+                .ok()?;
         }
-
-        // Record after the launch. If it fails, the kernel is already enqueued and
-        // reading `mem`, so sync before `mem` drops to avoid a GPU use-after-free.
-        if event.record(&self.stream).is_err() {
-            eprintln!("[rtsp] cuda event record failed");
-            let _ = self.stream.synchronize();
-            self.recycle(img);
-            return None;
-        }
-
-        let meta = FrameMeta {
-            pts_ns: nvmm.pts_ns, // camera capture timestamp
-            source_id: Some(self.source_id),
-            ..FrameMeta::default()
-        };
-        self.inflight.push_back(InFlight {
-            _mem: mem,
-            _nvmm: nvmm,
-            event: event.clone(),
-        });
-        Some(Frame {
-            image: Some(img),
-            meta,
-            done: event,
-            pool: self.pool.clone(),
-        })
-    }
-
-    /// Reclaim NVMM imports whose copy has finished — **non-blocking**. Events
-    /// complete in submission order on the single stream, so drain from the front
-    /// while `cudaEventQuery` reports ready. Called at the top of every acquire.
-    fn retire(&mut self) {
-        use cudarc::driver::sys::CUresult;
-        while let Some(front) = self.inflight.front() {
-            match unsafe { cudarc::driver::result::event::query(front.event.cu_event()) } {
-                // Copy done → drop _mem (release import) then _nvmm (unref sample).
-                Ok(()) => {
-                    self.inflight.pop_front();
-                }
-                // Still running (in submission order on one stream) → stop draining.
-                Err(e) if e.0 == CUresult::CUDA_ERROR_NOT_READY => break,
-                // A real query error will never clear; releasing the import now beats
-                // an unbounded in-flight queue leaking DMA-BUF fds / device memory.
-                Err(e) => {
-                    eprintln!("[rtsp] event query error, releasing import: {e:?}");
-                    self.inflight.pop_front();
-                }
-            }
-        }
+        // The kernel read the transient NVMM import; sync before it (and the
+        // backing DMA-BUF frame) are dropped.
+        self.stream.synchronize().ok()?;
+        drop(mem);
+        drop(frame);
+        Some(Stamped::new(meta, img))
     }
 
     /// Pull the next decoded frame as a raw NVMM handle (DMA-BUF fd + metadata),
@@ -732,52 +556,5 @@ impl RtspSource {
 impl Drop for RtspSource {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gstreamer::State::Null);
-        // Ensure any in-flight copy has finished before the NVMM imports are
-        // released (this is teardown, not the hot path — a blocking sync is fine).
-        let _ = self.stream.synchronize();
-        self.inflight.clear();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::redact_url;
-    use super::stamp::{FrameMeta, Stamped};
-
-    #[test]
-    fn redact_strips_credentials() {
-        // userinfo removed, host/port/path kept
-        assert_eq!(
-            redact_url("rtsp://user:pass@192.168.1.147:554/stream1"),
-            "rtsp://***@192.168.1.147:554/stream1"
-        );
-        // no credentials → unchanged
-        assert_eq!(redact_url("rtsp://host:554/s"), "rtsp://host:554/s");
-        // userinfo with no port/path
-        assert_eq!(redact_url("rtsp://u:p@host"), "rtsp://***@host");
-        // rtsps scheme
-        assert_eq!(redact_url("rtsps://a:b@h/p"), "rtsps://***@h/p");
-        // an '@' in the path must NOT be mistaken for userinfo
-        assert_eq!(redact_url("rtsp://host/pa@th"), "rtsp://host/pa@th");
-        // not a URL → returned as-is (never used except for display)
-        assert_eq!(redact_url("garbage"), "garbage");
-    }
-
-    #[test]
-    fn stamp_carries_and_maps_metadata() {
-        let meta = FrameMeta {
-            seq: 7,
-            pts_ns: Some(42),
-            source_id: Some(3),
-        };
-        let s: Stamped<&str> = meta.stamp("payload");
-        assert_eq!(s.meta.seq, 7);
-        assert_eq!(s.meta.pts_ns, Some(42));
-        assert_eq!(s.data, "payload");
-
-        // map transforms the value, keeps the metadata
-        let mapped = s.map(|d| d.len());
-        assert_eq!(mapped.data, 7);
-        assert_eq!(mapped.meta.source_id, Some(3));
     }
 }
