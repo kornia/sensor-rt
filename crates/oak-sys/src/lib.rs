@@ -12,6 +12,21 @@ pub struct oak_device {
     _private: [u8; 0],
 }
 
+/// One IMU reading: accelerometer (m/s²) + gyroscope (rad/s), stamped on the same
+/// host-synced epoch timeline as the image frames. Mirrors `oak_imu_sample` in
+/// `oak_bridge.h` — the layout must stay in lockstep with it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct oak_imu_sample {
+    pub ts_ns: u64,
+    pub ax: f32,
+    pub ay: f32,
+    pub az: f32,
+    pub gx: f32,
+    pub gy: f32,
+    pub gz: f32,
+}
+
 extern "C" {
     pub fn oak_open(
         device_id: *const c_char,
@@ -22,6 +37,36 @@ extern "C" {
         enable_depth: c_int,
         video_only: c_int,
     ) -> *mut oak_device;
+
+    /// Open the stereo (CAM_B/CAM_C) + IMU modality. See `oak_bridge.h`.
+    pub fn oak_open_stereo(
+        device_id: *const c_char,
+        width: c_int,
+        height: c_int,
+        fps: c_int,
+        imu_hz: c_int,
+    ) -> *mut oak_device;
+
+    pub fn oak_has_stereo(dev: *const oak_device) -> c_int;
+
+    pub fn oak_has_imu(dev: *const oak_device) -> c_int;
+
+    pub fn oak_poll_stereo(
+        dev: *mut oak_device,
+        left: *mut *const u8,
+        right: *mut *const u8,
+        width: *mut c_int,
+        height: *mut c_int,
+        len: *mut c_int,
+        ts_ns: *mut u64,
+    ) -> c_int;
+
+    pub fn oak_poll_imu(
+        dev: *mut oak_device,
+        out: *mut oak_imu_sample,
+        max: c_int,
+        n: *mut c_int,
+    ) -> c_int;
 
     pub fn oak_has_depth(dev: *const oak_device) -> c_int;
 

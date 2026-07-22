@@ -22,10 +22,6 @@ use vrt_xfeat::{XFeat, XFeatParams};
 mod sink;
 use sink::KeypointViz;
 
-fn pad32(v: u32) -> u32 {
-    v.div_ceil(32) * 32
-}
-
 fn main() -> Result<(), vrt::BoxError> {
     env_logger::init();
 
@@ -64,23 +60,26 @@ fn main() -> Result<(), vrt::BoxError> {
     let stream = Stream::new_standalone()?.cuda_stream().clone();
     let mut source = RtspSource::connect_resized(rtsp_url, RESIZE_W, RESIZE_H, stream.clone())?;
     let (src_w, src_h) = (source.width(), source.height());
-    let (dst_w, dst_h) = (pad32(src_w), pad32(src_h));
-    println!("Stream: resized to {src_w}×{src_h} (VIC) → model input {dst_w}×{dst_h}");
+    println!(
+        "Stream: resized to {src_w}×{src_h} (VIC); XFeat runs its backbone at {}×{} (floor-32)",
+        (src_w / 32) * 32,
+        (src_h / 32) * 32,
+    );
 
     let cpu_snap = source.latest_cpu_frame();
-    // XFeat owns its letterbox preprocessor (source frames → dst_w×dst_h model input).
-    let mut xfeat = XFeat::new(
-        engine,
-        stream.clone(),
-        XFeatParams::new(4096, 0.05, dst_h as usize, dst_w as usize),
-    )?;
+    // Upstream XFeat sizes its backbone per frame (floor-of-32 of the input) and
+    // rescales keypoints back to source pixels, so no model-input size is configured.
+    let mut xfeat = XFeat::new(engine, stream.clone(), XFeatParams::new(4096, 0.05))?;
+    // Submit-only API: caller owns the output buffer and the stream sync.
+    let mut result = xfeat.alloc_result()?;
     // The viz shares the stream to download device-resident keypoints when drawing.
-    let viz = KeypointViz::new(cpu_snap, stream, save_dir.to_string(), dst_w, dst_h, 30);
+    let viz = KeypointViz::new(cpu_snap, save_dir.to_string(), 30);
 
     let mut n = 0u64;
     let t0 = Instant::now();
     while let Some(frame) = source.next_frame() {
-        let result = xfeat.run(&frame.data)?;
+        xfeat.submit(&frame.data, &mut result)?;
+        stream.synchronize()?;
         n += 1;
         // frame.meta carries the camera capture PTS; the app owns the seq counter.
         let pts_ms = frame.meta.pts_ns.map(|p| p as f64 / 1e6).unwrap_or(0.0);

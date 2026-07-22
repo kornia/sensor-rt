@@ -13,12 +13,16 @@ use std::sync::Arc;
 use cudarc::driver::CudaStream;
 use kornia_image::Image;
 use kornia_tensor::Tensor;
-use vrt::stamp::FrameMeta;
-use vrt::{BoxError, Intrinsics, VrtDepthMap};
+use sensor_types::{DepthMap, FrameMeta};
+use vrt::BoxError;
+use vrt_types::CameraIntrinsics;
 
 // The depth→3D bridge (`Lifter`/`SizePriors`) is sensor-agnostic and lives in
-// `vrt-lift`; camera `Intrinsics` are a `vrt` core type. This crate is just the
+// `vrt-lift`; camera `CameraIntrinsics` are a `vrt` core type. This crate is just the
 // OAK sensor driver and no longer depends on the tracker.
+
+mod stereo;
+pub use stereo::{ImuSample, StereoFrame};
 
 /// One synced OAK frame: RGB on the device, optional aligned depth on the host.
 ///
@@ -36,7 +40,7 @@ pub struct OakFrame<'a> {
     width: u32,
     height: u32,
     rgb_device: Option<&'a Image<u8, 3>>,
-    depth: Option<VrtDepthMap>,
+    depth: Option<DepthMap>,
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
 
@@ -70,7 +74,7 @@ impl OakFrame<'_> {
     }
     /// Aligned depth map, if the device has a stereo pair. Borrowed — same "valid only while this
     /// frame is held" contract as [`rgb_host`](Self::rgb_host).
-    pub fn depth(&self) -> Option<&VrtDepthMap> {
+    pub fn depth(&self) -> Option<&DepthMap> {
         self.depth.as_ref()
     }
 }
@@ -85,9 +89,15 @@ pub struct OakSource {
     width: u32,
     height: u32,
     seq: u64,
-    intr: Intrinsics,
+    intr: CameraIntrinsics,
     has_depth: bool,
     has_sync: bool,
+    // Stereo+IMU modality (`open_stereo`) — see `stereo.rs`. Both false on every other path.
+    has_stereo: bool,
+    has_imu: bool,
+    /// Reused staging buffer for `next_imu`, so draining inertial samples every
+    /// frame costs no allocation once it has grown.
+    imu_scratch: Vec<oak_sys::oak_imu_sample>,
 }
 
 // SAFETY: the device handle is used single-threaded by the owning loop; the CUDA
@@ -142,11 +152,18 @@ impl OakSource {
         )
     }
 
-    /// Open **video-only**: the device builds ONLY the on-device H.264 encoder — no RGB888 sync output,
-    /// no stereo — so it transmits just the small H.264 bitstream (low-bandwidth viewing over USB2 or a
-    /// shared gigabit link, where the raw RGBD would saturate it). [`OakSource::next_frame`] yields
-    /// nothing; drain [`OakSource::next_video`]. `device`: see [`OakSource::open`]. Takes NO CUDA stream:
-    /// a pure H.264 encoder never touches the GPU, so no CUDA context is created.
+    /// Open **no-stereo**: the on-device H.264 encoder plus a raw RGB888 stream, and NO StereoDepth —
+    /// for a camera with no stereo pair or no usable factory calibration, where the depth node would
+    /// fail at runtime and take the pipeline down.
+    ///
+    /// The raw RGB output is deliberate even though H.264 alone would be cheaper on the link: this
+    /// repo's cameras feed **onboard compute**, which needs actual frames (calibration snapshots,
+    /// fusion colouring), not just a bitstream for viewing. So [`OakSource::next_frame`] DOES yield
+    /// frames here — RGB with no depth — and [`OakSource::next_video`] drains the encoded stream
+    /// alongside it. Budget for the raw stream: `w*h*3` bytes/frame over XLink.
+    ///
+    /// `device`: see [`OakSource::open`]. Takes NO CUDA stream — nothing on this path uploads to the
+    /// GPU, so no CUDA context is created.
     pub fn open_video_only(
         device: Option<&str>,
         width: u32,
@@ -210,12 +227,6 @@ impl OakSource {
                 .into_owned();
             return Err(format!("oak_open failed: {e}").into());
         }
-        let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
-        unsafe { oak_sys::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
-        let has_depth = unsafe { oak_sys::oak_has_depth(dev) } != 0;
-        // False when the device auto-fell-back to a video-only pipeline (mono / uncalibrated): there is
-        // no synced RGBD to poll, so `next_frame` yields nothing and the caller drains only `next_video`.
-        let has_sync = unsafe { oak_sys::oak_has_sync(dev) } != 0;
         let rgb_img = if upload {
             let s = stream
                 .as_ref()
@@ -224,6 +235,29 @@ impl OakSource {
         } else {
             None
         };
+        Self::from_open_device(dev, width, height, stream, rgb_img, upload, h264)
+    }
+
+    /// Wrap a device the shim has already opened, reading every capability back
+    /// from it rather than assuming what the constructor asked for.
+    ///
+    /// Shared by `open_inner` and [`open_stereo`](OakSource::open_stereo): those
+    /// two build genuinely different pipelines (they share no depthai nodes), but
+    /// the "what did we actually get?" half is identical, and hard-coding it per
+    /// constructor is how the two drift. The `oak_has_*` accessors are the source
+    /// of truth — e.g. `has_sync` is false when a mono/uncalibrated device
+    /// auto-fell-back to a video-only pipeline, which the caller cannot predict.
+    pub(crate) fn from_open_device(
+        dev: *mut oak_sys::oak_device,
+        width: u32,
+        height: u32,
+        stream: Option<Arc<CudaStream>>,
+        rgb_img: Option<Image<u8, 3>>,
+        upload: bool,
+        h264: bool,
+    ) -> Result<Self, BoxError> {
+        let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
+        unsafe { oak_sys::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
         Ok(Self {
             dev,
             stream,
@@ -233,13 +267,25 @@ impl OakSource {
             width,
             height,
             seq: 0,
-            intr: Intrinsics { fx, fy, cx, cy },
-            has_depth,
-            has_sync,
+            intr: CameraIntrinsics { fx, fy, cx, cy },
+            has_depth: unsafe { oak_sys::oak_has_depth(dev) } != 0,
+            has_sync: unsafe { oak_sys::oak_has_sync(dev) } != 0,
+            has_stereo: unsafe { oak_sys::oak_has_stereo(dev) } != 0,
+            has_imu: unsafe { oak_sys::oak_has_imu(dev) } != 0,
+            imu_scratch: Vec::new(),
         })
     }
 
-    pub fn intrinsics(&self) -> Intrinsics {
+    /// Turn a device id into a C string (NULL for "first available"), kept alive
+    /// by the caller across the `oak_open*` call.
+    pub(crate) fn device_id_cstring(device: Option<&str>) -> Result<Option<CString>, BoxError> {
+        device
+            .map(CString::new)
+            .transpose()
+            .map_err(|e| format!("bad device id: {e}").into())
+    }
+
+    pub fn intrinsics(&self) -> CameraIntrinsics {
         self.intr
     }
     /// The shared CUDA stream the RGB upload runs on. **Build the consuming model
@@ -365,7 +411,7 @@ impl OakSource {
         // Zero-copy: borrow the OAK's aligned depth buffer (valid until next poll). Depth carries its OWN
         // dims (dw×dh) — it may be a downscaled grid aligned to the RGB, so consumers scale by w/dw.
         let depth = (!depth.is_null() && dw > 0 && dh > 0)
-            .then(|| unsafe { VrtDepthMap::borrowed(depth, dw as u32, dh as u32) });
+            .then(|| unsafe { DepthMap::borrowed(depth, dw as u32, dh as u32) });
 
         Some(OakFrame {
             rgb_host: host,
@@ -501,8 +547,14 @@ impl VideoTap {
     }
 }
 
-/// Build a zeroed, device-resident RGB888 kornia image of `w×h` (tight, 3 B/px).
-fn alloc_rgb_image(stream: &Arc<CudaStream>, w: u32, h: u32) -> Result<Image<u8, 3>, BoxError> {
+/// Build a zeroed, device-resident RGB888 kornia image of `w×h` (tight, 3 B/px) —
+/// the layout kornia's `Preprocessor` and the `vrt` models consume, and the one the
+/// OAK already hands us on the host, so uploads are a straight `memcpy_htod`.
+///
+/// Public so consumers that own their own upload (notably the stereo modality, which
+/// deliberately takes no CUDA stream) allocate an identically-shaped destination
+/// rather than restating the layout contract.
+pub fn alloc_rgb_image(stream: &Arc<CudaStream>, w: u32, h: u32) -> Result<Image<u8, 3>, BoxError> {
     let slice = stream.alloc_zeros::<u8>(w as usize * h as usize * 3)?;
     let t = Tensor::from_cudaslice(slice, [h as usize, w as usize, 3], stream.clone());
     Image::try_from(t).map_err(|e| format!("build device Image<u8,3>: {e}").into())

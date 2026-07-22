@@ -16,6 +16,8 @@ oak-sys       = { workspace = true }
 cudarc        = { workspace = true }
 kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
+sensor-types  = { workspace = true }
+vrt-types     = { workspace = true }
 
 [dev-dependencies]
 kornia-io = { workspace = true }

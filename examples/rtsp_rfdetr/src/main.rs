@@ -53,12 +53,17 @@ fn main() -> Result<(), vrt::BoxError> {
     println!("Stream: {src_w}×{src_h} | {det_model} (stretch)");
     let cpu_snap = source.latest_cpu_frame();
 
-    let mut detr = RfDetr::new(engine, stream, 0.5)?;
+    let mut detr = RfDetr::new(engine, stream.clone(), 0.5)?;
+    // Upstream models are submit-only: the caller owns the output buffer and the
+    // stream sync. One reused result across frames — the sync below covers it.
+    let mut det_res = detr.alloc_result()?;
 
     let mut n = 0u64;
     let t0 = Instant::now();
     while let Some(frame) = source.next_frame() {
-        let dets = detr.run(&frame.data)?;
+        detr.submit(&frame.data, &mut det_res)?;
+        stream.synchronize()?;
+        let dets = det_res.detections()?;
         n += 1;
         let pts_ms = frame.meta.pts_ns.map(|p| p as f64 / 1e6).unwrap_or(0.0);
         println!("[{n:06}] pts={pts_ms:.1}ms  | {} dets", dets.len());

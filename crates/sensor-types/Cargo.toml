@@ -1,0 +1,13 @@
+[package]
+name = "sensor-types"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Sensor-side shared types for sensor-rt: frame metadata, stamped frames, and host depth maps"
+
+[lib]
+name = "sensor_types"
+
+[dependencies]

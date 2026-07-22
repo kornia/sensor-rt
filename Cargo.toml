@@ -1,16 +1,39 @@
 [workspace]
 resolver = "2"
-# Isolated Jetson sensor drivers. Depends on vision-rt (vrt) only for the shared
-# image/tensor/geometry types that sensors emit (kornia Image, Intrinsics,
-# VrtDepthMap, stamp); vrt itself has NO sensor dependency. Live-camera examples
-# live here. Sensors emit kornia `Image<u8,3>` (device-resident).
+# Isolated Jetson sensor drivers. Depends on the PUBLIC upstream vision-rt
+# (kornia/vision-rt) for the TensorRT runtime + its shared model vocabulary
+# (`vrt-types::CameraIntrinsics`); vrt itself has NO sensor dependency. Types that
+# are purely sensor-side — frame metadata, stamped frames, host depth maps — live
+# in this workspace's own `sensor-types` leaf crate, since upstream (correctly)
+# does not carry producer concepts. Live-camera examples live here. Sensors emit
+# kornia `Image<u8,3>` (device-resident).
 members = [
     "crates/nvbuf-sys",
+    "crates/sensor-types",
     "crates/oak-sys",
     "crates/sensor-oak",
     "crates/sensor-rtsp",
     "examples/rtsp_xfeat",
     "examples/rtsp_rfdetr",
+    "examples/oakd_xfeat_stereo",
+]
+
+# PARKED — these build only against the old edgarriba/vision-rt fork; the workspace now
+# tracks kornia/vision-rt upstream (see [workspace.dependencies]). Listed as `exclude`
+# rather than commented out of `members` so cargo actually knows about them: an excluded
+# directory is a standalone package, whereas a directory that is neither a member nor
+# excluded makes `cargo` run *inside* it fail with "current package believes it's in a
+# workspace when it's not".
+#
+# Un-parking is NOT just moving a line back: each one's Cargo.toml still says
+# `vrt-lift/vrt-reid/vrt-depth = { workspace = true }`, and those keys no longer exist
+# in [workspace.dependencies], so they need re-adding (or porting) too.
+#   examples/rtsp_track         — needs vrt-reid, renamed vrt-osnet upstream (+ vrt-track API drift)
+#   examples/oakd_track3d       — needs vrt-lift, which has no upstream equivalent yet
+#   examples/oakd_track3d_viz   — needs vrt-lift and vrt-reid
+#   examples/oakd_depth_refine  — needs vrt-depth (lingbot depth *refinement*); upstream's
+#                                 vrt-depth-anything is monocular depth *estimation*, not the same model
+exclude = [
     "examples/rtsp_track",
     "examples/oakd_track3d",
     "examples/oakd_track3d_viz",
@@ -36,23 +59,31 @@ cudarc = { version = "0.19", default-features = false, features = [
   "fallback-dynamic-loading",
   "fallback-latest",
 ] }
-# vision-rt (private) — git-pinned to a fixed rev (Cargo.lock also locks it).
-# Only the crates the sensors/examples consume; vrt-preproc/vrt-yolo were removed upstream.
-vrt        = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283", package = "vision-rt" }
-vrt-xfeat  = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
-vrt-rfdetr = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
-vrt-track  = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
-vrt-lift   = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
-vrt-reid   = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
-vrt-hub    = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
-vrt-depth  = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+# vision-rt — the PUBLIC upstream (kornia/vision-rt), git-pinned to a fixed rev
+# (Cargo.lock also locks it). Previously this tracked the edgarriba/vision-rt fork;
+# the workspace now uses upstream only, so nothing here depends on a private repo.
+#
+# Two consequences of that switch, both deliberate:
+#   * upstream's vrt-xfeat already exposes the async `submit(img, &mut out)` API, so
+#     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
+#   * vrt-lift / vrt-depth / vrt-reid have no upstream equivalent (or were renamed);
+#     the examples that used them are parked in `members` above rather than deleted.
+# NOTE: upstream's core crate is named `vrt` outright; the fork called it
+# `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
+vrt        = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
+vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
+vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
+vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
+# Upstream's dependency-light shared vocabulary (CameraIntrinsics, Detection, Mask, DepthImage).
+vrt-types  = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
 # kornia GPU image/tensor types — pinned to the same rev vision-rt uses.
 kornia-image   = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-io      = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
 # sensor-rt internal crates
-nvbuf-sys   = { path = "crates/nvbuf-sys" }
+nvbuf-sys    = { path = "crates/nvbuf-sys" }
+sensor-types = { path = "crates/sensor-types" }
 oak-sys     = { path = "crates/oak-sys" }
 sensor-rtsp = { path = "crates/sensor-rtsp" }
 sensor-oak  = { path = "crates/sensor-oak" }

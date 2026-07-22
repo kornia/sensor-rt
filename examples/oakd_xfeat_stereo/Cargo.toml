@@ -1,0 +1,16 @@
+[package]
+name = "oakd_xfeat_stereo"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+vrt           = { workspace = true }
+vrt-xfeat     = { workspace = true }
+sensor-oak    = { workspace = true }
+vrt-hub       = { workspace = true, features = ["builder"] }
+cudarc        = { workspace = true }
+kornia-image  = { workspace = true }
+kornia-tensor = { workspace = true }
+kornia-io     = { workspace = true }
+env_logger    = { workspace = true }

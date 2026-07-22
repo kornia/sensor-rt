@@ -14,6 +14,7 @@ nvbuf-sys     = { workspace = true }
 gstreamer     = { workspace = true }
 gstreamer-app = { workspace = true }
 vrt           = { workspace = true }
+sensor-types  = { workspace = true }
 kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
 thiserror     = { workspace = true }

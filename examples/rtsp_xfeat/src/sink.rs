@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use kornia_image::{Image, ImageSize};
 use kornia_io::png::write_image_png_rgba8;
 use sensor_rtsp::CpuFrame;
-use vrt::CudaStream;
 use vrt_xfeat::XFeatResult;
 
 /// Draws keypoints onto the latest CPU snapshot and writes a PNG every
@@ -14,31 +13,16 @@ use vrt_xfeat::XFeatResult;
 pub struct KeypointViz {
     /// Latest CPU RGBA snapshot from the `RtspSource` tee branch.
     cpu_snap: Arc<Mutex<Option<CpuFrame>>>,
-    /// Shared stream — used to download the (device-resident) keypoints on demand.
-    stream: Arc<CudaStream>,
     save_dir: String,
-    /// Model input dims — keypoints are in model space and scale to frame space.
-    dst_w: u32,
-    dst_h: u32,
     /// Save one frame every `interval`; `0` disables saving.
     interval: u64,
 }
 
 impl KeypointViz {
-    pub fn new(
-        cpu_snap: Arc<Mutex<Option<CpuFrame>>>,
-        stream: Arc<CudaStream>,
-        save_dir: String,
-        dst_w: u32,
-        dst_h: u32,
-        interval: u64,
-    ) -> Self {
+    pub fn new(cpu_snap: Arc<Mutex<Option<CpuFrame>>>, save_dir: String, interval: u64) -> Self {
         Self {
             cpu_snap,
-            stream,
             save_dir,
-            dst_w,
-            dst_h,
             interval,
         }
     }
@@ -55,7 +39,7 @@ impl KeypointViz {
             return;
         };
         // Keypoints live on the GPU — download the valid ones only when drawing.
-        let kpts = match result.kpts_to_host(&self.stream) {
+        let kpts = match result.kpts_to_host() {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("[viz] kpts D2H failed: {e}");
@@ -64,12 +48,12 @@ impl KeypointViz {
         };
 
         let mut buf = rgba;
-        // keypoint coords are in model space (dst_w × dst_h); scale to frame space
-        let sx = fw as f32 / self.dst_w as f32;
-        let sy = fh as f32 / self.dst_h as f32;
+        // Upstream XFeat rescales keypoints from its floor-of-32 backbone input back
+        // to SOURCE pixels itself, so these are already frame coordinates — scaling
+        // them again here would misplace every dot.
         for chunk in kpts.chunks_exact(2) {
-            let cx = (chunk[0] * sx) as i32;
-            let cy = (chunk[1] * sy) as i32;
+            let cx = chunk[0] as i32;
+            let cy = chunk[1] as i32;
             draw_dot(&mut buf, fw, fh, cx, cy, 4, [255, 50, 50, 255]); // red filled circle
             draw_dot(&mut buf, fw, fh, cx, cy, 2, [255, 255, 50, 255]); // yellow centre dot
         }
@@ -83,7 +67,7 @@ impl KeypointViz {
             buf,
         ) {
             Ok(img) => match write_image_png_rgba8(&path, &img) {
-                Ok(()) => println!("[viz] saved {path}  ({} kpts)", result.count),
+                Ok(()) => println!("[viz] saved {path}  ({} kpts)", result.count()),
                 Err(e) => eprintln!("[viz] save failed: {e}"),
             },
             Err(e) => eprintln!("[viz] bad frame buffer: {e}"),

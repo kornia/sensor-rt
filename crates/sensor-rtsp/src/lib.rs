@@ -29,7 +29,7 @@ use cudarc::driver::CudaStream;
 use gstreamer::prelude::*;
 use kornia_image::Image;
 use kornia_tensor::{CudaKernel, Tensor};
-use vrt::stamp::{FrameMeta, Stamped};
+use sensor_types::{FrameMeta, Stamped};
 
 /// Errors from the GStreamer NVMM source.
 #[derive(Debug, thiserror::Error)]

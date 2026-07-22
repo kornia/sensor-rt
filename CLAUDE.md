@@ -2,10 +2,11 @@
 
 Isolated **sensor drivers** for Jetson — RTSP/NVMM cameras and OAK-D depth —
 extracted from vision-rt so that `vrt` stays pure algorithms. Every driver emits
-a device-resident kornia `Image<u8,3>` (plus `vrt::VrtDepthMap` + `Intrinsics`
-for OAK), consumed directly by the `vrt` models. The edge points one way:
-`sensor-rt → vision-rt` (a **private git dep**, pinned by rev); `vrt` has no
-dependency back on sensors. Three-repo split: `vrt` ← `sensor-rt` ← `flux`.
+a device-resident kornia `Image<u8,3>` (plus `sensor_types::DepthMap` +
+`vrt_types::CameraIntrinsics` for OAK), consumed directly by the `vrt` models. The edge points one way:
+`sensor-rt → vision-rt` (the **public upstream `kornia/vision-rt`**, pinned by
+rev); `vrt` has no dependency back on sensors. Three-repo split:
+`vrt` ← `sensor-rt` ← `flux`.
 
 ## Workspace layout
 
@@ -18,12 +19,13 @@ Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
 | `crates/nvbuf-sys` | `nvbuf_sys` | FFI: NvBufSurface → CUDA device ptr from NVMM DMA-BUF (`links = nvbufsurface`) |
 | `crates/oak-sys` | `oak_sys` | FFI: C shim over depthai-core v3 (`links = depthai-core`; built from `vendor/`) |
 | `crates/sensor-rtsp` | `sensor_rtsp` | RTSP/H.264 source, NVMM → CUDA, emits device `Image<u8,3>` |
-| `crates/sensor-oak` | `sensor_oak` | OAK-D RGB + aligned depth → device `Image<u8,3>` + `VrtDepthMap` |
+| `crates/sensor-oak` | `sensor_oak` | OAK-D RGB + aligned depth → device `Image<u8,3>` + `DepthMap`; **stereo pair + IMU** via `open_stereo` |
+| `crates/sensor-types` | `sensor_types` | Sensor-side leaf types: `FrameMeta`, `Stamped<T>`, host `DepthMap` (no deps) |
 
 ## Architecture
 
 Sensors are plain producers: `next_frame()` → `Stamped<Image<u8,3>>` (RTSP) or an
-`OakFrame` lending `&Image<u8,3>` + `&VrtDepthMap` (OAK). Frames are device-resident
+`OakFrame` lending `&Image<u8,3>` + `&DepthMap` (OAK). Frames are device-resident
 and tightly packed RGB8 — the shape kornia's `Preprocessor` and the `vrt` models
 consume. RTSP's NVMM path is RGBA + hardware-padded pitch, so it runs one on-GPU
 pack kernel (RGBA-pitched → tight RGB8) — there is no zero-copy path into kornia's
@@ -39,8 +41,12 @@ already tight RGB8 (zero extra copies).
   the **`vendor/depthai-core` git submodule** pinned to a release tag (`v3.7.1`):
   `git submodule update --init --recursive` then `pixi run depthai-build` to
   produce the prefix.
-- **Private git dep**: `export CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo clones
-  the private vision-rt via the git credential helper.
+- **Upstream only**: all `vrt-*` deps come from the public `kornia/vision-rt`. Do
+  NOT reintroduce the `edgarriba/vision-rt` fork. Upstream deliberately has no
+  `FrameMeta`/`Stamped`/depth-map type (those are producer concepts) — they live in
+  `crates/sensor-types`; camera intrinsics come from `vrt-types::CameraIntrinsics`.
+  Upstream model crates are **submit-only** (`alloc_result` + `submit` + an explicit
+  `stream.synchronize()`); there is no `run()`.
 - **Build cap**: `-j2` (`CARGO_BUILD_JOBS=2`) — parallel heavy builds OOM the 7.4 GB Orin.
 
 ## Commands
