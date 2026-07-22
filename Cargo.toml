@@ -1,12 +1,11 @@
 [workspace]
 resolver = "2"
-# Isolated Jetson sensor drivers. Depends on the PUBLIC upstream vision-rt
-# (kornia/vision-rt) for the TensorRT runtime + its shared model vocabulary
-# (`vrt-types::CameraIntrinsics`); vrt itself has NO sensor dependency. Types that
-# are purely sensor-side — frame metadata, stamped frames, host depth maps — live
-# in this workspace's own `sensor-types` leaf crate, since upstream (correctly)
-# does not carry producer concepts. Live-camera examples live here. Sensors emit
-# kornia `Image<u8,3>` (device-resident).
+# Isolated Jetson sensor drivers. The driver crates depend on NO inference runtime —
+# a consumer that only wants camera frames should not have to build TensorRT — so
+# they own their device-shaped types (`OakIntrinsics`, `OakDepthMap`) and share only
+# frame timing via the dependency-free `sensor-types` leaf. `vrt` (upstream
+# kornia/vision-rt) appears solely in the examples that actually run models, and has
+# no dependency back on sensors. Sensors emit kornia `Image<u8,3>` (device-resident).
 members = [
     "crates/nvbuf-sys",
     "crates/sensor-types",
@@ -14,13 +13,6 @@ members = [
     "crates/sensor-rtsp",
     "examples/rtsp_xfeat",
     "examples/rtsp_rfdetr",
-]
-
-exclude = [
-    "examples/rtsp_track",
-    "examples/oakd_track3d",
-    "examples/oakd_track3d_viz",
-    "examples/oakd_depth_refine",
 ]
 
 [workspace.package]
@@ -48,16 +40,12 @@ cudarc = { version = "0.19", default-features = false, features = [
 # Two things worth knowing:
 #   * upstream's vrt-xfeat already exposes the async `submit(img, &mut out)` API, so
 #     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
-#   * a few model crates these examples used have no upstream equivalent yet, so
-#     those examples are listed under `exclude` rather than deleted.
 # NOTE: upstream's core crate is named `vrt` outright; the fork called it
 # `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
 vrt        = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
 vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
 vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
 vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
-# Upstream's dependency-light shared vocabulary (CameraIntrinsics, Detection, Mask, DepthImage).
-vrt-types  = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
 # kornia GPU image/tensor types — pinned to the same rev vision-rt uses.
 kornia-image   = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
