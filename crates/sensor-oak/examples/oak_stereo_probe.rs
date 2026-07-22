@@ -13,7 +13,7 @@
 //! Optional: `-- --width 640 --height 400 --fps 30 --imu-hz 200 --frames 60`.
 
 use argh::FromArgs;
-use sensor_oak::{ImuSample, OakSource};
+use sensor_oak::{BoxError, ImuSample, OakSource};
 use std::time::Instant;
 
 #[derive(FromArgs)]
@@ -38,7 +38,7 @@ struct Args {
     frames: u64,
 }
 
-fn main() -> Result<(), vrt::BoxError> {
+fn main() -> Result<(), BoxError> {
     let args: Args = argh::from_env();
     let (w, h, fps, imu_hz, frames) = (args.width, args.height, args.fps, args.imu_hz, args.frames);
 
@@ -46,8 +46,7 @@ fn main() -> Result<(), vrt::BoxError> {
     let mut src = OakSource::open_stereo(None, w, h, fps, imu_hz)?;
     let intr = src.intrinsics();
     println!(
-        "device up: stereo={} imu={}  CAM_B intrinsics fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
-        src.has_stereo(),
+        "device up: imu={}  CAM_B intrinsics fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
         src.has_imu(),
         intr.fx,
         intr.fy,

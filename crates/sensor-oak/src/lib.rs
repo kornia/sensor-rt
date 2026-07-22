@@ -10,7 +10,16 @@
 //! **Nothing here touches CUDA**: frames come out on the host and the consumer owns
 //! any upload, so a process that only wants pixels builds no GPU stack.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
+
+/// Turn an optional device id into a C string (`None` → NULL, "first available").
+/// The caller keeps it alive across the FFI call.
+pub(crate) fn device_id_cstring(device: Option<&str>) -> Result<Option<CString>, BoxError> {
+    device
+        .map(CString::new)
+        .transpose()
+        .map_err(|e| format!("bad device id: {e}").into())
+}
 
 /// The shim's last error for the calling thread, as a `BoxError`.
 pub(crate) fn last_error(what: &str) -> BoxError {
@@ -47,14 +56,14 @@ mod stereo;
 pub use imu::ImuSample;
 pub use stereo::OakStereoFrame;
 
-/// OAK-D source. `open` then `next_frame()` in a loop (like `RtspSource`).
+/// OAK-D source: [`open_stereo`](Self::open_stereo), then [`next_stereo`](Self::next_stereo)
+/// in a loop, draining [`next_imu`](Self::next_imu) alongside it.
 pub struct OakSource {
     dev: *mut ffi::OakDevice,
     width: u32,
     height: u32,
     seq: u64,
     intr: OakIntrinsics,
-    has_stereo: bool,
     has_imu: bool,
     /// Reused staging buffer for `next_imu`, so draining inertial samples every
     /// frame costs no allocation once it has grown.
@@ -66,15 +75,12 @@ pub struct OakSource {
 unsafe impl Send for OakSource {}
 
 impl OakSource {
-    /// Wrap a device the shim has already opened, reading every capability back
-    /// from it rather than assuming what the constructor asked for.
+    /// Wrap a device the shim has already opened, reading its capabilities back from
+    /// it rather than assuming what the constructor asked for — the IMU in particular
+    /// may fail to start on a board that has none, which the caller cannot predict.
     ///
-    /// Shared by `open_inner` and [`open_stereo`](OakSource::open_stereo): those
-    /// two build genuinely different pipelines (they share no depthai nodes), but
-    /// the "what did we actually get?" half is identical, and hard-coding it per
-    /// constructor is how the two drift. Every `oak_has_*` accessor is the source of
-    /// truth — e.g. `has_sync` is false when a mono/uncalibrated device auto-fell-back
-    /// to a video-only pipeline, which the caller cannot predict.
+    /// `width`/`height` are the *requested* size and are kept only so callers can size
+    /// buffers before the first frame; each frame reports its own actual dimensions.
     pub(crate) fn from_open_device(
         dev: *mut ffi::OakDevice,
         width: u32,
@@ -88,19 +94,9 @@ impl OakSource {
             height,
             seq: 0,
             intr: OakIntrinsics { fx, fy, cx, cy },
-            has_stereo: unsafe { ffi::oak_has_stereo(dev) } != 0,
             has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
             imu_scratch: Vec::new(),
         })
-    }
-
-    /// Turn a device id into a C string (NULL for "first available"), kept alive
-    /// by the caller across the `oak_open*` call.
-    pub(crate) fn device_id_cstring(device: Option<&str>) -> Result<Option<CString>, BoxError> {
-        device
-            .map(CString::new)
-            .transpose()
-            .map_err(|e| format!("bad device id: {e}").into())
     }
 
     pub fn intrinsics(&self) -> OakIntrinsics {
@@ -121,21 +117,13 @@ impl OakSource {
 /// was nothing to kick (target absent or healthy), `Err` on a driver error. Blocking — call from the
 /// reconnect path, not the drain loop.
 pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
-    let c = target
-        .map(CString::new)
-        .transpose()
-        .map_err(|e| format!("bad kick target: {e}"))?;
+    let c = device_id_cstring(target)?;
     let ptr = c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
     let rc = unsafe { ffi::oak_kick(ptr) };
     match rc {
         1 => Ok(true),
         0 => Ok(false),
-        _ => {
-            let e = unsafe { CStr::from_ptr(ffi::oak_last_error()) }
-                .to_string_lossy()
-                .into_owned();
-            Err(format!("oak_kick failed: {e}").into())
-        }
+        _ => Err(last_error("oak_kick")),
     }
 }
 

@@ -2,7 +2,7 @@
 resolver = "2"
 # Isolated Jetson sensor drivers. The driver crates depend on NO inference runtime —
 # a consumer that only wants camera frames should not have to build TensorRT — so
-# they own their device-shaped types (`OakIntrinsics`, `OakDepthMap`) and share only
+# they own their device-shaped types (e.g. `OakIntrinsics`) and share only
 # frame timing via the dependency-free `sensor-types` leaf. `vrt` (upstream
 # kornia/vision-rt) appears solely in the examples that actually run models, and has
 # no dependency back on sensors. Sensors emit kornia `Image<u8,3>` (device-resident).

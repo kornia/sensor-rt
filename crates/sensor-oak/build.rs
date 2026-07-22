@@ -79,6 +79,6 @@ fn main() {
         println!("cargo:rustc-link-lib=dylib=usb-1.0");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", usb.display());
     } else {
-        println!("cargo:warning=oak-sys: libusb-1.0 not found (build inside the pixi env: `pixi run cargo build`)");
+        println!("cargo:warning=sensor-oak: libusb-1.0 not found (build inside the pixi env: `pixi run cargo build`)");
     }
 }

@@ -13,11 +13,11 @@ use crate::OakSource;
 /// One IMU reading: accelerometer + gyroscope, sampled together.
 ///
 /// `ts_ns` is on the **same host-synced epoch timeline as the image frames**, so
-/// samples can be interpolated directly against a [`OakStereoFrame`]'s timestamp
+/// samples can be interpolated directly against a the stereo frame's timestamp
 /// without a clock alignment step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImuSample {
-    /// Capture time, epoch nanoseconds — comparable to `OakStereoFrame::meta().pts_ns`.
+    /// Capture time, epoch nanoseconds — comparable to `meta().pts_ns` on a stereo frame.
     pub ts_ns: u64,
     /// Accelerometer, m/s².
     pub accel: [f32; 3],

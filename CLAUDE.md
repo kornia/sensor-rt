@@ -16,15 +16,15 @@ Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
 | Crate | lib | Role |
 |-------|-----|------|
 | `crates/nvbuf-sys` | `nvbuf_sys` | FFI: NvBufSurface → CUDA device ptr from NVMM DMA-BUF (`links = nvbufsurface`) |
-| `crates/oak-sys` | `oak_sys` | FFI: C shim over depthai-core v3 (`links = depthai-core`; built from `vendor/`) |
 | `crates/sensor-rtsp` | `sensor_rtsp` | RTSP/H.264 source, NVMM → CUDA, emits device `Image<u8,3>` |
-| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`). Bundles the depthai C shim (no separate `-sys` crate); depends on NO inference runtime and never touches CUDA. RGB-D / H.264 paths removed for now |
+| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`). Bundles the depthai C shim (no separate `-sys` crate); depends on NO inference runtime and never touches CUDA. RGB-D / H.264 paths removed for now — **`flux-oak` consumes those and must stay pinned to a pre-removal rev until it is reworked** |
 | `crates/sensor-types` | `sensor_types` | Frame-timing leaf shared by every driver: `FrameMeta`, `Stamped<T>` (zero deps) |
 
 ## Architecture
 
-Sensors are plain producers: `next_frame()` → `Stamped<Image<u8,3>>` (RTSP) or an
-`OakStereoFrame` lending both eyes as host RGB888 spans (OAK). RTSP frames are device-resident
+Sensors are plain producers: `next_frame()` → `Stamped<Image<u8,3>>` (RTSP) or `next_stereo()` → an
+`OakStereoFrame` lending both eyes as host RGB888 spans, or as zero-copy kornia
+`Image`s that outlive the frame via a retained handle (OAK). RTSP frames are device-resident
 and tightly packed RGB8 — the shape kornia's `Preprocessor` and the `vrt` models
 consume. RTSP's NVMM path is RGBA + hardware-padded pitch, so it runs one on-GPU
 pack kernel (RGBA-pitched → tight RGB8) — there is no zero-copy path into kornia's
@@ -35,7 +35,7 @@ already tight RGB8 (zero extra copies).
 
 - **GStreamer + libnvbufsurface are system/JetPack** (build + runtime) — NOT conda.
 - **OAK-D needs the depthai prefix** under `vendor/depthai` (or `DEPTHAI_PREFIX=…`);
-  runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath). `oak-sys`
+  runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath). `sensor-oak`
   bakes an absolute rpath — rebuild from scratch if `vendor/` moves. The source is
   the **`vendor/depthai-core` git submodule** pinned to a release tag (`v3.7.1`):
   `git submodule update --init --recursive` then `pixi run depthai-build` to
@@ -43,7 +43,7 @@ already tight RGB8 (zero extra copies).
 - **Upstream only**: all `vrt-*` deps come from the public `kornia/vision-rt`. Do
   NOT point them at a fork. Upstream deliberately has no
   `FrameMeta`/`Stamped` (producer concepts) — those live in `crates/sensor-types`.
-  Device-shaped types (`OakIntrinsics`, `OakDepthMap`) belong to their driver crate:
+  Device-shaped types (e.g. `OakIntrinsics`) belong to their driver crate:
   **driver crates must not depend on `vrt`**, so nothing that merely wants frames has
   to build TensorRT. Upstream model crates are **submit-only** (`alloc_result` +
   `submit` + an explicit `stream.synchronize()`); there is no `run()`.

@@ -40,8 +40,6 @@ extern "C" {
         imu_hz: c_int,
     ) -> *mut OakDevice;
 
-    pub fn oak_has_stereo(dev: *const OakDevice) -> c_int;
-
     pub fn oak_has_imu(dev: *const OakDevice) -> c_int;
 
     pub fn oak_poll_stereo(

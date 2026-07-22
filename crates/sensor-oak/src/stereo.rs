@@ -6,17 +6,16 @@
 //! builds a completely separate device pipeline ([`crate::ffi::oak_open_stereo`]):
 //! no colour camera, no `StereoDepth`, no encoder.
 //!
-//! **The frames are host-only and this source takes no [`CudaStream`].** That is
+//! **The frames are host-only and this source takes no CUDA stream.** That is
 //! deliberate, and the crux of the design: a consumer that wants the two eyes to
 //! overlap on the GPU needs them on *different* CUDA streams, which the source
 //! cannot know — so it stays a plain producer (per the crate's architecture) and
 //! hands out host spans. See `examples/oakd_xfeat_stereo`, which uploads left and
 //! right onto two streams to keep both XFeat backbones in flight at once.
 //!
-//! [`CudaStream`]: cudarc::driver::CudaStream
 
 use std::any::Any;
-use std::ffi::{c_void, CStr};
+use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::{BoxError, OakSource};
@@ -128,7 +127,9 @@ impl OakStereoFrame<'_> {
                 keepalive,
             )
         };
-        // Row-major [H, W, 3]; the shim guarantees tight rows, so strides are exact.
+        // Row-major [H, W, 3]; the shim guarantees tight rows, so these strides are exact.
+        // (kornia's own `get_strides_from_shape` is not reachable from outside the crate,
+        // which is why its v4l/gstreamer backends spell this out the same way.)
         let tensor = Tensor {
             storage,
             shape: [h, w, 3],
@@ -159,7 +160,7 @@ impl OakSource {
         fps: u32,
         imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        let id_c = Self::device_id_cstring(device)?;
+        let id_c = crate::device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let dev = unsafe {
             crate::ffi::oak_open_stereo(
@@ -171,21 +172,12 @@ impl OakSource {
             )
         };
         if dev.is_null() {
-            let e = unsafe { CStr::from_ptr(crate::ffi::oak_last_error()) }
-                .to_string_lossy()
-                .into_owned();
-            return Err(format!("oak_open_stereo failed: {e}").into());
+            return Err(crate::last_error("oak_open_stereo"));
         }
         // Capabilities (including whether the IMU actually started) are read back from
         // the device by `from_open_device`, not assumed here. In this modality the shim
         // reports CAM_B (left) intrinsics — the stereo reference camera.
         Self::from_open_device(dev, width, height)
-    }
-
-    /// Whether this source runs the stereo-pair pipeline (so
-    /// [`next_stereo`](OakSource::next_stereo) yields frames).
-    pub fn has_stereo(&self) -> bool {
-        self.has_stereo
     }
 
     /// Whether the on-board IMU is running (so [`next_imu`](OakSource::next_imu)
@@ -198,12 +190,9 @@ impl OakSource {
     /// device (zero-copy, no host repack) and valid until the next call.
     ///
     /// Blocks until a pair arrives, absorbing transient empty polls (device
-    /// warmup) exactly like [`next_frame`](OakSource::next_frame). `None` means
+    /// warmup). `None` means
     /// the stream ended: a device error, or ~5 s with no pair.
     pub fn next_stereo(&mut self) -> Option<OakStereoFrame<'_>> {
-        if !self.has_stereo {
-            return None;
-        }
         let mut left: *const u8 = std::ptr::null();
         let mut right: *const u8 = std::ptr::null();
         let (mut w, mut h, mut len) = (0i32, 0i32, 0i32);

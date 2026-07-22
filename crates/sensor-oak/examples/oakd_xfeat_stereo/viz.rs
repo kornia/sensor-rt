@@ -15,7 +15,7 @@
 //! Writes an `.rrd` file by default (no viewer needed on the robot); open it later
 //! with `rerun <file>`. `--rrd-connect` streams to a running viewer instead.
 
-use rerun::{Points2D, RecordingStream, RecordingStreamBuilder};
+use rerun::{Points2D, RecordingStream, RecordingStreamBuilder, TimeColumn};
 use sensor_oak::{ImuSample, OakStereoFrame};
 use vrt::BoxError;
 use vrt_xfeat::XFeatResult;
@@ -62,40 +62,36 @@ impl StereoViz {
 
         // Counters are cheap and the most useful thing to scrub against — a sudden
         // collapse in matches is the signature of a decalibrated or occluded eye.
+        // One entity with three series rather than three entities: rerun keys chunks
+        // per entity, so splitting them triples the row machinery for the same data.
         self.rec.log(
-            "stats/keypoints_left",
-            &rerun::Scalars::single(res_l.len() as f64),
-        )?;
-        self.rec.log(
-            "stats/keypoints_right",
-            &rerun::Scalars::single(res_r.len() as f64),
-        )?;
-        self.rec.log(
-            "stats/matches",
-            &rerun::Scalars::single(matches.len() as f64),
+            "stats",
+            &rerun::Scalars::new([res_l.len() as f64, res_r.len() as f64, matches.len() as f64]),
         )?;
 
-        // IMU as time series. Logged per sample at its OWN timestamp, not smeared
-        // across the frame, so the trace keeps its true ~200 Hz shape between frames.
-        for s in imu {
-            self.rec
-                .set_duration_secs("capture_time", s.ts_ns as f64 / 1e9);
-            for (axis, v) in ["x", "y", "z"].iter().zip(s.accel) {
-                self.rec.log(
-                    format!("imu/accel/{axis}"),
-                    &rerun::Scalars::single(v as f64),
-                )?;
-            }
-            for (axis, v) in ["x", "y", "z"].iter().zip(s.gyro) {
-                self.rec.log(
-                    format!("imu/gyro/{axis}"),
-                    &rerun::Scalars::single(v as f64),
-                )?;
-            }
-        }
-        // Restore the frame's own time for the imagery below.
-        if let Some(pts) = frame.meta().pts_ns {
-            self.rec.set_duration_secs("capture_time", pts as f64 / 1e9);
+        // IMU as time series, sent COLUMNAR: one chunk per batch instead of one row per
+        // scalar. Row-at-a-time logging was the dominant cost of this example — 6 `log`
+        // calls per sample at ~185 Hz is ~1100/s, each building a row id, a timepoint map
+        // and a length-1 Arrow array, to carry ~9 KB/s of actual data. Columns keep every
+        // sample's own timestamp (the trace stays true ~200 Hz) while collapsing that to
+        // two calls per frame, with no per-axis entity paths to format.
+        if !imu.is_empty() {
+            let times =
+                TimeColumn::new_duration_nanos("capture_time", imu.iter().map(|s| s.ts_ns as i64));
+            // Three scalars per row (x, y, z) → three named series on one entity.
+            let rows = || std::iter::repeat_n(3, imu.len());
+            self.rec.send_columns(
+                "imu/accel",
+                [times.clone()],
+                rerun::Scalars::new(imu.iter().flat_map(|s| s.accel.map(|v| v as f64)))
+                    .columns(rows())?,
+            )?;
+            self.rec.send_columns(
+                "imu/gyro",
+                [times],
+                rerun::Scalars::new(imu.iter().flat_map(|s| s.gyro.map(|v| v as f64)))
+                    .columns(rows())?,
+            )?;
         }
 
         if self.image_every == 0 || !seq.is_multiple_of(self.image_every) {

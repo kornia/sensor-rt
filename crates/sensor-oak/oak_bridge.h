@@ -45,14 +45,15 @@ typedef struct {
 oak_device *oak_open_stereo(const char *device_id, int width, int height,
                             int fps, int imu_hz);
 
-/* True (1) if this device runs the stereo pair pipeline (oak_poll_stereo yields
- * frames), i.e. it was opened with oak_open_stereo. */
-int oak_has_stereo(const oak_device *dev);
-
 /* True (1) if the on-board IMU is running (oak_poll_imu yields samples). 0 on a
  * device with no IMU, or when the IMU node failed to start — the stereo pair is
  * unaffected either way, so callers should degrade rather than abort. */
 int oak_has_imu(const oak_device *dev);
+
+/* Factory intrinsics of the LEFT (CAM_B) camera at the streamed size — the stereo
+ * reference frame. Returns 0 on success, -1 on error. */
+int oak_intrinsics(const oak_device *dev,
+                   float *fx, float *fy, float *cx, float *cy);
 
 /* Pull the next time-synced stereo pair. On success (return 1) both out-pointers
  * alias device-internal buffers VALID UNTIL THE NEXT oak_poll_stereo:

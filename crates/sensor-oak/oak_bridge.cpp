@@ -1,7 +1,6 @@
 // C++ implementation of the pure-C OAK bridge over depthai-core v3.
-// One device (USB or PoE) → Camera (CAM_A, RGB) + StereoDepth (CAM_B/CAM_C, aligned
-// to CAM_A) + Sync, exposing a time-synced RGB888 + uint16-mm depth pair, PLUS an
-// optional standalone on-device H.264 colour stream (a second camera output → encoder).
+// One device (USB or PoE) → the two mono cameras (CAM_B/CAM_C) through a Sync node,
+// exposing a time-synced RGB888 stereo pair, plus the on-board IMU on its own queue.
 // All C++ exceptions are caught and surfaced as return codes + oak_last_error().
 
 #include "oak_bridge.h"
@@ -10,7 +9,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -65,8 +63,6 @@ static std::shared_ptr<dai::Device> connect_device(const char* device_id) {
     return std::make_shared<dai::Device>(usb_speed);
 }
 
-
-
 struct oak_device {
     std::shared_ptr<dai::Device> device;
     std::unique_ptr<dai::Pipeline> pipeline;
@@ -80,12 +76,9 @@ struct oak_device {
     std::shared_ptr<dai::ImgFrame> cur_right;
     // IMU samples popped off the queue but not yet handed to the caller (see oak_poll_imu).
     std::vector<oak_imu_sample> imu_pending;
-    bool has_stereo = false;  // stereo-pair pipeline running (oak_open_stereo)
     bool has_imu = false;     // on-board IMU running (optional even in stereo mode)
-    int width = 0, height = 0;
     float fx = 0, fy = 0, cx = 0, cy = 0;
 };
-
 
 // STEREO+IMU modality: the two mono cameras as a Sync'd RGB888 pair + the IMU on its own queue.
 // Shares no nodes with oak_open's colour/depth pipeline — deliberately a separate entry point so the
@@ -94,8 +87,6 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
                                        int fps, int imu_hz) {
     try {
         auto dev = std::make_unique<oak_device>();
-        dev->width = width;
-        dev->height = height;
         dev->device = connect_device(device_id);
         dev->pipeline = std::make_unique<dai::Pipeline>(dev->device);
         auto& pipeline = *dev->pipeline;
@@ -136,10 +127,9 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         lo->link(sync->inputs["left"]);
         ro->link(sync->inputs["right"]);
         dev->stereo_q = sync->out.createOutputQueue(4, false);
-        dev->has_stereo = true;
 
         // IMU is OPTIONAL: not every OAK carries one, and a failed IMU must not cost us the stereo
-        // pair. Same degrade-don't-die discipline as device_has_stereo in oak_open.
+        // pair — degrade rather than lose the stereo stream over a missing IMU.
         if (imu_hz > 0) try {
             auto imu = pipeline.create<dai::node::IMU>();
             imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER_RAW, (uint32_t)imu_hz);
@@ -170,10 +160,6 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
     catch (...) { set_err("unknown error in oak_open_stereo"); return nullptr; }
 }
 
-extern "C" int oak_has_stereo(const oak_device* dev) {
-    return (dev && dev->has_stereo) ? 1 : 0;
-}
-
 extern "C" int oak_has_imu(const oak_device* dev) {
     return (dev && dev->has_imu) ? 1 : 0;
 }
@@ -199,7 +185,6 @@ extern "C" int oak_poll_stereo(oak_device* dev,
     if (!left || !right || !width || !height || !len || !ts_ns) {
         set_err("null out pointer"); return -1;
     }
-    if (!dev->stereo_q) return 0;   // not a stereo build
     try {
         bool timed_out = false;
         auto group = dev->stereo_q->get<dai::MessageGroup>(std::chrono::seconds(1), timed_out);
@@ -274,14 +259,12 @@ extern "C" int oak_poll_imu(oak_device* dev, oak_imu_sample* out, int max, int* 
     catch (...) { set_err("unknown error in oak_poll_imu"); return -1; }
 }
 
-
 extern "C" int oak_intrinsics(const oak_device* dev, float* fx, float* fy, float* cx, float* cy) {
     if (!dev) { set_err("null device"); return -1; }
     if (!fx || !fy || !cx || !cy) { set_err("null out pointer"); return -1; }
     *fx = dev->fx; *fy = dev->fy; *cx = dev->cx; *cy = dev->cy;
     return 0;
 }
-
 
 // Recover a PoE OAK wedged in bootloader state (the "X_LINK_BOOTLOADER" signature that in-process
 // oak_open retries can never clear): enumerate, find the target by IP/name or deviceId, and if it is

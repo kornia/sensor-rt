@@ -2,7 +2,6 @@
 //!
 //! Upstream `kornia/vision-rt` deliberately does not carry these — and rightly so:
 //! frame timing metadata is a *producer* concept, not an inference-runtime one.
-//! Upstream's
 //! Scope is deliberately narrow: only what EVERY sensor emits — frame timing.
 //! Anything specific to one device (OAK depth maps, OAK intrinsics) lives in that
 //! device's own driver crate instead, so this stays a tiny leaf that costs nothing
