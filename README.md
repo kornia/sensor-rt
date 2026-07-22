@@ -1,77 +1,62 @@
 # sensor-rt
 
-**RTSP camera source for NVIDIA Jetson Orin, written in Rust.**
+Isolated **camera drivers for Jetson** — RTSP/H.264 over NVMM and OAK-D RGB-D —
+that feed the [`vision-rt`](https://github.com/edgarriba/vision-rt) algorithm
+crates. Drivers are plain producers: they emit a device-resident kornia
+`Image<u8,3>` (plus depth / intrinsics for OAK), ready to hand to a `vrt` model.
 
-Decodes RTSP/H.264 in hardware over NVMM (`nvv4l2decoder`), imports the DMA-BUF
-into CUDA, and emits a **device-resident kornia `Image<u8,3>`** — ready to hand
-to any GPU vision model. It's a plain producer: `next_frame()` in a loop, no
-orchestration framework.
+The dependency edge points one way — `sensor-rt → vision-rt` — so `vrt` stays
+pure algorithms with no sensor/GStreamer/depthai dependency. Part of the
+three-repo split: `vision-rt` (algorithms) ← **sensor-rt** (drivers) ← `flux`
+(publishing).
 
-The source has **no algorithm dependency** — frame provenance travels in a small
-vendored `stamp` type, so nothing here pulls in the model crates. Models
-(e.g. [`vision-rt`](https://github.com/kornia/vision-rt)) consume these frames
-from the application side.
-
-**Target platform:** Jetson Orin (aarch64, SM87), JetPack 6.x, CUDA 12.6.
+**Target platform:** Jetson Orin (aarch64), JetPack 6.x, CUDA 12.6.
 
 ## Workspace
 
 | Crate | Role |
 |-------|------|
 | `crates/nvbuf-sys` | FFI: Jetson `NvBufSurface` → CUDA device ptr from an NVMM DMA-BUF (`links = nvbufsurface`) |
+| `crates/oak-sys` | FFI: C shim over depthai-core v3 (`links = depthai-core`, built from `vendor/`) |
 | `crates/sensor-rtsp` | RTSP/H.264 source, NVMM → CUDA, emits a device `Image<u8,3>` (GStreamer) |
-
-Examples live inside the `sensor-rtsp` crate (`crates/sensor-rtsp/examples/`):
-
-| Example | Role |
-|---------|------|
-| `rtsp_grab` | Minimal, **vrt-free**: connect, grab a few frames, save one PNG |
+| `crates/sensor-oak` | OAK-D RGB + aligned depth → device `Image<u8,3>` + `vrt::VrtDepthMap` |
 
 ## Usage
 
-The API is **async — the caller owns the single sync** (VPI / TensorRT model):
-`next_frame` only *enqueues* the NVMM→CUDA copy on the shared stream and returns
-an owned `Frame`; you run your model on that same stream and sync once.
-
 ```rust
-use cudarc::driver::CudaContext;
-use sensor_rtsp::RtspSource;
+use sensor_oak::OakSource;
+use vrt_rfdetr::RfDetr;
 
-let stream = CudaContext::new(0)?.default_stream();
-let mut source = RtspSource::connect("rtsp://camera/stream", stream.clone())?;
+let mut cam = OakSource::open(Default::default())?;   // RGB + aligned depth
+let mut detr = RfDetr::new(engine, cam.cuda_stream(), 0.5)?;
 
-while let Some(frame) = source.next_frame() {   // enqueues copy, NO sync
-    // frame.image(): &Image<u8,3> (device RGB, model-ready)  ·  frame.meta: FrameMeta
-    // ... enqueue your model on the SAME stream ...
-    stream.synchronize()?;                       // the caller's one sync
-    // ... read results ...
-}                                                // Frame drops → buffer back to ring
+while let Some(frame) = cam.next_frame() {
+    let dets = detr.run(frame.rgb())?;                // frame.rgb(): &Image<u8,3>, device-resident
+    // frame.depth(): &VrtDepthMap  ·  frame.meta(): FrameMeta (seq / pts)
+}
 ```
-
-`connect_resized(url, w, h, stream)` resizes on the Jetson VIC hardware scaler (no
-CUDA/CPU cost). Each frame is imported from NVMM and copied — pitched RGBA → tight
-**RGB** (alpha dropped in the same pass) — by one on-GPU kernel; **no hidden
-`cudaStreamSynchronize`**. Frames come from a small **ring of device buffers** so
-several can be in flight (decode ∥ copy ∥ inference); the transient NVMM imports
-are reclaimed lazily via per-frame CUDA events (`cudaEventQuery`). `try_next()` is
-the non-blocking variant. The output is a model-ready tight-RGB `Image<u8,3>` —
-feed it straight to a detector on the same stream.
 
 ## Building
 
-Native, **Jetson-only** — GStreamer + `libnvbufsurface` are system/JetPack (build
-and runtime), not conda:
+Native, Jetson-only. The image type + `vrt` come from vision-rt (a **private**
+git dep), so cargo must fetch with the git CLI credentials:
 
 ```bash
-export CARGO_BUILD_JOBS=2               # 7.4 GB Orin OOMs on parallel native builds
-cargo build -j2                         # library + nvbuf-sys (vrt-free)
-cargo run --release -p sensor-rtsp --example rtsp_grab -- rtsp://<camera>/stream out.png
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+cargo build -j2                       # -j2: the 7.4 GB Orin OOMs on parallel native builds
 ```
 
-CI on a hosted runner: `cargo fmt --all --check` + the pure-logic **unit tests**
-(`NVBUF_STUB=1 cargo test -p sensor-rtsp --lib` — the nvbuf FFI is stubbed so the
-crate builds with no Jetson libs). The full build/clippy/test is gated on a
-self-hosted Jetson runner (needs real CUDA + NVMM).
+- **GStreamer + libnvbufsurface** are system/JetPack (build + runtime), not conda.
+- **OAK-D** builds depthai-core from `vendor/depthai-core` — a git **submodule**
+  pinned to a release tag (currently `v3.7.1`). Fetch it on a fresh checkout with
+  `git clone --recursive …` (or `git submodule update --init --recursive`), then
+  build the install prefix once: `pixi run depthai-build` (→ `vendor/depthai`).
+  Runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath); override
+  the prefix with `DEPTHAI_PREFIX=…`.
+
+CI runs `cargo fmt --all --check` on a hosted runner (fmt resolves no deps); the
+real build/clippy/test job is gated on a self-hosted Jetson runner (it needs
+CUDA, NVMM, depthai, and access to the private vision-rt dep).
 
 ## License
 

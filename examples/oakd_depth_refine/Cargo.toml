@@ -1,0 +1,13 @@
+[package]
+name = "oakd_depth_refine"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+vrt           = { workspace = true }
+vrt-depth     = { workspace = true }
+sensor-oak    = { workspace = true }
+kornia-image  = { workspace = true }
+kornia-tensor = { workspace = true }
+env_logger    = { workspace = true }

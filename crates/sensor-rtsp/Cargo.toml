@@ -13,12 +13,8 @@ name = "sensor_rtsp"
 nvbuf-sys     = { workspace = true }
 gstreamer     = { workspace = true }
 gstreamer-app = { workspace = true }
+vrt           = { workspace = true }
 kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
 thiserror     = { workspace = true }
 cudarc        = { workspace = true }
-
-# Examples only (crates/sensor-rtsp/examples/). `rtsp_grab` saves a PNG.
-[dev-dependencies]
-kornia-io  = { workspace = true }
-env_logger = { workspace = true }

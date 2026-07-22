@@ -1,0 +1,16 @@
+[package]
+name = "oak-sys"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "Raw C FFI shim over depthai-core v3 — OAK-D RGB + aligned depth"
+links = "depthai-core"
+build = "build.rs"
+
+[lib]
+name = "oak_sys"
+
+[build-dependencies]
+cmake = { workspace = true }

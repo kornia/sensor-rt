@@ -1,0 +1,17 @@
+[package]
+name = "oakd_track3d_viz"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+vrt           = { workspace = true }
+vrt-rfdetr    = { workspace = true }
+vrt-track     = { workspace = true }
+vrt-reid      = { workspace = true }
+vrt-lift      = { workspace = true }
+sensor-oak    = { workspace = true }
+vrt-hub       = { workspace = true, features = ["hub", "builder"] }
+sensor-rtsp   = { workspace = true }
+kornia-image  = { workspace = true }
+env_logger    = { workspace = true }

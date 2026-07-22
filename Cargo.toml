@@ -1,26 +1,33 @@
 [workspace]
 resolver = "2"
-# Jetson RTSP camera source. A pure driver: decodes RTSP/H.264 over NVMM and emits
-# a device-resident kornia `Image<u8,3>` — no algorithm dependency. Frame
-# provenance (`stamp`) is vendored into `sensor-rtsp`, so the crate itself has no
-# dependency on vision-rt (`vrt`); models consume these frames from the
-# application side. Examples live inside `crates/sensor-rtsp/examples/`.
+# Isolated Jetson sensor drivers. Depends on vision-rt (vrt) only for the shared
+# image/tensor/geometry types that sensors emit (kornia Image, Intrinsics,
+# VrtDepthMap, stamp); vrt itself has NO sensor dependency. Live-camera examples
+# live here. Sensors emit kornia `Image<u8,3>` (device-resident).
 members = [
     "crates/nvbuf-sys",
+    "crates/oak-sys",
+    "crates/sensor-oak",
     "crates/sensor-rtsp",
+    "examples/rtsp_xfeat",
+    "examples/rtsp_rfdetr",
+    "examples/rtsp_track",
+    "examples/oakd_track3d",
+    "examples/oakd_track3d_viz",
+    "examples/oakd_depth_refine",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/kornia/sensor-rt"
-authors = ["Edgar Riba <edgar.riba@gmail.com>", "Kornia AI"]
+repository = "https://github.com/edgarriba/sensor-rt"
+authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 
 [workspace.dependencies]
-# One cudarc across the workspace, matching kornia-rs's feature set so cargo
-# unifies to a single build (shared CudaStream/CudaSlice for zero-copy interop
-# with the models that consume these frames downstream).
+# One cudarc across the workspace, matching vision-rt + kornia-rs's feature set so
+# cargo unifies to a single build (shared CudaStream/CudaSlice types → zero-copy
+# interop with the vrt models that consume these frames).
 cudarc = { version = "0.19", default-features = false, features = [
   "cuda-version-from-build-system",
   "driver",
@@ -29,16 +36,30 @@ cudarc = { version = "0.19", default-features = false, features = [
   "fallback-dynamic-loading",
   "fallback-latest",
 ] }
-# kornia GPU image/tensor types (device-resident RGB8 frames + the pack kernel).
-kornia-image  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
-kornia-tensor = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
-kornia-io     = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
+# vision-rt (private) — git-pinned to a fixed rev (Cargo.lock also locks it).
+# Only the crates the sensors/examples consume; vrt-preproc/vrt-yolo were removed upstream.
+vrt        = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283", package = "vision-rt" }
+vrt-xfeat  = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+vrt-rfdetr = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+vrt-track  = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+vrt-lift   = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+vrt-reid   = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+vrt-hub    = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+vrt-depth  = { git = "https://github.com/edgarriba/vision-rt", rev = "44984073639e303d8299d4b90a3ab1c466b89283" }
+# kornia GPU image/tensor types — pinned to the same rev vision-rt uses.
+kornia-image   = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
+kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
+kornia-io      = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
 # sensor-rt internal crates
 nvbuf-sys   = { path = "crates/nvbuf-sys" }
+oak-sys     = { path = "crates/oak-sys" }
 sensor-rtsp = { path = "crates/sensor-rtsp" }
+sensor-oak  = { path = "crates/sensor-oak" }
 # external
 gstreamer     = "0.20"
 gstreamer-app = "0.20"
 thiserror     = "2.0"
 env_logger    = "0.11"
 cc            = "1"
+cmake         = "0.1"

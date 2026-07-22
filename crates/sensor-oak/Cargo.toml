@@ -1,0 +1,21 @@
+[package]
+name = "sensor-oak"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+description = "OAK-D RGB + aligned depth source (safe wrapper over oak-sys); produces a kornia Image"
+
+[lib]
+name = "sensor_oak"
+
+[dependencies]
+vrt           = { workspace = true }
+oak-sys       = { workspace = true }
+cudarc        = { workspace = true }
+kornia-image  = { workspace = true }
+kornia-tensor = { workspace = true }
+
+[dev-dependencies]
+kornia-io = { workspace = true }

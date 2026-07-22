@@ -1,0 +1,14 @@
+[package]
+name = "rtsp_xfeat"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+vrt          = { workspace = true }
+vrt-xfeat    = { workspace = true }
+sensor-rtsp  = { workspace = true }
+vrt-hub      = { workspace = true, features = ["builder"] }
+kornia-image = { workspace = true }
+kornia-io    = { workspace = true }
+env_logger   = { workspace = true }
