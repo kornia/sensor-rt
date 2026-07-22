@@ -18,7 +18,7 @@ name = "sensor_oak"
 [dependencies]
 # Deliberately minimal: this driver is a plain producer that never touches CUDA or
 # an inference runtime, so a process that only wants camera frames builds neither.
-# `cudarc` / `kornia-tensor` / `vrt` are dev-dependencies, for the examples that do.
+# `cudarc` / `vrt` are dev-dependencies, for the examples that do.
 kornia-image = { workspace = true }
 sensor-types = { workspace = true }
 
@@ -28,9 +28,9 @@ cmake = { workspace = true }
 [dev-dependencies]
 vrt           = { workspace = true }
 cudarc        = { workspace = true }
-kornia-tensor = { workspace = true }
 kornia-io     = { workspace = true }
 argh          = { workspace = true }
+rerun         = { workspace = true }
 vrt-xfeat  = { workspace = true }
 vrt-hub    = { workspace = true, features = ["builder"] }
 env_logger = { workspace = true }

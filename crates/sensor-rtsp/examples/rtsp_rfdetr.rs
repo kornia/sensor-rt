@@ -10,17 +10,32 @@
 //! 30 frames the detections are drawn on the CPU snapshot and saved as a PNG.
 //!
 //! Usage:
-//!   cargo run --release -p rtsp_rfdetr -- rtsp://camera/stream [save_dir]
+//!   cargo run --release -p sensor-rtsp --example rtsp_rfdetr -- rtsp://camera/stream
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use argh::FromArgs;
 use kornia_image::{Image, ImageSize};
 use kornia_io::png::write_image_png_rgba8;
 use sensor_rtsp::{CpuFrame, RtspSource};
 use vrt::logger::Severity;
 use vrt::{Engine, Logger, Runtime, Stream};
 use vrt_rfdetr::{Detection, RfDetr};
+
+#[derive(FromArgs)]
+/// RF-DETR detections on a live RTSP/NVMM stream.
+struct Args {
+    /// RTSP URL to pull from
+    #[argh(positional)]
+    url: String,
+    /// directory for the periodic detection PNGs (default ".")
+    #[argh(option, default = "String::from(\".\")")]
+    save_dir: String,
+    /// model id to pull from the hub (default "rfdetr-medium")
+    #[argh(option, default = "String::from(\"rfdetr-medium\")")]
+    model: String,
+}
 
 fn main() -> Result<(), vrt::BoxError> {
     env_logger::init();

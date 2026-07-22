@@ -26,15 +26,15 @@
 //!
 //! Usage:
 //!   cargo run --release -p sensor-oak --example oakd_xfeat_stereo -- \
-//!       models/xfeat/xfeat_backbone_fp16.engine --save-dir /tmp
+//!       models/xfeat/xfeat_backbone_fp16.engine --rrd /tmp/stereo.rrd
 //!
-//! `--help` lists the rest (`--width`, `--fps`, `--imu-hz`, `--frames`, `--save-every`).
+//! Then `rerun /tmp/stereo.rrd`, or pass `--rrd-connect` to stream to a live viewer.
+//! `--help` lists the rest (`--width`, `--fps`, `--imu-hz`, `--frames`, `--image-every`).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use argh::FromArgs;
-use kornia_image::Image;
 use sensor_oak::{ImuSample, OakSource};
 
 #[derive(FromArgs)]
@@ -43,9 +43,12 @@ struct Args {
     /// path to the XFeat backbone (.onnx builds and caches an engine; .engine is used as-is)
     #[argh(positional)]
     model: String,
-    /// directory for the periodic match PNGs (default ".")
-    #[argh(option, default = "String::from(\".\")")]
-    save_dir: String,
+    /// path for the rerun recording (default "oakd_xfeat_stereo.rrd")
+    #[argh(option, default = "String::from(\"oakd_xfeat_stereo.rrd\")")]
+    rrd: String,
+    /// stream to a running rerun viewer over gRPC instead of writing a file
+    #[argh(switch)]
+    rrd_connect: bool,
     /// per-eye width (default 640)
     #[argh(option, default = "640")]
     width: u32,
@@ -61,42 +64,23 @@ struct Args {
     /// stop after N frames; 0 runs until the stream ends (default 0)
     #[argh(option, default = "0")]
     frames: u64,
-    /// save a match PNG every N frames; 0 disables (default 30)
+    /// log imagery every N frames; 0 disables images (counters and IMU always log)
     #[argh(option, default = "30")]
-    save_every: u64,
+    image_every: u64,
 }
 use vrt::{BoxError, Engine, Logger, Runtime, Stream};
 use vrt_xfeat::{Matcher, XFeat, XFeatParams, XFeatResult};
 
 mod viz;
-use viz::StereoMatchViz;
-
-/// Build a zeroed, device-resident RGB888 image (tight, 3 B/px) — the layout the
-/// `vrt` models consume, and the one the OAK already hands us on the host, so the
-/// upload is a straight `memcpy_htod`.
-///
-/// Lives here rather than in `sensor-oak`: the driver is deliberately CUDA-free, so
-/// choosing *where* frames land on the GPU is the consumer's job. Reused across
-/// frames, which is why this example uploads the borrowed span directly instead of
-/// going through `OakFrame::rgb_image()` — that would add a host copy per frame.
-fn alloc_rgb_image(
-    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-    w: u32,
-    h: u32,
-) -> Result<Image<u8, 3>, BoxError> {
-    let slice = stream.alloc_zeros::<u8>(w as usize * h as usize * 3)?;
-    let t =
-        kornia_tensor::Tensor::from_cudaslice(slice, [h as usize, w as usize, 3], stream.clone());
-    Image::try_from(t).map_err(|e| format!("build device Image<u8,3>: {e}").into())
-}
+use viz::StereoViz;
 
 fn main() -> Result<(), BoxError> {
     env_logger::init();
 
     let args: Args = argh::from_env();
     let (w, h, fps, imu_hz) = (args.width, args.height, args.fps, args.imu_hz);
-    let (max_frames, save_every) = (args.frames, args.save_every);
-    let (model_path, save_dir) = (args.model.as_str(), args.save_dir.as_str());
+    let max_frames = args.frames;
+    let model_path = args.model.as_str();
 
     // ── camera ────────────────────────────────────────────────────────────────
     // Host-only by design: the source hands out spans, and *we* decide which CUDA
@@ -162,16 +146,7 @@ fn main() -> Result<(), BoxError> {
     let matcher = Matcher::new(s0.clone())?;
     let mut match_res = matcher.alloc_result(TOP_K)?;
 
-    // Reused device buffers — one per eye, each on its own stream so the two uploads
-    // are independent and can overlap. Sized lazily from the first frame's ACTUAL
-    // dims: the device may hand back a different size than requested (CROP against
-    // the sensor's native resolution), and `memcpy_htod` asserts dst >= src, so
-    // sizing these from the *requested* dims would panic on a larger frame and
-    // silently leave stale tail rows on a smaller one.
-    let mut dev_l: Option<Image<u8, 3>> = None;
-    let mut dev_r: Option<Image<u8, 3>> = None;
-
-    let viz = StereoMatchViz::new(save_dir.to_string(), save_every);
+    let viz = StereoViz::new(&args.rrd, args.rrd_connect, args.image_every)?;
 
     let mut imu: Vec<ImuSample> = Vec::new();
     let mut n = 0u64;
@@ -201,33 +176,17 @@ fn main() -> Result<(), BoxError> {
 
         let t_gpu = Instant::now();
 
-        // (Re)allocate on the first frame, or if the device ever changes size.
-        let (fw, fh) = (frame.width(), frame.height());
-        let fits = |img: &Option<Image<u8, 3>>| {
-            img.as_ref()
-                .is_some_and(|i| i.width() as u32 == fw && i.height() as u32 == fh)
-        };
-        if !fits(&dev_l) {
-            dev_l = Some(alloc_rgb_image(&s0, fw, fh)?);
-            dev_r = Some(alloc_rgb_image(&s1, fw, fh)?);
-        }
-        let (img_l, img_r) = (dev_l.as_mut().unwrap(), dev_r.as_mut().unwrap());
-
-        // Uploads: async on their own streams, so the right eye's copy is already
-        // moving while the left eye's preprocess kernel launches.
-        s0.memcpy_htod(
-            frame.left(),
-            img_l.as_cudaslice_mut().ok_or("left not device")?,
-        )?;
-        s1.memcpy_htod(
-            frame.right(),
-            img_r.as_cudaslice_mut().ok_or("right not device")?,
-        )?;
+        // Host image -> device image, through kornia's own API. `to_cuda_image` does
+        // the H2D in one `clone_htod` and hands back a device-resident `Image`, so the
+        // frame never leaves the typed image world and this example needs no CUDA
+        // allocation code of its own. Each eye uploads on its own stream.
+        let img_l = frame.left_image()?.to_cuda_image(&s0)?;
+        let img_r = frame.right_image()?.to_cuda_image(&s1)?;
 
         // Both submissions return immediately — nothing has synced yet, so the GPU
         // holds work from both streams at once and can interleave it.
-        xf_l.submit(img_l, &mut res_l)?;
-        xf_r.submit(img_r, &mut res_r)?;
+        xf_l.submit(&img_l, &mut res_l)?;
+        xf_r.submit(&img_r, &mut res_r)?;
 
         // ⚠ LOAD-BEARING, NOT DECORATIVE. `Stream::new_standalone` disables cudarc's
         // per-op event tracking, whose safety contract is "no buffer crosses
@@ -282,7 +241,7 @@ fn main() -> Result<(), BoxError> {
             matches.len(),
         );
 
-        viz.draw_and_save(n, &frame, &res_l, &res_r, &matches);
+        viz.log_frame(n, &frame, &res_l, &res_r, &matches, &imu)?;
 
         if n.is_multiple_of(100) {
             let fps_now = n as f64 / t0.elapsed().as_secs_f64();

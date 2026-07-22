@@ -1,163 +1,151 @@
-//! Side-by-side stereo match visualization: left | right, keypoints dotted, and a
-//! line per mutual-NN match crossing the seam.
+//! Rerun logging for the stereo XFeat loop.
 //!
-//! This is the example's real evidence. Counts alone can't tell a working matcher
-//! from a broken one — but on an unrectified OAK stereo pair, correct matches all
-//! slope the same way (the disparity shifts every feature left-to-right by a
-//! similar amount at similar depth), so a picture makes a bad matcher obvious at a
-//! glance where "1200 matches" would not.
+//! Replaces the side-by-side PNG dump this example used to write. A PNG could only
+//! show one frame in isolation; rerun puts everything on a shared timeline, which is
+//! what the interesting questions here actually need:
+//!
+//!   * are the eyes genuinely different images, and do keypoints track the scene?
+//!   * do matched keypoints line up row-wise (correct stereo disparity) or scatter?
+//!   * does the IMU move when the camera moves — i.e. are frames and inertial data
+//!     really on one clock?
+//!
+//! Everything is logged against a `frame` sequence timeline plus the camera's own
+//! capture timestamp, so scrubbing lines the images up with the IMU trace.
+//!
+//! Writes an `.rrd` file by default (no viewer needed on the robot); open it later
+//! with `rerun <file>`. `--rrd-connect` streams to a running viewer instead.
 
-use kornia_image::{Image, ImageSize};
-use kornia_io::png::write_image_png_rgba8;
-use sensor_oak::StereoFrame;
+use rerun::{Points2D, RecordingStream, RecordingStreamBuilder};
+use sensor_oak::{ImuSample, OakStereoFrame};
+use vrt::BoxError;
 use vrt_xfeat::XFeatResult;
 
-/// Cap on match lines actually rendered — see the comment at the draw loop.
-const MAX_MATCH_LINES: usize = 60;
+/// Matched keypoints are drawn larger and in a distinct colour so they stand out
+/// from the unmatched background set.
+const MATCHED_COLOR: [u8; 3] = [40, 220, 90];
+const UNMATCHED_COLOR: [u8; 3] = [90, 90, 200];
 
-pub struct StereoMatchViz {
-    save_dir: String,
-    /// Save one frame every `interval`; `0` disables saving.
-    interval: u64,
+pub struct StereoViz {
+    rec: RecordingStream,
+    /// Log imagery every `image_every` frames; the IMU and counters log every frame
+    /// regardless. Images dominate the .rrd size, and at 30 fps most are redundant.
+    image_every: u64,
 }
 
-impl StereoMatchViz {
-    pub fn new(save_dir: String, interval: u64) -> Self {
-        Self { save_dir, interval }
+impl StereoViz {
+    /// `rrd_path` writes a file; `connect` streams to a viewer on the default port.
+    pub fn new(rrd_path: &str, connect: bool, image_every: u64) -> Result<Self, BoxError> {
+        let builder = RecordingStreamBuilder::new("oakd_xfeat_stereo");
+        let rec = if connect {
+            builder.connect_grpc()?
+        } else {
+            builder.save(rrd_path)?
+        };
+        Ok(Self { rec, image_every })
     }
 
-    /// On every `interval`-th frame, render the pair with its matches and save
-    /// `<save_dir>/xfeat_stereo_<seq>.png`. Viz failures are logged, never fatal —
-    /// a PNG we couldn't write must not take down a camera loop.
-    pub fn draw_and_save(
+    /// Log one frame: both eyes, their keypoints, the match count, and whatever IMU
+    /// samples arrived alongside.
+    pub fn log_frame(
         &self,
         seq: u64,
-        frame: &StereoFrame<'_>,
+        frame: &OakStereoFrame<'_>,
         res_l: &XFeatResult,
         res_r: &XFeatResult,
         matches: &[(usize, usize)],
-    ) {
-        if self.interval == 0 || !seq.is_multiple_of(self.interval) {
-            return;
+        imu: &[ImuSample],
+    ) -> Result<(), BoxError> {
+        self.rec.set_time_sequence("frame", seq as i64);
+        if let Some(pts) = frame.meta().pts_ns {
+            self.rec.set_duration_secs("capture_time", pts as f64 / 1e9);
         }
-        // Each result downloads on the stream it was allocated against.
-        let (kl, kr) = match (res_l.kpts_to_host(), res_r.kpts_to_host()) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Err(e), _) | (_, Err(e)) => {
-                eprintln!("[viz] keypoint D2H failed: {e}");
-                return;
+
+        // Counters are cheap and the most useful thing to scrub against — a sudden
+        // collapse in matches is the signature of a decalibrated or occluded eye.
+        self.rec.log(
+            "stats/keypoints_left",
+            &rerun::Scalars::single(res_l.len() as f64),
+        )?;
+        self.rec.log(
+            "stats/keypoints_right",
+            &rerun::Scalars::single(res_r.len() as f64),
+        )?;
+        self.rec.log(
+            "stats/matches",
+            &rerun::Scalars::single(matches.len() as f64),
+        )?;
+
+        // IMU as time series. Logged per sample at its OWN timestamp, not smeared
+        // across the frame, so the trace keeps its true ~200 Hz shape between frames.
+        for s in imu {
+            self.rec
+                .set_duration_secs("capture_time", s.ts_ns as f64 / 1e9);
+            for (axis, v) in ["x", "y", "z"].iter().zip(s.accel) {
+                self.rec.log(
+                    format!("imu/accel/{axis}"),
+                    &rerun::Scalars::single(v as f64),
+                )?;
             }
-        };
-
-        let (fw, fh) = (frame.width(), frame.height());
-        let (cw, ch) = (fw * 2, fh);
-        let mut canvas = vec![0u8; cw as usize * ch as usize * 4];
-        blit_rgb(&mut canvas, cw, frame.left(), fw, fh, 0);
-        blit_rgb(&mut canvas, cw, frame.right(), fw, fh, fw);
-
-        // Upstream XFeat already rescales keypoints from its floor-of-32 backbone
-        // input back to original frame pixels, so these are frame coordinates
-        // directly — the only adjustment is the right eye's horizontal offset in
-        // the side-by-side canvas.
-        let at = |k: &[f32], i: usize, x_off: u32| -> Option<(i32, i32)> {
-            let (x, y) = (*k.get(i * 2)?, *k.get(i * 2 + 1)?);
-            Some((x as i32 + x_off as i32, y as i32))
-        };
-
-        // All keypoints first, dim — so unmatched ones stay visible as context.
-        for i in 0..kl.len() / 2 {
-            if let Some((x, y)) = at(&kl, i, 0) {
-                draw_dot(&mut canvas, cw, ch, x, y, 1, [90, 90, 200, 255]);
+            for (axis, v) in ["x", "y", "z"].iter().zip(s.gyro) {
+                self.rec.log(
+                    format!("imu/gyro/{axis}"),
+                    &rerun::Scalars::single(v as f64),
+                )?;
             }
         }
-        for i in 0..kr.len() / 2 {
-            if let Some((x, y)) = at(&kr, i, fw) {
-                draw_dot(&mut canvas, cw, ch, x, y, 1, [90, 90, 200, 255]);
+        // Restore the frame's own time for the imagery below.
+        if let Some(pts) = frame.meta().pts_ns {
+            self.rec.set_duration_secs("capture_time", pts as f64 / 1e9);
+        }
+
+        if self.image_every == 0 || !seq.is_multiple_of(self.image_every) {
+            return Ok(());
+        }
+        let res = [frame.width(), frame.height()];
+        self.rec.log(
+            "stereo/left/image",
+            &rerun::Image::from_rgb24(frame.left().to_vec(), res),
+        )?;
+        self.rec.log(
+            "stereo/right/image",
+            &rerun::Image::from_rgb24(frame.right().to_vec(), res),
+        )?;
+
+        // Keypoints, with the matched subset highlighted. Logged in each eye's own
+        // image space, so rerun overlays them on the right picture and a mis-scaled
+        // coordinate shows up immediately as points sitting off the features.
+        let (kl, kr) = (res_l.kpts_to_host()?, res_r.kpts_to_host()?);
+        let mut matched_l = vec![false; kl.len() / 2];
+        let mut matched_r = vec![false; kr.len() / 2];
+        for &(i, j) in matches {
+            if let Some(m) = matched_l.get_mut(i) {
+                *m = true;
+            }
+            if let Some(m) = matched_r.get_mut(j) {
+                *m = true;
             }
         }
-
-        // Then the matches. Every match line spans the full seam (~frame width), so
-        // drawing all ~1000 of them paints the canvas solid green and hides exactly
-        // what we came to check. Draw an evenly-spaced subset instead: the point is
-        // to eyeball whether the lines are near-parallel and consistently sloped
-        // (correct disparity) or fanned out at random (a broken matcher), and a few
-        // dozen show that far better than a thousand.
-        let stride = matches.len().div_ceil(MAX_MATCH_LINES).max(1);
-        let mut drawn = 0;
-        for &(i, j) in matches.iter().step_by(stride) {
-            let (Some(a), Some(b)) = (at(&kl, i, 0), at(&kr, j, fw)) else {
-                continue;
-            };
-            draw_line(&mut canvas, cw, ch, a, b, [40, 220, 90, 255]);
-            draw_dot(&mut canvas, cw, ch, a.0, a.1, 2, [255, 60, 60, 255]);
-            draw_dot(&mut canvas, cw, ch, b.0, b.1, 2, [255, 60, 60, 255]);
-            drawn += 1;
-        }
-
-        let path = format!("{}/xfeat_stereo_{:06}.png", self.save_dir, seq);
-        match Image::<u8, 4>::new(
-            ImageSize {
-                width: cw as usize,
-                height: ch as usize,
-            },
-            canvas,
-        ) {
-            Ok(img) => match write_image_png_rgba8(&path, &img) {
-                Ok(()) => println!(
-                    "[viz] saved {path}  (L{} R{} kpts, {} matches, {drawn} lines drawn)",
-                    res_l.len(),
-                    res_r.len(),
-                    matches.len()
-                ),
-                Err(e) => eprintln!("[viz] save failed: {e}"),
-            },
-            Err(e) => eprintln!("[viz] bad canvas: {e}"),
-        }
+        self.log_keypoints("stereo/left/keypoints", &kl, &matched_l)?;
+        self.log_keypoints("stereo/right/keypoints", &kr, &matched_r)?;
+        Ok(())
     }
-}
 
-/// Copy a tightly packed RGB888 frame into an RGBA canvas at horizontal offset `x_off`.
-fn blit_rgb(canvas: &mut [u8], cw: u32, src: &[u8], w: u32, h: u32, x_off: u32) {
-    for y in 0..h as usize {
-        for x in 0..w as usize {
-            let s = (y * w as usize + x) * 3;
-            let d = (y * cw as usize + x + x_off as usize) * 4;
-            if s + 3 <= src.len() && d + 4 <= canvas.len() {
-                canvas[d] = src[s];
-                canvas[d + 1] = src[s + 1];
-                canvas[d + 2] = src[s + 2];
-                canvas[d + 3] = 255;
-            }
-        }
-    }
-}
-
-/// Draw a filled disc of radius `r` into an interleaved RGBA buffer (`w`×`h`).
-fn draw_dot(buf: &mut [u8], w: u32, h: u32, cx: i32, cy: i32, r: i32, color: [u8; 4]) {
-    let (iw, ih) = (w as i32, h as i32);
-    for dy in -r..=r {
-        for dx in -r..=r {
-            if dx * dx + dy * dy <= r * r {
-                let (x, y) = (cx + dx, cy + dy);
-                if x >= 0 && x < iw && y >= 0 && y < ih {
-                    let p = (y as usize * w as usize + x as usize) * 4;
-                    buf[p..p + 4].copy_from_slice(&color);
-                }
-            }
-        }
-    }
-}
-
-/// Bresenham-free DDA line — plenty for a debug overlay.
-fn draw_line(buf: &mut [u8], w: u32, h: u32, a: (i32, i32), b: (i32, i32), color: [u8; 4]) {
-    let steps = (b.0 - a.0).abs().max((b.1 - a.1).abs()).max(1);
-    for i in 0..=steps {
-        let t = i as f32 / steps as f32;
-        let x = a.0 + ((b.0 - a.0) as f32 * t) as i32;
-        let y = a.1 + ((b.1 - a.1) as f32 * t) as i32;
-        if x >= 0 && x < w as i32 && y >= 0 && y < h as i32 {
-            let p = (y as usize * w as usize + x as usize) * 4;
-            buf[p..p + 4].copy_from_slice(&color);
-        }
+    fn log_keypoints(&self, entity: &str, kpts: &[f32], matched: &[bool]) -> Result<(), BoxError> {
+        // Upstream XFeat rescales keypoints back to source pixels, so these are frame
+        // coordinates already — no model-space conversion.
+        let points: Vec<(f32, f32)> = kpts.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let colors: Vec<rerun::Color> = matched
+            .iter()
+            .map(|&m| {
+                let c = if m { MATCHED_COLOR } else { UNMATCHED_COLOR };
+                rerun::Color::from_rgb(c[0], c[1], c[2])
+            })
+            .collect();
+        let radii: Vec<f32> = matched.iter().map(|&m| if m { 2.0 } else { 1.0 }).collect();
+        self.rec.log(
+            entity,
+            &Points2D::new(points).with_colors(colors).with_radii(radii),
+        )?;
+        Ok(())
     }
 }

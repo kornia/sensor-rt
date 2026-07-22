@@ -11,8 +11,6 @@ members = [
     "crates/sensor-types",
     "crates/sensor-oak",
     "crates/sensor-rtsp",
-    "examples/rtsp_xfeat",
-    "examples/rtsp_rfdetr",
 ]
 
 [workspace.package]
@@ -64,5 +62,8 @@ env_logger    = "0.11"
 # Example CLIs only (dev-dependency): argh over clap — a fraction of the compile
 # time and dependency count, and these binaries need flags, not a framework.
 argh          = "0.1"
+# Example visualisation only. SDK feature just logs / writes .rrd — the native
+# viewer feature would drag in a whole GUI stack we do not want on a Jetson.
+rerun         = { version = "0.34", default-features = false, features = ["sdk"] }
 cc            = "1"
 cmake         = "0.1"

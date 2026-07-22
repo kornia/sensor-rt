@@ -18,24 +18,10 @@
 use std::ffi::CStr;
 
 use crate::BoxError;
+use kornia_image::{Image, ImageSize};
 use sensor_types::FrameMeta;
 
 use crate::OakSource;
-
-/// One IMU reading: accelerometer + gyroscope, sampled together.
-///
-/// `ts_ns` is on the **same host-synced epoch timeline as the image frames**, so
-/// samples can be interpolated directly against a [`StereoFrame`]'s timestamp
-/// without a clock alignment step.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ImuSample {
-    /// Capture time, epoch nanoseconds — comparable to `StereoFrame::meta().pts_ns`.
-    pub ts_ns: u64,
-    /// Accelerometer, m/s².
-    pub accel: [f32; 3],
-    /// Gyroscope, rad/s.
-    pub gyro: [f32; 3],
-}
 
 /// One time-synced stereo pair, borrowed from the source.
 ///
@@ -44,8 +30,8 @@ pub struct ImuSample {
 /// are **valid only until the next [`OakSource::next_stereo`]**. The `'a` lifetime
 /// ties this frame to the `&mut OakSource` borrow, so the borrow checker forbids
 /// pulling the next pair while this one is still held — the same contract, and
-/// the same enforcement, as [`OakFrame`](crate::OakFrame).
-pub struct StereoFrame<'a> {
+/// the same enforcement, as [`OakRgbFrame`](crate::OakRgbFrame).
+pub struct OakStereoFrame<'a> {
     left: &'a [u8],
     right: &'a [u8],
     width: u32,
@@ -54,7 +40,7 @@ pub struct StereoFrame<'a> {
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
 
-impl StereoFrame<'_> {
+impl OakStereoFrame<'_> {
     /// Left eye (CAM_B), RGB888 `w*h*3`. The stereo reference frame — the
     /// intrinsics from [`OakSource::intrinsics`] belong to this camera.
     pub fn left(&self) -> &[u8] {
@@ -75,6 +61,33 @@ impl StereoFrame<'_> {
     /// Sequence + capture pts (of the left eye).
     pub fn meta(&self) -> &FrameMeta {
         &self.meta
+    }
+
+    /// Left eye as an owned **host** kornia [`Image`], ready for CPU code or for
+    /// kornia's `to_cuda_image(&stream)`.
+    ///
+    /// Copies `w*h*3` — an `Image` owns its buffer while [`left`](Self::left) only
+    /// borrows the device's. For a per-frame hot loop that already owns a device
+    /// buffer, uploading the borrowed span is cheaper; use this when you want the
+    /// typed image.
+    pub fn left_image(&self) -> Result<Image<u8, 3>, BoxError> {
+        self.eye_image(self.left)
+    }
+
+    /// Right eye as an owned host [`Image`] — see [`left_image`](Self::left_image).
+    pub fn right_image(&self) -> Result<Image<u8, 3>, BoxError> {
+        self.eye_image(self.right)
+    }
+
+    fn eye_image(&self, span: &[u8]) -> Result<Image<u8, 3>, BoxError> {
+        Image::new(
+            ImageSize {
+                width: self.width as usize,
+                height: self.height as usize,
+            },
+            span.to_vec(),
+        )
+        .map_err(|e| format!("build host Image<u8,3>: {e}").into())
     }
 }
 
@@ -140,7 +153,7 @@ impl OakSource {
     /// Blocks until a pair arrives, absorbing transient empty polls (device
     /// warmup) exactly like [`next_frame`](OakSource::next_frame). `None` means
     /// the stream ended: a device error, or ~5 s with no pair.
-    pub fn next_stereo(&mut self) -> Option<StereoFrame<'_>> {
+    pub fn next_stereo(&mut self) -> Option<OakStereoFrame<'_>> {
         if !self.has_stereo {
             return None;
         }
@@ -178,7 +191,7 @@ impl OakSource {
         let right = unsafe { std::slice::from_raw_parts(right, n) };
 
         self.seq += 1;
-        Some(StereoFrame {
+        Some(OakStereoFrame {
             left,
             right,
             width: w,
@@ -190,43 +203,5 @@ impl OakSource {
             },
             _src: std::marker::PhantomData,
         })
-    }
-
-    /// Drain queued IMU samples, appending them to `out` in capture order;
-    /// returns how many were appended. Non-blocking.
-    ///
-    /// The IMU reports far faster than the frame rate (hundreds of Hz vs ~30),
-    /// which is why it is drained separately rather than folded into the synced
-    /// pair — bundling it per frame would throw away all but one sample. Call it
-    /// once per frame (or more often); samples that don't fit `cap` stay queued
-    /// in order for the next call, so nothing is dropped.
-    ///
-    /// Takes `&mut self` like every other poll, so drain it **outside** a held
-    /// [`StereoFrame`].
-    pub fn next_imu(&mut self, out: &mut Vec<ImuSample>, cap: usize) -> usize {
-        if !self.has_imu || cap == 0 {
-            return 0;
-        }
-        // Reused staging buffer: this runs every frame, and a fresh `vec![default; cap]`
-        // would be a `cap * 32`-byte alloc + memset each time (16 KB at the usual
-        // cap = 512) to receive the handful of samples that actually arrived.
-        if self.imu_scratch.len() < cap {
-            self.imu_scratch
-                .resize(cap, crate::ffi::OakImuSample::default());
-        }
-        let mut n: i32 = 0;
-        let rc = unsafe {
-            crate::ffi::oak_poll_imu(self.dev, self.imu_scratch.as_mut_ptr(), cap as i32, &mut n)
-        };
-        if rc != 1 || n <= 0 {
-            return 0;
-        }
-        let n = (n as usize).min(cap);
-        out.extend(self.imu_scratch[..n].iter().map(|s| ImuSample {
-            ts_ns: s.ts_ns,
-            accel: [s.ax, s.ay, s.az],
-            gyro: [s.gx, s.gy, s.gz],
-        }));
-        n
     }
 }

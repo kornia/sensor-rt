@@ -31,32 +31,30 @@ fn main() -> Result<(), BoxError> {
 
     let mut saved = false;
     for attempt in 1..=20 {
-        let Some(frame) = src.next_frame() else {
+        let Some(frame) = src.next_rgbd() else {
             continue;
         };
-        let (fw, fh) = (frame.width() as usize, frame.height() as usize);
+        let (fw, fh) = (frame.rgb().width() as usize, frame.rgb().height() as usize);
         let npx = fw * fh;
         // RGB888 straight through — the PNG writer takes 3 channels, so there is no
         // reason to widen to RGBA.
-        let rgb = frame.rgb_host();
+        let rgb = frame.rgb().rgb();
         // Depth is aligned to the RGB grid but may be a SMALLER one (downscaled
         // on-device before transport), so resample it to RGB resolution by nearest
         // neighbour before overlaying — indexing it as if it were RGB-sized would
         // read the wrong pixels and make an aligned camera look misaligned.
-        let (dims_match, dep): (bool, Vec<u16>) = match frame.depth() {
-            None => (false, vec![0; npx]),
-            Some(d) => {
-                let (dw, dh) = (d.width() as usize, d.height() as usize);
-                let src_mm = d.as_slice();
-                let mut full = vec![0u16; npx];
-                for y in 0..fh {
-                    let sy = y * dh / fh;
-                    for x in 0..fw {
-                        full[y * fw + x] = src_mm[sy * dw + x * dw / fw];
-                    }
+        let (dims_match, dep): (bool, Vec<u16>) = {
+            let d = frame.depth();
+            let (dw, dh) = (d.width() as usize, d.height() as usize);
+            let src_mm = d.as_slice();
+            let mut full = vec![0u16; npx];
+            for y in 0..fh {
+                let sy = y * dh / fh;
+                for x in 0..fw {
+                    full[y * fw + x] = src_mm[sy * dw + x * dw / fw];
                 }
-                (dw == fw && dh == fh, full)
             }
+            (dw == fw && dh == fh, full)
         };
 
         // RGB channel stats.

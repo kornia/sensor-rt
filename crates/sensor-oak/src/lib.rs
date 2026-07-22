@@ -35,33 +35,31 @@ pub struct OakIntrinsics {
 // caller goes through the safe wrappers below.
 mod depth;
 mod ffi;
+mod imu;
 mod stereo;
 pub use depth::OakDepthMap;
-pub use stereo::{ImuSample, StereoFrame};
+pub use imu::ImuSample;
+pub use stereo::OakStereoFrame;
 
-/// One synced OAK frame: RGB plus optional aligned depth, both on the host.
+/// One RGB frame, borrowed from the source.
 ///
-/// **Both buffers are borrowed from the source and only valid until the next
-/// [`OakSource::next_frame`].** The `'a` lifetime ties this frame to the `&mut
-/// OakSource` borrow, so the borrow checker forbids pulling the next frame while
-/// this one (or anything it lent out) is still held — preventing use-after-free
-/// of the borrowed device buffers.
-pub struct OakFrame<'a> {
-    // Borrowed from the source and valid only until the next poll, so they must NOT
-    // be movable out of the frame.
-    rgb_host: &'a [u8],
+/// **The span is borrowed and only valid until the next poll.** The `'a` lifetime
+/// ties this frame to the `&mut OakSource` borrow, so the borrow checker forbids
+/// pulling the next frame while this one (or anything it lent out) is still held.
+pub struct OakRgbFrame<'a> {
+    rgb: &'a [u8],
     meta: FrameMeta,
     width: u32,
     height: u32,
-    depth: Option<OakDepthMap>,
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
 
-impl OakFrame<'_> {
-    /// Host rgb span, borrowed — valid only while this frame is held. Always raw RGB888 (`w*h*3`,
-    /// tightly packed). The compressed colour stream is separate — see [`OakSource::next_video`].
-    pub fn rgb_host(&self) -> &[u8] {
-        self.rgb_host
+impl OakRgbFrame<'_> {
+    /// Raw RGB888 span (`w*h*3`, tightly packed), borrowed — valid only while this
+    /// frame is held. The compressed colour stream is separate — see
+    /// [`OakSource::next_video`].
+    pub fn rgb(&self) -> &[u8] {
+        self.rgb
     }
     /// Frame metadata (sequence + capture pts).
     pub fn meta(&self) -> &FrameMeta {
@@ -73,28 +71,54 @@ impl OakFrame<'_> {
     pub fn height(&self) -> u32 {
         self.height
     }
-    /// RGB as an owned **host** kornia [`Image`], ready to hand to CPU code or to
-    /// push to the GPU with kornia's `to_cuda_image(&stream)`.
+
+    /// RGB as an owned **host** kornia [`Image`], ready for CPU code or for kornia's
+    /// `to_cuda_image(&stream)`.
     ///
     /// This **copies** `w*h*3` bytes, because a kornia `Image` owns its buffer while
-    /// [`rgb_host`](Self::rgb_host) only borrows the device's. For a per-frame hot
-    /// loop, prefer `rgb_host()` straight into your own reused device buffer — that
-    /// path stays copy-free on the host. Use this when the convenience is worth one
-    /// memcpy (~2.7 MB at 1280x720).
+    /// [`rgb`](Self::rgb) only borrows the device's. For a per-frame hot loop that
+    /// already owns a device buffer, uploading the span is cheaper.
     pub fn rgb_image(&self) -> Result<Image<u8, 3>, BoxError> {
         Image::new(
             ImageSize {
                 width: self.width as usize,
                 height: self.height as usize,
             },
-            self.rgb_host.to_vec(),
+            self.rgb.to_vec(),
         )
         .map_err(|e| format!("build host Image<u8,3>: {e}").into())
     }
-    /// Aligned depth map, if the device has a stereo pair. Borrowed — same "valid only while this
-    /// frame is held" contract as [`rgb_host`](Self::rgb_host).
-    pub fn depth(&self) -> Option<&OakDepthMap> {
-        self.depth.as_ref()
+}
+
+/// One synced RGB **+ aligned depth** frame.
+///
+/// Distinct from [`OakRgbFrame`] rather than an `Option<depth>` on it: a source
+/// either has a depth stream or it does not, and that is known at open time. Making
+/// it a separate type means a consumer that needs depth cannot compile against a
+/// source that will never produce it, instead of discovering `None` at runtime on
+/// every frame.
+///
+/// Same borrow contract as [`OakRgbFrame`] — valid only until the next poll.
+pub struct OakRgbdFrame<'a> {
+    rgb: OakRgbFrame<'a>,
+    depth: OakDepthMap,
+}
+
+impl<'a> OakRgbdFrame<'a> {
+    /// The colour half of the pair.
+    pub fn rgb(&self) -> &OakRgbFrame<'a> {
+        &self.rgb
+    }
+    /// Aligned depth. Present by construction — no `Option` to unwrap.
+    ///
+    /// May be a SMALLER grid than the RGB (downscaled on-device before transport)
+    /// but stays aligned to it, so scale coordinates by `rgb.width() / depth.width()`.
+    pub fn depth(&self) -> &OakDepthMap {
+        &self.depth
+    }
+    /// Frame metadata (sequence + capture pts).
+    pub fn meta(&self) -> &FrameMeta {
+        self.rgb.meta()
     }
 }
 
@@ -125,7 +149,7 @@ impl OakSource {
     /// `None` = first available; `Some(id)` = a specific MxId (USB or PoE) or IP (PoE).
     ///
     /// Takes **no CUDA stream**: this driver never touches the GPU. Frames arrive on the host —
-    /// [`OakFrame::rgb_host`] (borrowed, copy-free) or [`OakFrame::rgb_image`] (owned) — and a
+    /// [`OakRgbFrame::rgb`] (borrowed, copy-free) or [`OakRgbFrame::rgb_image`] (owned) — and a
     /// consumer that wants them on the device owns that upload and the stream it runs on. That keeps
     /// the driver a plain producer and keeps CUDA out of processes that only want pixels.
     pub fn open(device: Option<&str>, width: u32, height: u32, fps: u32) -> Result<Self, BoxError> {
@@ -153,7 +177,7 @@ impl OakSource {
         Self::open_inner(device, width, height, fps, true, false, true)
     }
 
-    /// Open host-only **plus an on-device hardware H.264 colour stream**: the synced [`OakFrame`] carries
+    /// Open host-only **plus an on-device hardware H.264 colour stream**: the synced frame carries
     /// raw RGB888 (+ aligned depth when `depth`), and [`OakSource::next_video`] drains the separate H.264
     /// bitstream (efficient video for viewing / recording). Set `depth = false` for an
     /// **uncalibrated** camera — it skips the StereoDepth node, which would otherwise fail at runtime and
@@ -274,9 +298,26 @@ impl OakSource {
     /// **Zero copies.** The shim hands out depthai's RGB and depth buffers directly
     /// (no host repack, no depth copy) and this driver adds nothing on top. A
     /// consumer that wants the frame on the GPU uploads the span into its own
-    /// buffer — see [`OakFrame::rgb_host`] — or takes an owned host image via
-    /// [`OakFrame::rgb_image`] at the cost of one memcpy.
-    pub fn next_frame(&mut self) -> Option<OakFrame<'_>> {
+    /// buffer — see [`OakRgbFrame::rgb`] — or takes an owned host image via
+    /// [`OakRgbFrame::rgb_image`] at the cost of one memcpy.
+    ///
+    /// Depth is dropped here even when the device produces it; use
+    /// [`next_rgbd`](Self::next_rgbd) to get the pair.
+    pub fn next_frame(&mut self) -> Option<OakRgbFrame<'_>> {
+        self.poll_frame().map(|(rgb, _)| rgb)
+    }
+
+    /// Pull the next synced **RGB + aligned depth** pair.
+    ///
+    /// `None` when the stream ends, or when this source has no depth stream at all
+    /// (check [`has_depth`](Self::has_depth) once at open time rather than testing
+    /// per frame).
+    pub fn next_rgbd(&mut self) -> Option<OakRgbdFrame<'_>> {
+        let (rgb, depth) = self.poll_frame()?;
+        Some(OakRgbdFrame { rgb, depth: depth? })
+    }
+
+    fn poll_frame(&mut self) -> Option<(OakRgbFrame<'_>, Option<OakDepthMap>)> {
         let mut rgb: *const u8 = std::ptr::null();
         let mut depth: *const u16 = std::ptr::null();
         let (mut w, mut h) = (0i32, 0i32);
@@ -342,14 +383,16 @@ impl OakSource {
         let depth = (!depth.is_null() && dw > 0 && dh > 0)
             .then(|| unsafe { OakDepthMap::borrowed(depth, dw as u32, dh as u32) });
 
-        Some(OakFrame {
-            rgb_host: host,
-            meta,
-            width: w,
-            height: h,
+        Some((
+            OakRgbFrame {
+                rgb: host,
+                meta,
+                width: w,
+                height: h,
+                _src: std::marker::PhantomData,
+            },
             depth,
-            _src: std::marker::PhantomData,
-        })
+        ))
     }
 
     /// Whether this source runs the on-device H.264 colour stream ([`OakSource::open_video`]).

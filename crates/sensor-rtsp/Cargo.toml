@@ -19,3 +19,13 @@ kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
 thiserror     = { workspace = true }
 cudarc        = { workspace = true }
+
+[dev-dependencies]
+# Examples only: the models they run, plus PNG output and CLI parsing. The driver
+# itself depends on none of this.
+vrt-xfeat    = { workspace = true }
+vrt-rfdetr   = { workspace = true }
+vrt-hub      = { workspace = true, features = ["hub", "builder"] }
+kornia-io    = { workspace = true }
+env_logger   = { workspace = true }
+argh         = { workspace = true }

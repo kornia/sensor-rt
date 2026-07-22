@@ -46,24 +46,20 @@ fn main() -> Result<(), vrt::BoxError> {
     // Pull a handful of frames — the first few may be empty while the pipeline spins up.
     let mut got = 0u32;
     for attempt in 1..=60 {
-        let Some(frame) = src.next_frame() else {
+        let Some(frame) = src.next_rgbd() else {
             continue;
         };
         got += 1;
-        let cx = frame.width() / 2;
-        let cy = frame.height() / 2;
+        let cx = frame.rgb().width() / 2;
+        let cy = frame.rgb().height() / 2;
 
-        let (center_mm, valid_pct) = match frame.depth() {
-            Some(d) => {
-                let center = d.meters_at(cx, cy).map(|m| (m * 1000.0) as u32);
-                (center, 100.0 * d.valid_fraction())
-            }
-            None => (None, 0.0),
-        };
+        let d = frame.depth();
+        let center_mm = d.meters_at(cx, cy).map(|m| (m * 1000.0) as u32);
+        let valid_pct = 100.0 * d.valid_fraction();
 
         println!(
             "frame {got:2} (attempt {attempt:2})  rgb {}×{}  pts={:?}  center_depth={}  depth_valid={:.1}%",
-            frame.width(), frame.height(), frame.meta().pts_ns,
+            frame.rgb().width(), frame.rgb().height(), frame.meta().pts_ns,
             center_mm.map_or("none".to_string(), |mm| format!("{mm} mm")),
             valid_pct,
         );
