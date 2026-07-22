@@ -1,16 +1,25 @@
 # sensor-rt
 
-Isolated **camera drivers for Jetson** — RTSP/H.264 over NVMM, and the OAK-D
-stereo pair + IMU — feeding the [`vision-rt`](https://github.com/kornia/vision-rt)
-algorithm crates. Drivers are plain producers: they emit kornia `Image<u8,3>`
-frames and nothing else.
+Real-time **sensor drivers in Rust** — cameras and inertial units — that hand off
+kornia images ready for inference.
 
-The dependency edge points one way — `sensor-rt → vision-rt` — so `vrt` stays
-pure algorithms with no sensor/GStreamer/depthai dependency. The OAK driver goes
-further and depends on **no inference runtime and no CUDA at all**, so a process
-that only wants camera frames builds neither.
+Drivers here are plain producers. Each one owns a transport and a device, emits
+frames (and where the hardware has one, an IMU stream), and stops there: no
+inference, no orchestration, no opinion about what consumes it. That boundary is
+the point — a process that only wants pixels should not build a model runtime, and
+several of these crates depend on neither an inference stack nor CUDA.
 
-**Target platform:** Jetson Orin (aarch64), JetPack 6.x, CUDA 12.6.
+Frames are kornia `Image` types, so they drop straight into
+[`vision-rt`](https://github.com/kornia/vision-rt)'s models, into kornia's own
+image ops, or into anything else that speaks the same types. The dependency edge
+points one way — `sensor-rt → vision-rt` — so the algorithm crates stay free of
+GStreamer, depthai, and driver concerns.
+
+**Sources today:** RTSP/H.264 (hardware NVMM decode) and OAK-D (synced stereo pair
++ IMU). Adding one is a crate, not a fork.
+
+**Current target:** Jetson Orin (aarch64), JetPack 6.x, CUDA 12.6 — the platform
+the hardware paths are tuned and tested against, not a limit of the design.
 
 ## Workspace
 
