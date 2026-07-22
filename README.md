@@ -37,9 +37,9 @@ loop {
     let Some(frame) = cam.next_stereo() else { break };
 
     // Borrowed, copy-free, valid until the next poll:
-    let (l, r) = (frame.left(), frame.right());          // &[u8], RGB888 w*h*3
+    let (l, r) = (frame.left(), frame.right());          // &[u8], GRAY8 w*h (mono sensors)
     // Or zero-copy kornia Images that OUTLIVE the frame (retained handle):
-    let left_img = frame.left_image()?;                  // Image<u8,3>, host
+    let left_img = frame.left_image()?;                  // Image<u8,1>, host
     // frame.meta(): FrameMeta (seq / pts) — same epoch clock as ImuSample::ts_ns
 }
 ```

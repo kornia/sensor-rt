@@ -79,11 +79,11 @@ fn main() -> Result<(), BoxError> {
         n += 1;
         let ts = frame.meta().pts_ns.unwrap_or(0);
         let (fw, fh) = (frame.width(), frame.height());
-        let expect = fw as usize * fh as usize * 3;
+        let expect = fw as usize * fh as usize; // GRAY8: one byte per pixel
 
         // (1) shape contract
-        assert_eq!(frame.left().len(), expect, "left eye is not tight RGB888");
-        assert_eq!(frame.right().len(), expect, "right eye is not tight RGB888");
+        assert_eq!(frame.left().len(), expect, "left eye is not tight GRAY8");
+        assert_eq!(frame.right().len(), expect, "right eye is not tight GRAY8");
 
         // (2) the eyes must differ — a stereo pair of the same scene from two baselines
         let ml = mean(frame.left());
@@ -185,7 +185,7 @@ fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// Mean byte value of an RGB888 span — a cheap, allocation-free image fingerprint.
+/// Mean byte value of a GRAY8 span — a cheap, allocation-free image fingerprint.
 fn mean(buf: &[u8]) -> f32 {
     if buf.is_empty() {
         return 0.0;

@@ -31,6 +31,7 @@ cmake = { workspace = true }
 # Examples only. The driver itself needs none of this — see the note above.
 vrt        = { workspace = true }
 vrt-xfeat  = { workspace = true }
+kornia-imgproc = { workspace = true }
 vrt-hub    = { workspace = true, features = ["builder"] }
 cudarc     = { workspace = true }
 rerun      = { workspace = true }

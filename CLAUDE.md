@@ -23,7 +23,8 @@ Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
 ## Architecture
 
 Sensors are plain producers: `next_frame()` → `Stamped<Image<u8,3>>` (RTSP) or `next_stereo()` → an
-`OakStereoFrame` lending both eyes as host RGB888 spans, or as zero-copy kornia
+`OakStereoFrame` lending both eyes as host **GRAY8** spans (CAM_B/CAM_C are mono —
+consumers needing RGB expand on the GPU), or as zero-copy kornia
 `Image`s that outlive the frame via a retained handle (OAK). RTSP frames are device-resident
 and tightly packed RGB8 — the shape kornia's `Preprocessor` and the `vrt` models
 consume. RTSP's NVMM path is RGBA + hardware-padded pitch, so it runs one on-GPU

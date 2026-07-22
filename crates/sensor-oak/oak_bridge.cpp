@@ -1,6 +1,6 @@
 // C++ implementation of the pure-C OAK bridge over depthai-core v3.
 // One device (USB or PoE) → the two mono cameras (CAM_B/CAM_C) through a Sync node,
-// exposing a time-synced RGB888 stereo pair, plus the on-board IMU on its own queue.
+// exposing a time-synced GRAY8 stereo pair, plus the on-board IMU on its own queue.
 // All C++ exceptions are caught and surfaced as return codes + oak_last_error().
 
 #include "oak_bridge.h"
@@ -103,18 +103,20 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
             return nullptr;
         }
 
-        // Mono sensors requested as RGB888i: depthai replicates gray across 3 channels on-device, so
-        // the frames land tightly packed in exactly the layout a 3-channel consumer (kornia
-        // Image<u8,3>, and through it XFeat) wants — no host conversion, no repack.
+        // CAM_B/CAM_C are MONOCHROME sensors, so they are requested as GRAY8 — one byte per pixel.
+        // Asking for RGB888i would make depthai replicate the same gray value across three channels
+        // on-device and then ship 3x the bytes over XLink for no information: 768 KB/eye at 640x400
+        // instead of 256 KB. Consumers that need 3 channels (most models) expand it on the GPU, where
+        // the copy is free next to the inference.
         auto left = pipeline.create<dai::node::Camera>();
         left->build(dai::CameraBoardSocket::CAM_B);
         auto right = pipeline.create<dai::node::Camera>();
         right->build(dai::CameraBoardSocket::CAM_C);
         const std::pair<uint32_t, uint32_t> size((uint32_t)width, (uint32_t)height);
-        auto* lo = left->requestOutput(size, dai::ImgFrame::Type::RGB888i,
+        auto* lo = left->requestOutput(size, dai::ImgFrame::Type::GRAY8,
                                        dai::ImgResizeMode::CROP, (float)fps,
                                        /*enableUndistortion=*/true);
-        auto* ro = right->requestOutput(size, dai::ImgFrame::Type::RGB888i,
+        auto* ro = right->requestOutput(size, dai::ImgFrame::Type::GRAY8,
                                         dai::ImgResizeMode::CROP, (float)fps,
                                         /*enableUndistortion=*/true);
 
@@ -164,16 +166,16 @@ extern "C" int oak_has_imu(const oak_device* dev) {
     return (dev && dev->has_imu) ? 1 : 0;
 }
 
-// Validate one eye and hand out its buffer zero-copy. The Rust side assumes TIGHT rows
-// (stride == w*3), so verify that rather than trust it — same check as oak_poll's RGB.
+// Validate one eye and hand out its buffer zero-copy. GRAY8 is one byte per pixel, and the Rust
+// side assumes TIGHT rows (stride == w), so verify that rather than trust it.
 static bool eye_span(const std::shared_ptr<dai::ImgFrame>& f, int w, int h,
                      const uint8_t** out) {
     if (!f) return false;
     if ((int)f->getWidth() != w || (int)f->getHeight() != h) return false;
     auto d = f->getData();
     const unsigned int stride = f->getStride();
-    if (stride != 0 && stride != (unsigned)w * 3) return false;
-    if (d.size() < (size_t)w * h * 3) return false;
+    if (stride != 0 && stride != (unsigned)w) return false;
+    if (d.size() < (size_t)w * h) return false;
     *out = d.data();
     return true;
 }
@@ -200,11 +202,11 @@ extern "C" int oak_poll_stereo(oak_device* dev,
         dev->cur_left = l;
         dev->cur_right = r;
         if (!eye_span(l, w, h, left) || !eye_span(r, w, h, right)) {
-            set_err("stereo eye is not tightly packed RGB888 (stride != w*3) or eyes differ in size");
+            set_err("stereo eye is not tightly packed GRAY8 (stride != w) or eyes differ in size");
             return -1;
         }
         *width = w; *height = h;
-        *len = w * h * 3;
+        *len = w * h;
         *ts_ns = frame_epoch_ns(l);
         return 1;
     } catch (const std::exception& e) { set_err(e.what()); return -1; }

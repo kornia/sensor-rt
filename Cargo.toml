@@ -47,7 +47,10 @@ vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351
 # kornia GPU image/tensor types — pinned to the same rev vision-rt uses.
 kornia-image   = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
 kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
-kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = ["cudarc"] }
+kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4", features = [
+  "cudarc",   # device backend + custom kernels (vrt-xfeat's preprocess)
+  "gpu-cuda", # gates the residency-aware CUDA colour dispatch (gray -> RGB on device)
+] }
 kornia-io      = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
 # sensor-rt internal crates
 nvbuf-sys    = { path = "crates/nvbuf-sys" }

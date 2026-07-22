@@ -35,6 +35,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use argh::FromArgs;
+use kornia_image::color_spaces::{Gray8, Rgb8};
+use kornia_image::ImageSize;
+use kornia_imgproc::color::ConvertColor;
 use sensor_oak::{ImuSample, OakSource};
 
 #[derive(FromArgs)]
@@ -148,6 +151,11 @@ fn main() -> Result<(), BoxError> {
 
     let viz = StereoViz::new(&args.rrd, args.rrd_connect, args.image_every)?;
 
+    // Reused device RGB targets for the gray->RGB expansion; sized on the first frame
+    // from its actual dims.
+    let mut rgb_l: Option<Rgb8> = None;
+    let mut rgb_r: Option<Rgb8> = None;
+
     let mut imu: Vec<ImuSample> = Vec::new();
     let mut n = 0u64;
     let mut gpu_ms_total = 0.0f64;
@@ -176,17 +184,31 @@ fn main() -> Result<(), BoxError> {
 
         let t_gpu = Instant::now();
 
-        // Host image -> device image, through kornia's own API. `to_cuda_image` does
-        // the H2D in one `clone_htod` and hands back a device-resident `Image`, so the
-        // frame never leaves the typed image world and this example needs no CUDA
-        // allocation code of its own. Each eye uploads on its own stream.
-        let img_l = frame.left_image()?.to_cuda_image(&s0)?;
-        let img_r = frame.right_image()?.to_cuda_image(&s1)?;
+        // The eyes are MONOCHROME, so only w*h bytes crossed XLink. XFeat wants three
+        // channels, so the gray->RGB expansion happens here on the GPU: kornia's
+        // ConvertColor is residency-aware and dispatches to a CUDA kernel for device
+        // operands. Doing it on-device rather than asking depthai for RGB888i is what
+        // keeps the link carrying 1 byte/px instead of 3 — the expansion itself is
+        // free next to the backbone.
+        let gray_l = Gray8(frame.left_image()?).to_cuda(&s0)?;
+        let gray_r = Gray8(frame.right_image()?).to_cuda(&s1)?;
+        if rgb_l.is_none() {
+            let size = ImageSize {
+                width: frame.width() as usize,
+                height: frame.height() as usize,
+            };
+            rgb_l = Some(Rgb8::zeros_cuda(size, &s0)?);
+            rgb_r = Some(Rgb8::zeros_cuda(size, &s1)?);
+        }
+        let (dst_l, dst_r) = (rgb_l.as_mut().unwrap(), rgb_r.as_mut().unwrap());
+        gray_l.convert(dst_l)?;
+        gray_r.convert(dst_r)?;
+        let (img_l, img_r) = (&dst_l.0, &dst_r.0);
 
         // Both submissions return immediately — nothing has synced yet, so the GPU
         // holds work from both streams at once and can interleave it.
-        xf_l.submit(&img_l, &mut res_l)?;
-        xf_r.submit(&img_r, &mut res_r)?;
+        xf_l.submit(img_l, &mut res_l)?;
+        xf_r.submit(img_r, &mut res_r)?;
 
         // ⚠ LOAD-BEARING, NOT DECORATIVE. `Stream::new_standalone` disables cudarc's
         // per-op event tracking, whose safety contract is "no buffer crosses

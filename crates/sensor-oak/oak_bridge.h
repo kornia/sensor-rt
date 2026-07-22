@@ -33,9 +33,11 @@ typedef struct {
  * A separate entry point rather than more flags on oak_open: the pipeline shares
  * no nodes with it, and the RGBD/H.264 paths must not regress.
  *
- *   width/height : per-eye output size. The mono sensors are requested as RGB888i
- *                  (gray replicated to 3 channels) so the frames drop straight
- *                  into a 3-channel consumer with no host conversion.
+ *   width/height : per-eye output size. CAM_B/CAM_C are MONOCHROME, so the frames
+ *                  are GRAY8 (one byte per pixel). Requesting RGB888i would make
+ *                  depthai replicate gray across three channels and ship 3x the
+ *                  bytes for no extra information — consumers that need RGB expand
+ *                  it on the GPU instead.
  *   fps          : stereo pair rate.
  *   imu_hz       : accelerometer + gyroscope report rate (e.g. 200-400). The IMU
  *                  is OPTIONAL — a device without one (or whose IMU fails to
@@ -57,8 +59,8 @@ int oak_intrinsics(const oak_device *dev,
 
 /* Pull the next time-synced stereo pair. On success (return 1) both out-pointers
  * alias device-internal buffers VALID UNTIL THE NEXT oak_poll_stereo:
- *   left/right -> width*height*3 bytes each, interleaved R,G,B (tightly packed)
- *   len        -> that byte length (width*height*3), same for both eyes
+ *   left/right -> width*height bytes each, GRAY8 (tightly packed, 1 byte/px)
+ *   len        -> that byte length (width*height), same for both eyes
  *   ts_ns      -> capture time of the LEFT frame, epoch ns
  * Blocks up to ~1s for the pair. Returns 1 on a pair, 0 on timeout/no-frame,
  * -1 on error. */

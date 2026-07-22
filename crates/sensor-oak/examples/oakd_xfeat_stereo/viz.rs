@@ -100,11 +100,11 @@ impl StereoViz {
         let res = [frame.width(), frame.height()];
         self.rec.log(
             "stereo/left/image",
-            &rerun::Image::from_rgb24(frame.left().to_vec(), res),
+            &rerun::Image::from_l8(frame.left().to_vec(), res),
         )?;
         self.rec.log(
             "stereo/right/image",
-            &rerun::Image::from_rgb24(frame.right().to_vec(), res),
+            &rerun::Image::from_l8(frame.right().to_vec(), res),
         )?;
 
         // Keypoints, with the matched subset highlighted. Logged in each eye's own

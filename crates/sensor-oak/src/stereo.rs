@@ -1,5 +1,5 @@
 //! OAK-D **stereo + IMU** modality: the two mono cameras (CAM_B = left, CAM_C =
-//! right) as a time-synced RGB888 pair, plus the on-board IMU.
+//! right) as a time-synced GRAY8 pair, plus the on-board IMU.
 //!
 //! This is the raw stereo + inertial source for VIO / stereo-feature work — the
 //! counterpart to the colour/depth path in [`crate`], not a variant of it. It
@@ -46,9 +46,9 @@ impl Drop for RetainedFrame {
 
 /// One time-synced stereo pair, borrowed from the source.
 ///
-/// Both spans are RGB888 (`w*h*3`, tightly packed — the mono sensors are streamed
-/// as 3-channel, so gray is already replicated and no conversion is needed) and
-/// are **valid only until the next [`OakSource::next_stereo`]**. The `'a` lifetime
+/// Both spans are GRAY8 (`w*h`, tightly packed) — these are monochrome sensors, so
+/// one byte per pixel is the whole signal — and are **valid only until the next
+/// [`OakSource::next_stereo`]**. The `'a` lifetime
 /// ties this frame to the `&mut OakSource` borrow, so the borrow checker forbids
 /// pulling the next pair while this one is still held — the same contract, and
 /// the same enforcement, as [`OakRgbFrame`](crate::OakRgbFrame).
@@ -64,12 +64,12 @@ pub struct OakStereoFrame<'a> {
 }
 
 impl OakStereoFrame<'_> {
-    /// Left eye (CAM_B), RGB888 `w*h*3`. The stereo reference frame — the
+    /// Left eye (CAM_B), GRAY8 `w*h`. The stereo reference frame — the
     /// intrinsics from [`OakSource::intrinsics`] belong to this camera.
     pub fn left(&self) -> &[u8] {
         self.left
     }
-    /// Right eye (CAM_C), RGB888 `w*h*3`, same dimensions as [`left`](Self::left).
+    /// Right eye (CAM_C), GRAY8 `w*h`, same dimensions as [`left`](Self::left).
     pub fn right(&self) -> &[u8] {
         self.right
     }
@@ -86,7 +86,7 @@ impl OakStereoFrame<'_> {
         &self.meta
     }
 
-    /// Left eye as a host kornia [`Image`] — **zero copy**.
+    /// Left eye as a host kornia grayscale [`Image`] — **zero copy**.
     ///
     /// The image borrows depthai's pixel buffer directly and carries a retain handle
     /// that keeps that buffer alive, so unlike [`left`](Self::left) the result is NOT
@@ -94,16 +94,16 @@ impl OakStereoFrame<'_> {
     /// moved or buffered freely. The reference is released when the image is dropped.
     ///
     /// Read-only — the underlying storage refuses mutable slice access.
-    pub fn left_image(&self) -> Result<Image<u8, 3>, BoxError> {
+    pub fn left_image(&self) -> Result<Image<u8, 1>, BoxError> {
         self.eye_image(0, self.left)
     }
 
     /// Right eye as a host [`Image`] — see [`left_image`](Self::left_image).
-    pub fn right_image(&self) -> Result<Image<u8, 3>, BoxError> {
+    pub fn right_image(&self) -> Result<Image<u8, 1>, BoxError> {
         self.eye_image(1, self.right)
     }
 
-    fn eye_image(&self, eye: i32, span: &[u8]) -> Result<Image<u8, 3>, BoxError> {
+    fn eye_image(&self, eye: i32, span: &[u8]) -> Result<Image<u8, 1>, BoxError> {
         // Retain BEFORE handing the pointer to kornia: from here on the buffer is
         // owned by the guard, not by "until the next poll".
         let handle = unsafe { crate::ffi::oak_stereo_retain(self.dev, eye) };
@@ -114,8 +114,8 @@ impl OakStereoFrame<'_> {
 
         let (w, h) = (self.width as usize, self.height as usize);
         // SAFETY:
-        //   - `span` points at the retained frame's pixels, non-null and `w*h*3` long
-        //     (the shim validated tight RGB888 before handing it out).
+        //   - `span` points at the retained frame's pixels, non-null and `w*h` long
+        //     (the shim validated tight GRAY8 before handing it out).
         //   - `keepalive` holds the depthai frame, so the memory outlives this storage.
         //   - Host memory: MemoryDomain::Host, and the OAK delivers frames to host RAM.
         let storage = unsafe {
@@ -127,15 +127,15 @@ impl OakStereoFrame<'_> {
                 keepalive,
             )
         };
-        // Row-major [H, W, 3]; the shim guarantees tight rows, so these strides are exact.
+        // Row-major [H, W, 1]; the shim guarantees tight rows, so these strides are exact.
         // (kornia's own `get_strides_from_shape` is not reachable from outside the crate,
         // which is why its v4l/gstreamer backends spell this out the same way.)
         let tensor = Tensor {
             storage,
-            shape: [h, w, 3],
-            strides: [w * 3, 3, 1],
+            shape: [h, w, 1],
+            strides: [w, 1, 1],
         };
-        Image::try_from(tensor).map_err(|e| format!("borrowed Image<u8,3>: {e}").into())
+        Image::try_from(tensor).map_err(|e| format!("borrowed Image<u8,1>: {e}").into())
     }
 }
 
@@ -220,7 +220,7 @@ impl OakSource {
         if w == 0 || h == 0 {
             return None;
         }
-        // The shim guarantees both eyes are tight RGB888 of these dims (it validates stride and
+        // The shim guarantees both eyes are tight GRAY8 of these dims (it validates stride and
         // size and errors out otherwise), so one length covers both spans.
         let n = len.max(0) as usize;
         let left = unsafe { std::slice::from_raw_parts(left, n) };
