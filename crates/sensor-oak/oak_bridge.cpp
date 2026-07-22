@@ -70,10 +70,6 @@ struct oak_device {
     std::shared_ptr<dai::MessageQueue> imu_q;    // IMUData batches, far faster than the frame rate
     // Keep the current frames alive so their buffers (handed out as raw spans) stay
     // valid until the next poll — zero-copy: no host repack.
-    // The stereo pair is pinned via the two eye frames (NOT the MessageGroup): holding the group
-    // alone would not keep the ImgFrame buffers alive once it hands out shared_ptrs.
-    std::shared_ptr<dai::ImgFrame> cur_left;
-    std::shared_ptr<dai::ImgFrame> cur_right;
     // IMU samples popped off the queue but not yet handed to the caller (see oak_poll_imu).
     std::vector<oak_imu_sample> imu_pending;
     bool has_imu = false;     // on-board IMU running (optional even in stereo mode)
@@ -182,9 +178,10 @@ static bool eye_span(const std::shared_ptr<dai::ImgFrame>& f, int w, int h,
 
 extern "C" int oak_poll_stereo(oak_device* dev,
                                const uint8_t** left, const uint8_t** right,
-                               int* width, int* height, int* len, uint64_t* ts_ns) {
+                               int* width, int* height, int* len, uint64_t* ts_ns,
+                               void** l_hnd, void** r_hnd) {
     if (!dev) { set_err("null device"); return -1; }
-    if (!left || !right || !width || !height || !len || !ts_ns) {
+    if (!left || !right || !width || !height || !len || !ts_ns || !l_hnd || !r_hnd) {
         set_err("null out pointer"); return -1;
     }
     try {
@@ -198,9 +195,6 @@ extern "C" int oak_poll_stereo(oak_device* dev,
 
         const int w = (int)l->getWidth(), h = (int)l->getHeight();
         if (w <= 0 || h <= 0) return 0;   // degenerate frame — skip, don't kill the stream
-        // Pin BOTH eyes for the lifetime of the caller's spans (until the next poll).
-        dev->cur_left = l;
-        dev->cur_right = r;
         if (!eye_span(l, w, h, left) || !eye_span(r, w, h, right)) {
             set_err("stereo eye is not tightly packed GRAY8 (stride != w) or eyes differ in size");
             return -1;
@@ -208,24 +202,18 @@ extern "C" int oak_poll_stereo(oak_device* dev,
         *width = w; *height = h;
         *len = w * h;
         *ts_ns = frame_epoch_ns(l);
+        // Hand ownership of both eyes to the caller. Each handle is a heap-allocated copy of
+        // the shared_ptr, so the pixel buffers live exactly as long as the caller keeps them —
+        // no device-side "current frame" slot to re-address later, and no way to retain the
+        // wrong frame.
+        *l_hnd = new std::shared_ptr<dai::ImgFrame>(l);
+        *r_hnd = new std::shared_ptr<dai::ImgFrame>(r);
         return 1;
     } catch (const std::exception& e) { set_err(e.what()); return -1; }
     catch (...) { set_err("unknown error in oak_poll_stereo"); return -1; }
 }
 
-// Retain/release for the current stereo eye. The handle is a heap-allocated copy of the
-// shared_ptr, so the ImgFrame (and its pixel buffer) survives until the handle is freed —
-// independently of dev->cur_left/cur_right being reassigned by the next poll.
-extern "C" void* oak_stereo_retain(oak_device* dev, int eye) {
-    if (!dev) { set_err("null device"); return nullptr; }
-    try {
-        const std::shared_ptr<dai::ImgFrame>& f = (eye == 0) ? dev->cur_left : dev->cur_right;
-        if (!f) { set_err("no current stereo frame to retain"); return nullptr; }
-        return new std::shared_ptr<dai::ImgFrame>(f);   // refcount++
-    } catch (const std::exception& e) { set_err(e.what()); return nullptr; }
-    catch (...) { set_err("unknown error in oak_stereo_retain"); return nullptr; }
-}
-
+// Release a handle from oak_poll_stereo.
 extern "C" void oak_frame_release(void* handle) {
     if (!handle) return;
     delete static_cast<std::shared_ptr<dai::ImgFrame>*>(handle);   // refcount--

@@ -24,11 +24,11 @@ use kornia_tensor::resource::MemoryDomain;
 use kornia_tensor::{host_alloc, storage::TensorStorage, Tensor};
 use sensor_types::FrameMeta;
 
-/// Keeps one depthai frame alive past the poll that produced it.
+/// Owns one depthai frame's pixel buffer.
 ///
-/// Holding this is what makes a borrowed [`Image`] sound: the shim copies the
-/// underlying `shared_ptr`, so the pixel buffer cannot be recycled while this guard
-/// exists. Dropping it releases the reference.
+/// `oak_poll_stereo` hands out a retain handle per eye, so the buffer's lifetime is
+/// the guard's — not "until the next poll". Holding one is what makes a borrowed
+/// [`Image`] sound; dropping it releases the reference.
 struct RetainedFrame(*mut c_void);
 
 // SAFETY: the handle is an owned heap `shared_ptr<ImgFrame>` copy. depthai's control
@@ -58,8 +58,10 @@ pub struct OakStereoFrame<'a> {
     width: u32,
     height: u32,
     meta: FrameMeta,
-    /// Needed to retain an eye — see [`left_image`](Self::left_image).
-    dev: *mut crate::ffi::OakDevice,
+    /// One per eye, owning the pixel buffers the spans point at. Sharing them into a
+    /// borrowed [`Image`] is a refcount bump, not a new FFI call.
+    keep_left: Arc<RetainedFrame>,
+    keep_right: Arc<RetainedFrame>,
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
 
@@ -88,35 +90,32 @@ impl OakStereoFrame<'_> {
 
     /// Left eye as a host kornia grayscale [`Image`] — **zero copy**.
     ///
-    /// The image borrows depthai's pixel buffer directly and carries a retain handle
-    /// that keeps that buffer alive, so unlike [`left`](Self::left) the result is NOT
-    /// tied to this frame's lifetime: it stays valid across later polls and can be
-    /// moved or buffered freely. The reference is released when the image is dropped.
+    /// The image borrows depthai's pixel buffer directly and shares this frame's
+    /// retain handle, so unlike [`left`](Self::left) the result is NOT tied to the
+    /// frame's lifetime: it stays valid across later polls and can be moved or
+    /// buffered freely. The buffer is released once the frame and every image made
+    /// from it are dropped.
     ///
     /// Read-only — the underlying storage refuses mutable slice access.
     pub fn left_image(&self) -> Result<Image<u8, 1>, BoxError> {
-        self.eye_image(0, self.left)
+        self.eye_image(&self.keep_left, self.left)
     }
 
     /// Right eye as a host [`Image`] — see [`left_image`](Self::left_image).
     pub fn right_image(&self) -> Result<Image<u8, 1>, BoxError> {
-        self.eye_image(1, self.right)
+        self.eye_image(&self.keep_right, self.right)
     }
 
-    fn eye_image(&self, eye: i32, span: &[u8]) -> Result<Image<u8, 1>, BoxError> {
-        // Retain BEFORE handing the pointer to kornia: from here on the buffer is
-        // owned by the guard, not by "until the next poll".
-        let handle = unsafe { crate::ffi::oak_stereo_retain(self.dev, eye) };
-        if handle.is_null() {
-            return Err(crate::last_error("oak_stereo_retain"));
-        }
-        let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(RetainedFrame(handle));
+    fn eye_image(&self, keep: &Arc<RetainedFrame>, span: &[u8]) -> Result<Image<u8, 1>, BoxError> {
+        // Sharing the frame's own handle — a refcount bump, no FFI call, and no way to
+        // end up holding a different frame than the one these pixels came from.
+        let keepalive: Arc<dyn Any + Send + Sync> = keep.clone();
 
         let (w, h) = (self.width as usize, self.height as usize);
         // SAFETY:
         //   - `span` points at the retained frame's pixels, non-null and `w*h` long
         //     (the shim validated tight GRAY8 before handing it out).
-        //   - `keepalive` holds the depthai frame, so the memory outlives this storage.
+        //   - `keepalive` shares the frame's retain handle, so the memory outlives this storage.
         //   - Host memory: MemoryDomain::Host, and the OAK delivers frames to host RAM.
         let storage = unsafe {
             TensorStorage::from_borrowed_readonly(
@@ -197,12 +196,14 @@ impl OakSource {
         let mut right: *const u8 = std::ptr::null();
         let (mut w, mut h, mut len) = (0i32, 0i32, 0i32);
         let mut ts: u64 = 0;
+        let (mut l_hnd, mut r_hnd) = (std::ptr::null_mut(), std::ptr::null_mut());
 
         let mut tries = 0;
         loop {
             let rc = unsafe {
                 crate::ffi::oak_poll_stereo(
-                    self.dev, &mut left, &mut right, &mut w, &mut h, &mut len, &mut ts,
+                    self.dev, &mut left, &mut right, &mut w, &mut h, &mut len, &mut ts, &mut l_hnd,
+                    &mut r_hnd,
                 )
             };
             if rc == 1 && !left.is_null() && !right.is_null() {
@@ -216,6 +217,11 @@ impl OakSource {
                 return None; // ~1s per poll → ~5s with no pair ⇒ treat as ended
             }
         }
+        // Own the handles immediately, so every early return below still releases them.
+        let (keep_left, keep_right) = (
+            Arc::new(RetainedFrame(l_hnd)),
+            Arc::new(RetainedFrame(r_hnd)),
+        );
         let (w, h) = (w as u32, h as u32);
         if w == 0 || h == 0 {
             return None;
@@ -237,7 +243,8 @@ impl OakSource {
                 pts_ns: Some(ts),
                 source_id: None,
             },
-            dev: self.dev,
+            keep_left,
+            keep_right,
             _src: std::marker::PhantomData,
         })
     }
