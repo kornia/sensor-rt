@@ -30,15 +30,6 @@ pub struct OakImuSample {
 }
 
 extern "C" {
-    pub fn oak_open(
-        device_id: *const c_char,
-        width: c_int,
-        height: c_int,
-        fps: c_int,
-        enable_h264: c_int,
-        enable_depth: c_int,
-        video_only: c_int,
-    ) -> *mut OakDevice;
 
     /// Open the stereo (CAM_B/CAM_C) + IMU modality. See `oak_bridge.h`.
     pub fn oak_open_stereo(
@@ -70,54 +61,12 @@ extern "C" {
         n: *mut c_int,
     ) -> c_int;
 
-    pub fn oak_has_depth(dev: *const OakDevice) -> c_int;
-
-    pub fn oak_has_video(dev: *const OakDevice) -> c_int;
-
-    pub fn oak_has_sync(dev: *const OakDevice) -> c_int;
-
-    pub fn oak_poll_rgb(
-        dev: *mut OakDevice,
-        rgb: *mut *const u8,
-        width: *mut c_int,
-        height: *mut c_int,
-        rgb_len: *mut c_int,
-        ts_ns: *mut u64,
-    ) -> c_int;
-
-    pub fn oak_poll_depth(
-        dev: *mut OakDevice,
-        depth_mm: *mut *const u16,
-        depth_w: *mut c_int,
-        depth_h: *mut c_int,
-        ts_ns: *mut u64,
-    ) -> c_int;
-
     pub fn oak_intrinsics(
         dev: *const OakDevice,
         fx: *mut f32,
         fy: *mut f32,
         cx: *mut f32,
         cy: *mut f32,
-    ) -> c_int;
-
-    pub fn oak_poll(
-        dev: *mut OakDevice,
-        rgba: *mut *const u8,
-        depth_mm: *mut *const u16,
-        width: *mut c_int,
-        height: *mut c_int,
-        rgb_len: *mut c_int,
-        ts_ns: *mut u64,
-        depth_w: *mut c_int,
-        depth_h: *mut c_int,
-    ) -> c_int;
-
-    pub fn oak_poll_video(
-        dev: *mut OakDevice,
-        data: *mut *const u8,
-        len: *mut c_int,
-        ts_ns: *mut u64,
     ) -> c_int;
 
     /// Reboot a PoE OAK wedged in bootloader state so the next `oak_open` succeeds. `target` = IP/name

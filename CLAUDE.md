@@ -2,8 +2,8 @@
 
 Isolated **sensor drivers** for Jetson — RTSP/NVMM cameras and OAK-D depth —
 extracted from vision-rt so that `vrt` stays pure algorithms. Every driver emits
-a device-resident kornia `Image<u8,3>` (plus `OakDepthMap` + `OakIntrinsics` for
-OAK), consumed directly by the `vrt` models. The edge points one way:
+host frames (RTSP emits a device-resident kornia `Image<u8,3>`; OAK emits a synced
+stereo pair + IMU), consumed by the `vrt` models. The edge points one way:
 `sensor-rt → vision-rt` (the **public upstream `kornia/vision-rt`**, pinned by
 rev); `vrt` has no dependency back on sensors.
 
@@ -18,13 +18,13 @@ Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
 | `crates/nvbuf-sys` | `nvbuf_sys` | FFI: NvBufSurface → CUDA device ptr from NVMM DMA-BUF (`links = nvbufsurface`) |
 | `crates/oak-sys` | `oak_sys` | FFI: C shim over depthai-core v3 (`links = depthai-core`; built from `vendor/`) |
 | `crates/sensor-rtsp` | `sensor_rtsp` | RTSP/H.264 source, NVMM → CUDA, emits device `Image<u8,3>` |
-| `crates/sensor-oak` | `sensor_oak` | OAK-D RGB + aligned depth → device `Image<u8,3>` + `OakDepthMap`; **stereo pair + IMU** via `open_stereo`. Bundles the depthai C shim (no separate `-sys` crate) and depends on NO inference runtime |
+| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`). Bundles the depthai C shim (no separate `-sys` crate); depends on NO inference runtime and never touches CUDA. RGB-D / H.264 paths removed for now |
 | `crates/sensor-types` | `sensor_types` | Frame-timing leaf shared by every driver: `FrameMeta`, `Stamped<T>` (zero deps) |
 
 ## Architecture
 
 Sensors are plain producers: `next_frame()` → `Stamped<Image<u8,3>>` (RTSP) or an
-`OakFrame` lending `&Image<u8,3>` + `&OakDepthMap` (OAK). Frames are device-resident
+`OakStereoFrame` lending both eyes as host RGB888 spans (OAK). RTSP frames are device-resident
 and tightly packed RGB8 — the shape kornia's `Preprocessor` and the `vrt` models
 consume. RTSP's NVMM path is RGBA + hardware-padded pitch, so it runs one on-GPU
 pack kernel (RGBA-pitched → tight RGB8) — there is no zero-copy path into kornia's
