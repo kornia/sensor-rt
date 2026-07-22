@@ -5,7 +5,7 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
-description = "Sensor-side shared types for sensor-rt: frame metadata, stamped frames, and host depth maps"
+description = "Frame-timing types shared by every sensor-rt driver: frame metadata and stamped frames"
 
 [lib]
 name = "sensor_types"
