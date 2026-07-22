@@ -17,7 +17,7 @@
 /// image pixel `(u, v)`. When the map is a smaller grid than the image (sensors
 /// often downscale depth before transport), the consumer scales coordinates by
 /// `image_width / depth_width`.
-pub struct DepthMap {
+pub struct OakDepthMap {
     ptr: *const u16,
     width: u32,
     height: u32,
@@ -25,9 +25,9 @@ pub struct DepthMap {
 
 // SAFETY: `ptr` addresses host memory that the producer guarantees stays valid for
 // this map's lifetime (e.g. "valid until the next frame").
-unsafe impl Send for DepthMap {}
+unsafe impl Send for OakDepthMap {}
 
-impl DepthMap {
+impl OakDepthMap {
     /// Borrow a producer's `width*height` u16 depth buffer — **zero-copy**.
     ///
     /// # Safety

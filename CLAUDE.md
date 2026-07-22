@@ -5,8 +5,7 @@ extracted from vision-rt so that `vrt` stays pure algorithms. Every driver emits
 a device-resident kornia `Image<u8,3>` (plus `sensor_types::DepthMap` +
 `vrt_types::CameraIntrinsics` for OAK), consumed directly by the `vrt` models. The edge points one way:
 `sensor-rt → vision-rt` (the **public upstream `kornia/vision-rt`**, pinned by
-rev); `vrt` has no dependency back on sensors. Three-repo split:
-`vrt` ← `sensor-rt` ← `flux`.
+rev); `vrt` has no dependency back on sensors.
 
 ## Workspace layout
 
@@ -42,7 +41,7 @@ already tight RGB8 (zero extra copies).
   `git submodule update --init --recursive` then `pixi run depthai-build` to
   produce the prefix.
 - **Upstream only**: all `vrt-*` deps come from the public `kornia/vision-rt`. Do
-  NOT reintroduce the `edgarriba/vision-rt` fork. Upstream deliberately has no
+  NOT point them at a fork. Upstream deliberately has no
   `FrameMeta`/`Stamped`/depth-map type (those are producer concepts) — they live in
   `crates/sensor-types`; camera intrinsics come from `vrt-types::CameraIntrinsics`.
   Upstream model crates are **submit-only** (`alloc_result` + `submit` + an explicit
@@ -53,7 +52,7 @@ already tight RGB8 (zero extra copies).
 
 ```bash
 export CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_BUILD_JOBS=2
-export DEPTHAI_PREFIX=/home/nvidia/sensor-rt/vendor/depthai
+export DEPTHAI_PREFIX="$PWD/vendor/depthai"
 export LD_LIBRARY_PATH=$DEPTHAI_PREFIX/lib
 cargo build -j2
 cargo fmt --all --check

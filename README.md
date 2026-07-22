@@ -1,14 +1,12 @@
 # sensor-rt
 
 Isolated **camera drivers for Jetson** — RTSP/H.264 over NVMM and OAK-D RGB-D —
-that feed the [`vision-rt`](https://github.com/edgarriba/vision-rt) algorithm
+that feed the [`vision-rt`](https://github.com/kornia/vision-rt) algorithm
 crates. Drivers are plain producers: they emit a device-resident kornia
 `Image<u8,3>` (plus depth / intrinsics for OAK), ready to hand to a `vrt` model.
 
 The dependency edge points one way — `sensor-rt → vision-rt` — so `vrt` stays
-pure algorithms with no sensor/GStreamer/depthai dependency. Part of the
-three-repo split: `vision-rt` (algorithms) ← **sensor-rt** (drivers) ← `flux`
-(publishing).
+pure algorithms with no sensor/GStreamer/depthai dependency.
 
 **Target platform:** Jetson Orin (aarch64), JetPack 6.x, CUDA 12.6.
 

@@ -1,11 +1,11 @@
-//! OAK-D camera source: synced **RGB (device `VrtImage`) + aligned depth (CPU,
-//! uint16 mm) + factory intrinsics**, the real-depth 3D detection source for the
-//! `Box3DTracker`. Safe wrapper over the `oak-sys` C shim (depthai-core v3).
+//! OAK-D camera source: synced **device RGB + aligned depth (host, uint16 mm) +
+//! factory intrinsics**, plus a stereo-pair + IMU modality (see [`stereo`]).
+//! Safe wrapper over the bundled depthai-core C shim (`oak_bridge.h`).
 //!
-//! Mirrors `vrt-gst`'s `RtspSource`: a `next_frame()` loop. The OAK computes
-//! stereo depth on its own VPU, so there's no depth model on the Jetson. RGB is
-//! uploaded H2D into a reused device buffer for RF-DETR; depth stays on the CPU
-//! (sampled per-box — cheap). 3D points are in the **camera frame**.
+//! Same shape as the RTSP source: a `next_frame()` loop. The OAK computes stereo
+//! depth on its own VPU, so there is no depth model on the host. RGB is uploaded
+//! H2D into a reused device buffer; depth stays on the CPU (sampled per-box —
+//! cheap). 3D points are in the **camera frame**.
 
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub struct OakIntrinsics {
 mod depth;
 mod ffi;
 mod stereo;
-pub use depth::DepthMap;
+pub use depth::OakDepthMap;
 pub use stereo::{ImuSample, StereoFrame};
 
 /// One synced OAK frame: RGB on the device, optional aligned depth on the host.
@@ -57,7 +57,7 @@ pub struct OakFrame<'a> {
     width: u32,
     height: u32,
     rgb_device: Option<&'a Image<u8, 3>>,
-    depth: Option<DepthMap>,
+    depth: Option<OakDepthMap>,
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
 
@@ -91,7 +91,7 @@ impl OakFrame<'_> {
     }
     /// Aligned depth map, if the device has a stereo pair. Borrowed — same "valid only while this
     /// frame is held" contract as [`rgb_host`](Self::rgb_host).
-    pub fn depth(&self) -> Option<&DepthMap> {
+    pub fn depth(&self) -> Option<&OakDepthMap> {
         self.depth.as_ref()
     }
 }
@@ -192,11 +192,11 @@ impl OakSource {
 
     /// Open host-only **plus an on-device hardware H.264 colour stream**: the synced [`OakFrame`] carries
     /// raw RGB888 (+ aligned depth when `depth`), and [`OakSource::next_video`] drains the separate H.264
-    /// bitstream (efficient video for Foxglove / recording). For `flux-oak`. Set `depth = false` for an
+    /// bitstream (efficient video for viewing / recording). Set `depth = false` for an
     /// **uncalibrated** camera — it skips the StereoDepth node, which would otherwise fail at runtime and
     /// crash the pipeline. `device`: see [`OakSource::open`]. Takes NO CUDA stream: the host-only + H.264
-    /// path never uploads to the GPU (the decoupled RGB/depth polls hand out host copies), so flux-oak
-    /// creates no CUDA context — saving ~200-300 MB RSS per camera process.
+    /// path never uploads to the GPU (the decoupled RGB/depth polls hand out host copies), so the
+    /// caller creates no CUDA context — saving ~200-300 MB RSS per camera process.
     pub fn open_video(
         device: Option<&str>,
         width: u32,
@@ -428,7 +428,7 @@ impl OakSource {
         // Zero-copy: borrow the OAK's aligned depth buffer (valid until next poll). Depth carries its OWN
         // dims (dw×dh) — it may be a downscaled grid aligned to the RGB, so consumers scale by w/dw.
         let depth = (!depth.is_null() && dw > 0 && dh > 0)
-            .then(|| unsafe { DepthMap::borrowed(depth, dw as u32, dh as u32) });
+            .then(|| unsafe { OakDepthMap::borrowed(depth, dw as u32, dh as u32) });
 
         Some(OakFrame {
             rgb_host: host,

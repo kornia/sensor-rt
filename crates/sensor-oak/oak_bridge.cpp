@@ -21,7 +21,7 @@ static void set_err(const std::string& m) { g_err = m; }
 // depthai's getTimestamp() is on the host STEADY clock, synchronized across ALL connected devices, so
 // multiple cameras share one timeline (essential for multi-camera alignment). getTimestampDevice() is
 // per-device boot time — neither wall-clock nor comparable across cameras. We shift the steady stamp
-// onto the system clock so the value forwarded to ROS/Hiroz (and on to Foxglove/recordings) is a real
+// onto the system clock so the value forwarded downstream (publishers, recordings) is a real
 // epoch time every camera agrees on. Shared by frames AND IMU reports so both land on ONE timeline —
 // the whole point of the stereo+IMU modality, where the consumer interpolates inertial samples
 // between image timestamps.
@@ -66,7 +66,7 @@ static std::shared_ptr<dai::Device> connect_device(const char* device_id) {
 }
 
 // H.264 target bitrate in kbps. The preset's default scales with resolution and is generous; 2000 kbps
-// is comfortable for 640x360@30 and a big cut for the phone/Tailscale hop. Override with OAK_H264_KBPS.
+// is comfortable for 640x360@30 and a big cut for a constrained network hop. Override with OAK_H264_KBPS.
 static int h264_kbps() {
     if (const char* s = std::getenv("OAK_H264_KBPS")) {
         int v = std::atoi(s);

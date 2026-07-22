@@ -22,7 +22,7 @@ jobs:
       - run: cargo fmt --all --check
 
   # Self-hosted Jetson runner: real CUDA + NVMM (GStreamer) + depthai-core, and
-  # ambient git credentials to clone the private vision-rt dep.
+  # the depthai vendor libs available.
   # Register a runner on the Orin with labels [self-hosted, jetson] and provide
   # the depthai vendor libs, then remove the `if: false` guard.
   jetson:
@@ -30,11 +30,11 @@ jobs:
     runs-on: [self-hosted, jetson]
     env:
       CARGO_BUILD_JOBS: "2" # 7.4 GB RAM — parallel native builds OOM the box
-      LD_LIBRARY_PATH: /home/nvidia/sensor-rt/vendor/depthai/lib
+      LD_LIBRARY_PATH: ${{ github.workspace }}/vendor/depthai/lib
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive # depthai-core source for the oak-sys build
+          submodules: recursive # depthai-core source for the native shim build
       - name: Build workspace
         run: cargo build -j2
       - name: Clippy

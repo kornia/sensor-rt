@@ -5,7 +5,7 @@ platforms = ["linux-aarch64"]
 
 # pixi pins the native toolchain for the OAK-D path (depthai-core v3 builds from source). GStreamer
 # + libnvbufsurface (for sensor-rtsp/nvbuf-sys) are SYSTEM/JetPack, not conda — not listed here.
-# Mirrors vision-rt + flux: conda-forge / linux-aarch64 / CARGO_BUILD_JOBS cap.
+# conda-forge / linux-aarch64 / CARGO_BUILD_JOBS cap.
 [dependencies]
 cmake = ">=3.28"
 ninja = "*"

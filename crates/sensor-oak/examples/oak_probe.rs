@@ -3,7 +3,7 @@
 //! Proves: native shim ↔ device over USB, a synced RGBD frame arrives, factory
 //! intrinsics read back, and depth is sane. Run inside the pixi env so the
 //! depthai-core runtime libs resolve:
-//!   pixi run -- cargo run -p vrt-oak --example oak_probe
+//!   pixi run -- cargo run -p sensor-oak --example oak_probe
 //!
 //! Optional: `OAK_W=640 OAK_H=400 OAK_FPS=15` to drop resolution (USB2 fallback).
 

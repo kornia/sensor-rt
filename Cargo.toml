@@ -27,7 +27,7 @@ exclude = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/edgarriba/sensor-rt"
+repository = "https://github.com/kornia/sensor-rt"
 authors = ["Edgar Riba <edgar.riba@gmail.com>"]
 
 [workspace.dependencies]
@@ -43,14 +43,13 @@ cudarc = { version = "0.19", default-features = false, features = [
   "fallback-latest",
 ] }
 # vision-rt — the PUBLIC upstream (kornia/vision-rt), git-pinned to a fixed rev
-# (Cargo.lock also locks it). Previously this tracked the edgarriba/vision-rt fork;
-# the workspace now uses upstream only, so nothing here depends on a private repo.
+# (Cargo.lock also locks it). Everything here is public — no forks, no patches.
 #
-# Two consequences of that switch, both deliberate:
+# Two things worth knowing:
 #   * upstream's vrt-xfeat already exposes the async `submit(img, &mut out)` API, so
 #     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
-#   * vrt-lift / vrt-depth / vrt-reid have no upstream equivalent (or were renamed);
-#     the examples that used them are parked in `members` above rather than deleted.
+#   * a few model crates these examples used have no upstream equivalent yet, so
+#     those examples are listed under `exclude` rather than deleted.
 # NOTE: upstream's core crate is named `vrt` outright; the fork called it
 # `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
 vrt        = { git = "https://github.com/kornia/vision-rt", rev = "61e1dbcc42351cd62d89850aba384f2c0c53ba2a" }
