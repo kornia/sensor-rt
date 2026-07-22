@@ -51,6 +51,14 @@ kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-r
   "cudarc",   # device backend + custom kernels (vrt-xfeat's preprocess)
   "gpu-cuda", # gates the residency-aware CUDA colour dispatch (gray -> RGB on device)
 ] }
+# NOTE on those two feature names: kornia-rs unified `cudarc` / `gpu-cuda` /
+# `gpu-cubecl` into a single `cuda` feature after v0.1.15-rc.5. When this pin moves
+# past rc.4 they become `features = ["cuda"]` and the split names stop existing.
+#
+# The pin cannot move on its own: upstream vision-rt pins kornia at this same tag,
+# and two different kornia versions in the graph means two distinct Image/Tensor
+# types — which breaks the shared-type interop the whole workspace relies on. Bump
+# both together, or not at all.
 kornia-io      = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.4" }
 # sensor-rt internal crates
 nvbuf-sys    = { path = "crates/nvbuf-sys" }
