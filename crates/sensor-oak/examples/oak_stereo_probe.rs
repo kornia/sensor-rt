@@ -10,24 +10,37 @@
 //! Run inside the pixi env so the depthai-core runtime libs resolve:
 //!   pixi run -- cargo run -p sensor-oak --example oak_stereo_probe
 //!
-//! Optional: `OAK_W=640 OAK_H=400 OAK_FPS=30 OAK_IMU_HZ=200 OAK_FRAMES=60`.
+//! Optional: `-- --width 640 --height 400 --fps 30 --imu-hz 200 --frames 60`.
 
+use argh::FromArgs;
 use sensor_oak::{ImuSample, OakSource};
 use std::time::Instant;
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+#[derive(FromArgs)]
+/// Bring-up gate for the OAK-D stereo + IMU modality: checks that a synced pair
+/// arrives, that the two eyes really differ, and that the IMU streams on the same
+/// clock as the frames.
+struct Args {
+    /// per-eye width (default 640)
+    #[argh(option, default = "640")]
+    width: u32,
+    /// per-eye height (default 400)
+    #[argh(option, default = "400")]
+    height: u32,
+    /// stereo pair rate (default 30)
+    #[argh(option, default = "30")]
+    fps: u32,
+    /// imu report rate in Hz; 0 disables the IMU (default 200)
+    #[argh(option, default = "200")]
+    imu_hz: u32,
+    /// how many frames to check (default 60)
+    #[argh(option, default = "60")]
+    frames: u64,
 }
 
 fn main() -> Result<(), vrt::BoxError> {
-    let w = env_u32("OAK_W", 640);
-    let h = env_u32("OAK_H", 400);
-    let fps = env_u32("OAK_FPS", 30);
-    let imu_hz = env_u32("OAK_IMU_HZ", 200);
-    let frames = env_u32("OAK_FRAMES", 60) as u64;
+    let args: Args = argh::from_env();
+    let (w, h, fps, imu_hz, frames) = (args.width, args.height, args.fps, args.imu_hz, args.frames);
 
     println!("opening OAK stereo+IMU at {w}×{h}@{fps}, imu={imu_hz}Hz ...");
     let mut src = OakSource::open_stereo(None, w, h, fps, imu_hz)?;

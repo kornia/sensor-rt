@@ -5,16 +5,26 @@
 //!   <out>_overlay.png — 50/50 blend; if aligned, depth silhouettes sit exactly on RGB edges
 //! Also prints RGB channel stats + depth coverage.
 //!
-//!   cargo run -p sensor-oak --example oak_snap            # writes /tmp/oak_*.png
-//!   OAK_OUT=/tmp/foo cargo run -p sensor-oak --example oak_snap
+//!   cargo run -p sensor-oak --example oak_snap                 # writes /tmp/oak_*.png
+//!   cargo run -p sensor-oak --example oak_snap -- --out /tmp/foo
 
+use argh::FromArgs;
 use kornia_image::{Image, ImageSize};
 use kornia_io::png::write_image_png_rgba8;
 use sensor_oak::{BoxError, OakSource};
 
+#[derive(FromArgs)]
+/// Grab one synced OAK frame and write RGB, depth, and overlay PNGs so RGB-depth
+/// alignment can be checked by eye.
+struct Args {
+    /// output path prefix (default /tmp/oak)
+    #[argh(option, default = "String::from(\"/tmp/oak\")")]
+    out: String,
+}
+
 fn main() -> Result<(), BoxError> {
     let (w, h, fps) = (1280i32, 720i32, 30i32);
-    let out = std::env::var("OAK_OUT").unwrap_or_else(|_| "/tmp/oak".into());
+    let out = argh::from_env::<Args>().out;
 
     // The driver is host-only, so this diagnostic needs no CUDA context at all.
     let mut src = OakSource::open(None, w as u32, h as u32, fps as u32)?;

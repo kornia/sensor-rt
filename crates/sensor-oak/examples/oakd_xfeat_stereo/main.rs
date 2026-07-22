@@ -25,17 +25,46 @@
 //! XFeat cannot do today: its post-processing is fixed at batch 1.
 //!
 //! Usage:
-//!   cargo run --release -p oakd_xfeat_stereo -- \
-//!       models/xfeat/xfeat_backbone_fp16.engine [save_dir]
+//!   cargo run --release -p sensor-oak --example oakd_xfeat_stereo -- \
+//!       models/xfeat/xfeat_backbone_fp16.engine --save-dir /tmp
 //!
-//! Env: `OAK_W=640 OAK_H=400 OAK_FPS=30 OAK_IMU_HZ=200 OAK_FRAMES=0` (0 = forever),
-//!      `OAK_SAVE_EVERY=30` (0 disables PNG output).
+//! `--help` lists the rest (`--width`, `--fps`, `--imu-hz`, `--frames`, `--save-every`).
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use argh::FromArgs;
 use kornia_image::Image;
 use sensor_oak::{ImuSample, OakSource};
+
+#[derive(FromArgs)]
+/// XFeat on both eyes of an OAK-D stereo pair, across two CUDA streams, matched on device.
+struct Args {
+    /// path to the XFeat backbone (.onnx builds and caches an engine; .engine is used as-is)
+    #[argh(positional)]
+    model: String,
+    /// directory for the periodic match PNGs (default ".")
+    #[argh(option, default = "String::from(\".\")")]
+    save_dir: String,
+    /// per-eye width (default 640)
+    #[argh(option, default = "640")]
+    width: u32,
+    /// per-eye height (default 400)
+    #[argh(option, default = "400")]
+    height: u32,
+    /// stereo pair rate (default 30)
+    #[argh(option, default = "30")]
+    fps: u32,
+    /// imu report rate in Hz; 0 disables the IMU (default 200)
+    #[argh(option, default = "200")]
+    imu_hz: u32,
+    /// stop after N frames; 0 runs until the stream ends (default 0)
+    #[argh(option, default = "0")]
+    frames: u64,
+    /// save a match PNG every N frames; 0 disables (default 30)
+    #[argh(option, default = "30")]
+    save_every: u64,
+}
 use vrt::{BoxError, Engine, Logger, Runtime, Stream};
 use vrt_xfeat::{Matcher, XFeat, XFeatParams, XFeatResult};
 
@@ -61,31 +90,13 @@ fn alloc_rgb_image(
     Image::try_from(t).map_err(|e| format!("build device Image<u8,3>: {e}").into())
 }
 
-fn env_u32(key: &str, default: u32) -> u32 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
-}
-
 fn main() -> Result<(), BoxError> {
     env_logger::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    let positional: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with("--")).collect();
-    if positional.is_empty() {
-        eprintln!("Usage: oakd_xfeat_stereo <model.onnx|model.engine> [save_dir]");
-        std::process::exit(1);
-    }
-    let model_path = positional[0];
-    let save_dir = positional.get(1).map(|s| s.as_str()).unwrap_or(".");
-
-    let w = env_u32("OAK_W", 640);
-    let h = env_u32("OAK_H", 400);
-    let fps = env_u32("OAK_FPS", 30);
-    let imu_hz = env_u32("OAK_IMU_HZ", 200);
-    let max_frames = env_u32("OAK_FRAMES", 0) as u64;
-    let save_every = env_u32("OAK_SAVE_EVERY", 30) as u64;
+    let args: Args = argh::from_env();
+    let (w, h, fps, imu_hz) = (args.width, args.height, args.fps, args.imu_hz);
+    let (max_frames, save_every) = (args.frames, args.save_every);
+    let (model_path, save_dir) = (args.model.as_str(), args.save_dir.as_str());
 
     // ── camera ────────────────────────────────────────────────────────────────
     // Host-only by design: the source hands out spans, and *we* decide which CUDA

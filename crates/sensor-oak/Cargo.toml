@@ -30,6 +30,7 @@ vrt           = { workspace = true }
 cudarc        = { workspace = true }
 kornia-tensor = { workspace = true }
 kornia-io     = { workspace = true }
+argh          = { workspace = true }
 vrt-xfeat  = { workspace = true }
 vrt-hub    = { workspace = true, features = ["builder"] }
 env_logger = { workspace = true }

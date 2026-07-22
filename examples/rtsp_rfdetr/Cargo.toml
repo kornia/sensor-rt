@@ -12,3 +12,4 @@ vrt-hub      = { workspace = true, features = ["hub", "builder"] }
 kornia-image = { workspace = true }
 kornia-io    = { workspace = true }
 env_logger   = { workspace = true }
+argh         = { workspace = true }

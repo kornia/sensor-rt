@@ -7,10 +7,21 @@
 //!
 //! Exit: 0 = kicked (wait ~8s before re-opening the camera) or nothing to kick; 1 = driver error.
 
+use argh::FromArgs;
+
+#[derive(FromArgs)]
+/// Reboot a PoE OAK wedged in bootloader state so the next open succeeds.
+struct Args {
+    /// camera IP/name or deviceId (default: the first wedged device found)
+    #[argh(positional)]
+    target: Option<String>,
+}
+
 use sensor_oak::kick_wedged_oak;
 
 fn main() -> std::process::ExitCode {
-    let target = std::env::args().nth(1);
+    let args: Args = argh::from_env();
+    let target = args.target;
     match kick_wedged_oak(target.as_deref()) {
         Ok(true) => {
             println!(

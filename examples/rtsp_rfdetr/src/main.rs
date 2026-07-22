@@ -25,16 +25,11 @@ use vrt_rfdetr::{Detection, RfDetr};
 fn main() -> Result<(), vrt::BoxError> {
     env_logger::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: rtsp_rfdetr <rtsp_url> [save_dir]");
-        std::process::exit(1);
-    }
-    let rtsp_url = &args[1];
-    let save_dir = args.get(2).map(String::as_str).unwrap_or(".");
+    let args: Args = argh::from_env();
+    let (rtsp_url, save_dir) = (&args.url, args.save_dir.as_str());
 
     // Download (HF, sha256-pinned) + build the fp16 engine on-device (cached).
-    let det_model = std::env::var("RFDETR_MODEL").unwrap_or_else(|_| "rfdetr-medium".into());
+    let det_model = args.model.clone();
     let onnx = vrt_hub::ModelHub::get(&det_model)?;
     let engine_path = vrt_hub::EngineCache::default().resolve(
         &det_model,

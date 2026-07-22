@@ -61,5 +61,8 @@ gstreamer     = "0.20"
 gstreamer-app = "0.20"
 thiserror     = "2.0"
 env_logger    = "0.11"
+# Example CLIs only (dev-dependency): argh over clap — a fraction of the compile
+# time and dependency count, and these binaries need flags, not a framework.
+argh          = "0.1"
 cc            = "1"
 cmake         = "0.1"

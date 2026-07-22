@@ -13,7 +13,23 @@
 //!   cargo run --release -p rtsp_xfeat -- \
 //!       models/xfeat/xfeat_backbone_fp16.engine rtsp://camera/stream [save_dir]
 
+use argh::FromArgs;
 use sensor_rtsp::RtspSource;
+
+#[derive(FromArgs)]
+/// XFeat keypoints on a live RTSP/NVMM stream.
+struct Args {
+    /// XFeat backbone: .onnx is built on-device into the engine cache (one-time);
+    /// .engine is used directly and must match this machine's TRT + GPU
+    #[argh(positional)]
+    model: String,
+    /// RTSP URL to pull from
+    #[argh(positional)]
+    url: String,
+    /// directory for the periodic keypoint PNGs (default ".")
+    #[argh(option, default = "String::from(\".\")")]
+    save_dir: String,
+}
 use std::time::Instant;
 use vrt::logger::Severity;
 use vrt::{Engine, Logger, Runtime, Stream};
@@ -25,15 +41,8 @@ use sink::KeypointViz;
 fn main() -> Result<(), vrt::BoxError> {
     env_logger::init();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: rtsp_xfeat <model.onnx|model.engine> <rtsp_url> [save_dir]");
-        eprintln!("  .onnx   — built on-device into ~/.cache/vision-rt/engines (one-time)");
-        eprintln!("  .engine — used directly (must match this machine's TRT + GPU)");
-        std::process::exit(1);
-    }
-    let (model_path, rtsp_url) = (&args[1], &args[2]);
-    let save_dir = args.get(3).map(String::as_str).unwrap_or(".");
+    let args: Args = argh::from_env();
+    let (model_path, rtsp_url, save_dir) = (&args.model, &args.url, args.save_dir.as_str());
 
     // .onnx → versioned engine cache (build on first run); .engine → as-is.
     let profile = vrt_hub::EngineProfile {
