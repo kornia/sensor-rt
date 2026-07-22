@@ -54,6 +54,13 @@ extern "C" {
         ts_ns: *mut u64,
     ) -> c_int;
 
+    /// Retain one eye of the current pair (0 = left, 1 = right); NULL on failure.
+    /// Must be paired with exactly one [`oak_frame_release`].
+    pub fn oak_stereo_retain(dev: *mut OakDevice, eye: c_int) -> *mut std::ffi::c_void;
+
+    /// Release a handle from [`oak_stereo_retain`]. NULL is a no-op.
+    pub fn oak_frame_release(handle: *mut std::ffi::c_void);
+
     pub fn oak_poll_imu(
         dev: *mut OakDevice,
         out: *mut OakImuSample,

@@ -19,8 +19,10 @@ name = "sensor_oak"
 # Deliberately minimal: this driver is a plain producer that never touches CUDA or
 # an inference runtime, so a process that only wants camera frames builds neither.
 # `cudarc` / `vrt` are dev-dependencies, for the examples that do.
-kornia-image = { workspace = true }
-sensor-types = { workspace = true }
+kornia-image  = { workspace = true }
+# For the borrowed (zero-copy) image storage — see OakStereoFrame::left_image.
+kornia-tensor = { workspace = true }
+sensor-types  = { workspace = true }
 
 [build-dependencies]
 cmake = { workspace = true }

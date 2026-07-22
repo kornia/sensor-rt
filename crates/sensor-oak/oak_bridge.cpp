@@ -226,6 +226,24 @@ extern "C" int oak_poll_stereo(oak_device* dev,
     catch (...) { set_err("unknown error in oak_poll_stereo"); return -1; }
 }
 
+// Retain/release for the current stereo eye. The handle is a heap-allocated copy of the
+// shared_ptr, so the ImgFrame (and its pixel buffer) survives until the handle is freed —
+// independently of dev->cur_left/cur_right being reassigned by the next poll.
+extern "C" void* oak_stereo_retain(oak_device* dev, int eye) {
+    if (!dev) { set_err("null device"); return nullptr; }
+    try {
+        const std::shared_ptr<dai::ImgFrame>& f = (eye == 0) ? dev->cur_left : dev->cur_right;
+        if (!f) { set_err("no current stereo frame to retain"); return nullptr; }
+        return new std::shared_ptr<dai::ImgFrame>(f);   // refcount++
+    } catch (const std::exception& e) { set_err(e.what()); return nullptr; }
+    catch (...) { set_err("unknown error in oak_stereo_retain"); return nullptr; }
+}
+
+extern "C" void oak_frame_release(void* handle) {
+    if (!handle) return;
+    delete static_cast<std::shared_ptr<dai::ImgFrame>*>(handle);   // refcount--
+}
+
 extern "C" int oak_poll_imu(oak_device* dev, oak_imu_sample* out, int max, int* n) {
     if (!dev) { set_err("null device"); return -1; }
     if (!out || !n) { set_err("null out pointer"); return -1; }

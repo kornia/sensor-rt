@@ -65,6 +65,23 @@ int oak_poll_stereo(oak_device *dev,
                     const uint8_t **left, const uint8_t **right,
                     int *width, int *height, int *len, uint64_t *ts_ns);
 
+/* Retain one eye of the CURRENT stereo pair so its pixel buffer stays valid past the
+ * next oak_poll_stereo. Returns an opaque handle, or NULL if there is no current pair.
+ *
+ * The span handed out by oak_poll_stereo is only guaranteed until the next poll. A
+ * caller that needs to keep a frame longer — buffering, VIO windows, async work —
+ * retains it, which copies the underlying shared_ptr so depthai cannot recycle the
+ * buffer. The pixel pointer from oak_poll_stereo stays valid for as long as the
+ * handle is alive.
+ *
+ *   eye : 0 = left (CAM_B), 1 = right (CAM_C)
+ *
+ * Every successful retain MUST be matched by exactly one oak_frame_release. */
+void *oak_stereo_retain(oak_device *dev, int eye);
+
+/* Release a handle from oak_stereo_retain. NULL is a no-op. */
+void oak_frame_release(void *handle);
+
 /* Drain queued IMU samples into the caller's array. NON-BLOCKING: writes up to
  * `max` samples, sets *n to how many were written (0 when none are queued or the
  * IMU isn't running). Returns 1 / 0 / -1 (error).

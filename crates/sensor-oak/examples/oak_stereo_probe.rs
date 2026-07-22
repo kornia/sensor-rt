@@ -154,6 +154,34 @@ fn main() -> Result<(), vrt::BoxError> {
             );
         }
     }
+    // (5) A retained image must OUTLIVE the frame it came from. `left_image()` borrows
+    // depthai's buffer and holds a retain handle, so it must stay byte-identical after
+    // further polls have recycled the frame that produced it. If the retain were
+    // missing (or the keepalive a dummy) this is exactly where it would show up: the
+    // pixels would drift to whatever depthai wrote next.
+    // The inner scope ends the frame's borrow of `src`, so `held` outliving it is not
+    // just a runtime claim — it has to type-check, which is half the guarantee.
+    let held = {
+        let frame = src
+            .next_stereo()
+            .ok_or("no stereo frame for the retain check")?;
+        frame.left_image()?
+    };
+    {
+        let before = mean(held.as_slice());
+        for _ in 0..10 {
+            let _ = src.next_stereo(); // recycle the buffers behind it
+        }
+        let after = mean(held.as_slice());
+        println!("retained image  : mean {before:.4} before / {after:.4} after 10 more polls");
+        assert_eq!(
+            before.to_bits(),
+            after.to_bits(),
+            "retained image changed after later polls — the frame was not actually retained"
+        );
+        println!("zero-copy hold  : image outlived its frame, contents stable");
+    }
+
     println!("\nOK — stereo+IMU modality validated");
     Ok(())
 }

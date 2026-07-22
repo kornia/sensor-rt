@@ -12,6 +12,14 @@
 
 use std::ffi::{CStr, CString};
 
+/// The shim's last error for the calling thread, as a `BoxError`.
+pub(crate) fn last_error(what: &str) -> BoxError {
+    let e = unsafe { std::ffi::CStr::from_ptr(ffi::oak_last_error()) }
+        .to_string_lossy()
+        .into_owned();
+    format!("{what} failed: {e}").into()
+}
+
 /// Boxed error, `Send + Sync` so a source can be moved between threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
