@@ -2,8 +2,17 @@
  * opaque handle + plain types; C++ exceptions are caught and converted to return
  * codes + oak_last_error().
  *
- * Scope: the STEREO + IMU pipeline only. The colour/depth and H.264 paths were
- * removed while that modality is the one under development. */
+ * Two independent modalities behind ONE opaque handle, each its own oak_open_*
+ * entry point that builds a wholly separate pipeline (shared nodes would let one
+ * modality's changes regress the other):
+ *   - STEREO + IMU  (oak_open_stereo): the two mono cameras as a Sync'd GRAY8 pair
+ *     + the on-board IMU. Raw stereo/inertial source for VIO.
+ *   - RGBD + H.264  (oak_open_rgbd): CAM_A colour (RGB888) + StereoDepth aligned to
+ *     it (uint16 mm) + an on-device H.264 colour stream. The colour, depth, and
+ *     video are DECOUPLED — each on its own queue, pulled + timestamped
+ *     independently (oak_poll_rgb / oak_poll_depth / oak_poll_video), paired
+ *     downstream by their shared host-synced timeline. This is the site's camera
+ *     producer path (flux-oak). */
 #ifndef OAK_BRIDGE_H
 #define OAK_BRIDGE_H
 
@@ -51,6 +60,76 @@ oak_device *oak_open_stereo(const char *device_id, int width, int height,
  * device with no IMU, or when the IMU node failed to start — the stereo pair is
  * unaffected either way, so callers should degrade rather than abort. */
 int oak_has_imu(const oak_device *dev);
+
+/* Open an OAK in the RGBD + H.264 modality: CAM_A colour (RGB888) + StereoDepth
+ * (CAM_B/CAM_C) aligned to the colour grid (uint16 mm) + an on-device H.264 colour
+ * stream. Colour, depth, and video are DECOUPLED — each on its own queue, pulled
+ * independently (oak_poll_rgb / oak_poll_depth / oak_poll_video) and paired
+ * downstream by their shared host-synced timestamps.
+ *
+ *   width/height : CAM_A colour output size (the depth is aligned to this grid, then
+ *                  optionally downscaled on-device — see OAK_DEPTH_DIV — so it stays
+ *                  aligned but ships fewer bytes; its own dims come back from
+ *                  oak_poll_depth).
+ *   fps          : colour + encoder rate. The raw-RGB pull rate (OAK_RGB_FPS, default
+ *                  10) and depth rate (OAK_DEPTH_FPS, default = fps) are throttled
+ *                  separately to spare XLink; the H.264 stream runs at full fps.
+ *   enable_h264  : build the on-device H.264 encoder (oak_poll_video). Usually 1.
+ *   enable_depth : build StereoDepth. Set 0 for an uncalibrated camera — the stereo
+ *                  node would otherwise fail at runtime and crash the pipeline.
+ *   video_only   : build ONLY the H.264 encoder (no RGB888/depth): the device ships
+ *                  just the small bitstream for low-bandwidth viewing. oak_poll_rgb/
+ *                  _depth yield nothing; drain oak_poll_video.
+ *
+ * Auto-fall-back: if enable_depth is set but the device can't actually produce depth
+ * (no stereo pair, or a wiped/blank calibration → fx=0), the pipeline silently drops
+ * to video-only rather than pull raw RGB for a depth that would be garbage —
+ * reflected by oak_has_sync()==0.
+ *
+ * Returns NULL on failure (reason via oak_last_error). */
+oak_device *oak_open_rgbd(const char *device_id, int width, int height, int fps,
+                          int enable_h264, int enable_depth, int video_only);
+
+/* True (1) if StereoDepth is running (oak_poll_depth can yield aligned depth). */
+int oak_has_depth(const oak_device *dev);
+
+/* True (1) if the on-device H.264 colour stream is running (oak_poll_video yields). */
+int oak_has_video(const oak_device *dev);
+
+/* True (1) if this device runs the RGBD colour(+depth) pipeline (oak_poll_rgb yields
+ * frames). 0 when it auto-fell-back to video-only (mono / uncalibrated): the caller
+ * then advertises only the H.264 stream and never polls colour/depth. */
+int oak_has_sync(const oak_device *dev);
+
+/* Pull the next raw RGB888 colour frame from its own queue. NON-BLOCKING. On success
+ * (return 1) `rgb` aliases a device-internal buffer VALID UNTIL THE NEXT oak_poll_rgb
+ * (the caller copies it out before the next poll):
+ *   rgb    -> width*height*3 bytes, RGB888 (tightly packed, 3 B/px)
+ *   len    -> that byte length (width*height*3)
+ *   ts_ns  -> capture time, epoch ns (shared timeline with depth + video)
+ * Returns 1 on a frame, 0 when none is queued, -1 on error. Drain in a loop until 0. */
+int oak_poll_rgb(oak_device *dev, const uint8_t **rgb,
+                 int *width, int *height, int *len, uint64_t *ts_ns);
+
+/* Pull the next aligned depth frame from its own queue. NON-BLOCKING. On success
+ * (return 1) `depth_mm` aliases a device-internal buffer VALID UNTIL THE NEXT
+ * oak_poll_depth:
+ *   depth_mm         -> depth_w*depth_h uint16 values, millimetres (0 = no return)
+ *   depth_w/depth_h  -> depth grid size (may be < colour size: downscaled on-device,
+ *                       but aligned to the colour grid — scale coords by rgb_w/depth_w)
+ *   ts_ns            -> capture time, epoch ns (shared timeline with colour + video)
+ * Returns 1 / 0 (none) / -1 (error). Drain in a loop until 0. */
+int oak_poll_depth(oak_device *dev, const uint16_t **depth_mm,
+                   int *depth_w, int *depth_h, uint64_t *ts_ns);
+
+/* Pull the next on-device H.264 access unit (Annex-B NAL units) from its own queue.
+ * NON-BLOCKING. On success (return 1) `data` aliases a device-internal buffer VALID
+ * UNTIL THE NEXT oak_poll_video:
+ *   data   -> `len` bytes of H.264 bitstream
+ *   ts_ns  -> capture time, epoch ns (shared timeline with colour + depth)
+ * Returns 1 / 0 (none) / -1 (error). Drain in a loop until 0 so the encoder queue
+ * never overflows (a dropped P-frame glitches the stream until the next keyframe). */
+int oak_poll_video(oak_device *dev, const uint8_t **data, int *len, uint64_t *ts_ns);
 
 /* Factory intrinsics of the LEFT (CAM_B) camera at the streamed size — the stereo
  * reference frame. Returns 0 on success, -1 on error. */
