@@ -293,18 +293,43 @@ impl RtspSource {
 
         let pipeline = gstreamer::Pipeline::default();
 
+        // Force TCP-interleaved RTP (protocols=tcp). rtspsrc defaults to UDP-first (protocols=0x7);
+        // on many consumer IP cameras (e.g. TP-Link Tapo) the UDP RTP sockets error out / never
+        // receive — the RTP return path is blocked or the ports aren't reachable — so rtspsrc sits in
+        // "doing receive with timeout" and the first frame never arrives, hanging `connect`'s initial
+        // pull_sample forever. TCP interleaved carries RTP over the already-open RTSP TCP connection:
+        // reliable (no packet loss on large keyframes), NAT/firewall-proof, and fine for LAN bitrates.
         let src = gstreamer::ElementFactory::make("rtspsrc")
             .property("location", url)
             .property("latency", 100u32)
+            .property_from_str("protocols", "tcp")
             .build()
             .map_err(|_| GstSourceError::Setup("failed to create rtspsrc"))?;
 
-        // Parse the static downstream chain into a bin, then promote its
-        // contents into the pipeline so they sit at the top level (matching the
-        // previous flat `parse_launch` layout). `parse_bin_from_description`
-        // with `ghost_unlinked_pads = false` keeps `depay`'s sink pad exposed
-        // for dynamic linking from `rtspsrc`.
-        let bin = gstreamer::parse_bin_from_description(&bin_str, false)?;
+        // Set up ONLY the video stream. A Tapo (and many IP cameras) also advertises an audio track
+        // (e.g. PCMA); rtspsrc would expose a source pad for it that nothing downstream links, and the
+        // unlinked pad tears down the whole pipeline ("streaming stopped, reason not-linked"). The
+        // `select-stream` signal returns false to skip any RTP stream whose caps say media != "video",
+        // so audio never enters the pipeline. Media unknown at select time → keep it (the pad-added
+        // handler still links only a video pad, and falls back to the first pad if media is absent).
+        src.connect("select-stream", false, |vals| {
+            let keep = vals
+                .get(2)
+                .and_then(|v| v.get::<gstreamer::Caps>().ok())
+                .and_then(|caps| {
+                    caps.structure(0)
+                        .and_then(|s| s.get::<String>("media").ok())
+                })
+                .is_none_or(|media| media == "video");
+            Some(keep.to_value())
+        });
+
+        // Parse the static downstream chain into a bin. `ghost_unlinked_pads = TRUE` is REQUIRED: it
+        // exposes `depay`'s (only) unlinked pad — its sink — as a GHOST pad named "sink" on the bin.
+        // rtspsrc's dynamically-added src pad must link to that ghost pad, NOT to `depay`'s inner pad:
+        // rtspsrc lives in the pipeline and depay lives inside this bin, so a direct pad link across the
+        // bin boundary fails with "wrong hierarchy" and the stream never starts (reason not-linked).
+        let bin = gstreamer::parse_bin_from_description(&bin_str, true)?;
 
         pipeline
             .add(&src)
@@ -321,10 +346,9 @@ impl RtspSource {
             let Some(bin) = bin_weak.upgrade() else {
                 return;
             };
-            let Some(depay) = bin.by_name("depay") else {
-                return;
-            };
-            let Some(sink_pad) = depay.static_pad("sink") else {
+            // The bin's ghost "sink" pad (proxying depay's sink) — link to THIS, not depay's inner pad,
+            // or the cross-bin link fails "wrong hierarchy".
+            let Some(sink_pad) = bin.static_pad("sink") else {
                 return;
             };
             if sink_pad.is_linked() {
