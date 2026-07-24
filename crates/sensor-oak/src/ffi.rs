@@ -42,6 +42,49 @@ extern "C" {
 
     pub fn oak_has_imu(dev: *const OakDevice) -> c_int;
 
+    /// Open the RGBD (CAM_A colour + aligned StereoDepth) + on-device H.264 modality. See `oak_bridge.h`.
+    pub fn oak_open_rgbd(
+        device_id: *const c_char,
+        width: c_int,
+        height: c_int,
+        fps: c_int,
+        enable_h264: c_int,
+        enable_depth: c_int,
+        video_only: c_int,
+    ) -> *mut OakDevice;
+
+    pub fn oak_has_depth(dev: *const OakDevice) -> c_int;
+    pub fn oak_has_video(dev: *const OakDevice) -> c_int;
+    pub fn oak_has_sync(dev: *const OakDevice) -> c_int;
+
+    /// Next raw RGB888 colour frame (non-blocking); `rgb` aliases a buffer valid until the next call.
+    pub fn oak_poll_rgb(
+        dev: *mut OakDevice,
+        rgb: *mut *const u8,
+        width: *mut c_int,
+        height: *mut c_int,
+        len: *mut c_int,
+        ts_ns: *mut u64,
+    ) -> c_int;
+
+    /// Next aligned uint16-mm depth frame (non-blocking); `depth_mm` aliases a buffer valid until the
+    /// next call. Depth dims may be smaller than colour (downscaled on-device but aligned to it).
+    pub fn oak_poll_depth(
+        dev: *mut OakDevice,
+        depth_mm: *mut *const u16,
+        depth_w: *mut c_int,
+        depth_h: *mut c_int,
+        ts_ns: *mut u64,
+    ) -> c_int;
+
+    /// Next on-device H.264 access unit (non-blocking); `data` aliases a buffer valid until the next call.
+    pub fn oak_poll_video(
+        dev: *mut OakDevice,
+        data: *mut *const u8,
+        len: *mut c_int,
+        ts_ns: *mut u64,
+    ) -> c_int;
+
     pub fn oak_poll_stereo(
         dev: *mut OakDevice,
         left: *mut *const u8,

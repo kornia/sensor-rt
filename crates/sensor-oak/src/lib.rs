@@ -52,6 +52,7 @@ pub struct OakIntrinsics {
 // caller goes through the safe wrappers below.
 mod ffi;
 mod imu;
+mod rgbd;
 mod stereo;
 pub use imu::ImuSample;
 pub use stereo::OakStereoFrame;
@@ -68,6 +69,11 @@ pub struct OakSource {
     /// Reused staging buffer for `next_imu`, so draining inertial samples every
     /// frame costs no allocation once it has grown.
     imu_scratch: Vec<ffi::OakImuSample>,
+    // RGBD modality (oak_open_rgbd) capabilities, read back from the device after open. All false for a
+    // stereo source. `has_sync` is false when the device auto-fell-back to video-only (mono/uncalibrated).
+    has_depth: bool,
+    has_video: bool,
+    has_sync: bool,
 }
 
 // SAFETY: the device handle is used single-threaded by the owning loop; the CUDA
@@ -96,6 +102,9 @@ impl OakSource {
             intr: OakIntrinsics { fx, fy, cx, cy },
             has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
             imu_scratch: Vec::new(),
+            has_depth: false,
+            has_video: false,
+            has_sync: false,
         })
     }
 
