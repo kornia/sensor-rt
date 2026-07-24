@@ -211,6 +211,38 @@ impl std::ops::Deref for H264Buffer {
     }
 }
 
+/// Build an [`H264Buffer`] from a pulled tap sample — shared by the non-blocking
+/// [`RtspSource::next_h264`] and the blocking [`H264Tap::next`]. Takes the buffer by owned refcount and
+/// keeps its read mapping alive, so the bytes are handed out in place (no `to_vec`).
+fn h264_from_sample(sample: gstreamer::Sample) -> Option<H264Buffer> {
+    let pts_ns = sample
+        .buffer()
+        .and_then(|b| b.pts())
+        .map_or(0, |t| t.nseconds());
+    let map = sample.buffer_owned()?.into_mapped_buffer_readable().ok()?;
+    Some(H264Buffer { map, pts_ns })
+}
+
+/// A standalone, `Send` handle to the encoded-H.264 tap, detached from the borrow of [`RtspSource`] so a
+/// dedicated thread can drain + republish the video stream independently of the raw-frame
+/// ([`RtspSource::next_nvmm`]) cadence — the raw fd path and the encoded-video path then can't back each
+/// other up on the Rust side. Obtain it with [`RtspSource::h264_tap`]. It shares the same underlying
+/// appsink (a ref-counted GStreamer element), so drain the tap through EXACTLY ONE path — the tap or
+/// [`RtspSource::next_h264`], never both, or the two pullers race for samples.
+pub struct H264Tap {
+    sink: gstreamer_app::AppSink,
+}
+
+impl H264Tap {
+    /// BLOCK until the next Annex-B access unit is ready, then return it zero-copy (see [`H264Buffer`]).
+    /// Returns `None` when the stream ends (EOS) or the appsink is flushing, so a `while let Some(au)`
+    /// loop exits cleanly on pipeline shutdown. Publish + drop each unit before the next call so the tap
+    /// appsink pool never backs up.
+    pub fn next(&self) -> Option<H264Buffer> {
+        h264_from_sample(self.sink.pull_sample().ok()?)
+    }
+}
+
 // Pack the decoder's NVMM RGBA (row-pitched, 4 B/px) into a tightly-packed RGB8
 // image (3 B/px, stride = w*3) — the layout kornia's Preprocessor + the vrt models
 // require. There is no zero-copy path (kornia is tight-RGB8-only), but this stays
@@ -547,15 +579,17 @@ impl RtspSource {
     ///
     /// [`pts_ns`]: H264Buffer::pts_ns
     pub fn next_h264(&self) -> Option<H264Buffer> {
-        let sample = self.h264_sink.try_pull_sample(gstreamer::ClockTime::ZERO)?;
-        let pts_ns = sample
-            .buffer()
-            .and_then(|b| b.pts())
-            .map_or(0, |t| t.nseconds());
-        // buffer_owned() bumps the buffer's refcount (no data copy); the mapping keeps it alive so the
-        // returned slice stays valid without repacking the bytes onto the heap.
-        let map = sample.buffer_owned()?.into_mapped_buffer_readable().ok()?;
-        Some(H264Buffer { map, pts_ns })
+        // Non-blocking pull; the buffer is taken by owned refcount + kept mapped, so no bytes are copied.
+        h264_from_sample(self.h264_sink.try_pull_sample(gstreamer::ClockTime::ZERO)?)
+    }
+
+    /// Detach an [`H264Tap`] — a `Send` handle to the encoded-H.264 tap — so a dedicated thread can
+    /// republish the video stream on its own cadence, decoupled from [`next_nvmm`](Self::next_nvmm).
+    /// Drain video through the tap or [`next_h264`](Self::next_h264), never both (they share one appsink).
+    pub fn h264_tap(&self) -> H264Tap {
+        H264Tap {
+            sink: self.h264_sink.clone(),
+        }
     }
 
     /// The shared CUDA stream the per-frame RGBA→RGB pack runs on. **Build the
