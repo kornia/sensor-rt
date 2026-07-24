@@ -177,6 +177,38 @@ pub struct RtspSource {
     stream: Arc<CudaStream>,
     /// JIT kernel that packs the pitched NVMM RGBA import into a tight RGB8 image.
     pack: CudaKernel,
+    /// Encoded H.264 (Annex-B) tap, drained by [`RtspSource::next_h264`] for zero-transcode republish.
+    h264_sink: gstreamer_app::AppSink,
+}
+
+/// A borrowed, zero-copy view of one encoded H.264 access unit, still owned by its GStreamer buffer.
+/// It keeps the buffer's read mapping alive (the buffer is ref-counted, not copied), so [`data`] hands
+/// out the Annex-B bytes in place — no `to_vec`. **Drop it promptly**: while alive it holds one buffer
+/// out of the tap appsink's pool, so hoarding many at once starves the pool and stalls the tap. Deref
+/// gives `&[u8]` directly.
+///
+/// [`data`]: H264Buffer::data
+pub struct H264Buffer {
+    map: gstreamer::buffer::MappedBuffer<gstreamer::buffer::Readable>,
+    pts_ns: u64,
+}
+
+impl H264Buffer {
+    /// The Annex-B access-unit bytes in place (SPS/PPS prepended on keyframes). Zero-copy.
+    pub fn data(&self) -> &[u8] {
+        self.map.as_slice()
+    }
+    /// Capture PTS in ns.
+    pub fn pts_ns(&self) -> u64 {
+        self.pts_ns
+    }
+}
+
+impl std::ops::Deref for H264Buffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.map.as_slice()
+    }
 }
 
 // Pack the decoder's NVMM RGBA (row-pitched, 4 B/px) into a tightly-packed RGB8
@@ -280,10 +312,21 @@ impl RtspSource {
         // to inject or redirect elements. `rtspsrc` itself is created as a real
         // element and the URL is set as a typed `location` property — it is
         // never parsed as pipeline DSL, fully removing the injection surface.
+        // A `tee` right after h264parse forks the compressed bitstream: one branch keeps the existing
+        // decode path (NVMM RGBD + CPU RGBA appsinks), the other exposes the ENCODED H.264 to
+        // `next_h264()` for zero-transcode republish (e.g. flux-web/Foxglove/recording). `config-interval
+        // =-1` re-sends SPS/PPS before every keyframe so a mid-stream subscriber can start decoding, and
+        // `stream-format=byte-stream,alignment=au` yields Annex-B access units (what browsers/Foxglove
+        // want). Each tee branch gets its own queue (tee requirement); the h264 branch leaks downstream
+        // so a slow republisher never back-pressures the decoder.
         let bin_str = format!(
-            "rtph264depay name=depay ! h264parse ! \
-             nvv4l2decoder enable-max-performance=1 disable-dpb=true ! \
-             nvvidconv ! {nvmm_caps} ! tee name=t \
+            "rtph264depay name=depay ! h264parse config-interval=-1 ! tee name=ht \
+             ht. ! queue max-size-buffers=8 leaky=downstream ! \
+                   video/x-h264,stream-format=byte-stream,alignment=au ! \
+                   appsink name=sink_h264 max-buffers=30 drop=true sync=false \
+             ht. ! queue max-size-buffers=4 ! \
+                   nvv4l2decoder enable-max-performance=1 disable-dpb=true ! \
+                   nvvidconv ! {nvmm_caps} ! tee name=t \
              t. ! queue max-size-buffers=2 leaky=upstream ! \
                   appsink name=sink max-buffers=1 drop=true sync=false \
              t. ! queue max-size-buffers=2 leaky=upstream ! \
@@ -293,18 +336,43 @@ impl RtspSource {
 
         let pipeline = gstreamer::Pipeline::default();
 
+        // Force TCP-interleaved RTP (protocols=tcp). rtspsrc defaults to UDP-first (protocols=0x7);
+        // on many consumer IP cameras (e.g. TP-Link Tapo) the UDP RTP sockets error out / never
+        // receive — the RTP return path is blocked or the ports aren't reachable — so rtspsrc sits in
+        // "doing receive with timeout" and the first frame never arrives, hanging `connect`'s initial
+        // pull_sample forever. TCP interleaved carries RTP over the already-open RTSP TCP connection:
+        // reliable (no packet loss on large keyframes), NAT/firewall-proof, and fine for LAN bitrates.
         let src = gstreamer::ElementFactory::make("rtspsrc")
             .property("location", url)
             .property("latency", 100u32)
+            .property_from_str("protocols", "tcp")
             .build()
             .map_err(|_| GstSourceError::Setup("failed to create rtspsrc"))?;
 
-        // Parse the static downstream chain into a bin, then promote its
-        // contents into the pipeline so they sit at the top level (matching the
-        // previous flat `parse_launch` layout). `parse_bin_from_description`
-        // with `ghost_unlinked_pads = false` keeps `depay`'s sink pad exposed
-        // for dynamic linking from `rtspsrc`.
-        let bin = gstreamer::parse_bin_from_description(&bin_str, false)?;
+        // Set up ONLY the video stream. A Tapo (and many IP cameras) also advertises an audio track
+        // (e.g. PCMA); rtspsrc would expose a source pad for it that nothing downstream links, and the
+        // unlinked pad tears down the whole pipeline ("streaming stopped, reason not-linked"). The
+        // `select-stream` signal returns false to skip any RTP stream whose caps say media != "video",
+        // so audio never enters the pipeline. Media unknown at select time → keep it (the pad-added
+        // handler still links only a video pad, and falls back to the first pad if media is absent).
+        src.connect("select-stream", false, |vals| {
+            let keep = vals
+                .get(2)
+                .and_then(|v| v.get::<gstreamer::Caps>().ok())
+                .and_then(|caps| {
+                    caps.structure(0)
+                        .and_then(|s| s.get::<String>("media").ok())
+                })
+                .is_none_or(|media| media == "video");
+            Some(keep.to_value())
+        });
+
+        // Parse the static downstream chain into a bin. `ghost_unlinked_pads = TRUE` is REQUIRED: it
+        // exposes `depay`'s (only) unlinked pad — its sink — as a GHOST pad named "sink" on the bin.
+        // rtspsrc's dynamically-added src pad must link to that ghost pad, NOT to `depay`'s inner pad:
+        // rtspsrc lives in the pipeline and depay lives inside this bin, so a direct pad link across the
+        // bin boundary fails with "wrong hierarchy" and the stream never starts (reason not-linked).
+        let bin = gstreamer::parse_bin_from_description(&bin_str, true)?;
 
         pipeline
             .add(&src)
@@ -321,10 +389,9 @@ impl RtspSource {
             let Some(bin) = bin_weak.upgrade() else {
                 return;
             };
-            let Some(depay) = bin.by_name("depay") else {
-                return;
-            };
-            let Some(sink_pad) = depay.static_pad("sink") else {
+            // The bin's ghost "sink" pad (proxying depay's sink) — link to THIS, not depay's inner pad,
+            // or the cross-bin link fails "wrong hierarchy".
+            let Some(sink_pad) = bin.static_pad("sink") else {
                 return;
             };
             if sink_pad.is_linked() {
@@ -357,6 +424,14 @@ impl RtspSource {
             .ok_or(GstSourceError::Setup("no sink_cpu"))?
             .dynamic_cast::<gstreamer_app::AppSink>()
             .map_err(|_| GstSourceError::Setup("sink_cpu is not AppSink"))?;
+
+        // Encoded-H.264 tap. Pull-based (no callback): it buffers Annex-B access units, and `next_h264`
+        // drains them with try_pull_sample.
+        let appsink_h264 = bin
+            .by_name("sink_h264")
+            .ok_or(GstSourceError::Setup("no sink_h264"))?
+            .dynamic_cast::<gstreamer_app::AppSink>()
+            .map_err(|_| GstSourceError::Setup("sink_h264 is not AppSink"))?;
 
         let (frame_tx, frame_rx) = mpsc::sync_channel::<NvmmFrame>(2);
         let (dim_tx, dim_rx) = mpsc::sync_channel::<(u32, u32)>(1);
@@ -459,7 +534,28 @@ impl RtspSource {
             cpu_frame,
             stream,
             pack,
+            h264_sink: appsink_h264,
         })
+    }
+
+    /// Pull the next encoded **H.264** access unit (Annex-B), NON-BLOCKING: an [`H264Buffer`] borrowing
+    /// the bitstream bytes in place (zero-copy — deref for `&[u8]`, [`pts_ns`] for the capture PTS), or
+    /// `None` if none is queued. This is the camera's ORIGINAL H.264 tapped before decode — zero
+    /// transcode. Drain it in a loop until `None` each iteration, publishing and dropping each access
+    /// unit before the next pull, so the tap's appsink pool never backs up (a dropped frame glitches the
+    /// stream until the next keyframe; SPS/PPS are re-sent each keyframe so a subscriber recovers).
+    ///
+    /// [`pts_ns`]: H264Buffer::pts_ns
+    pub fn next_h264(&self) -> Option<H264Buffer> {
+        let sample = self.h264_sink.try_pull_sample(gstreamer::ClockTime::ZERO)?;
+        let pts_ns = sample
+            .buffer()
+            .and_then(|b| b.pts())
+            .map_or(0, |t| t.nseconds());
+        // buffer_owned() bumps the buffer's refcount (no data copy); the mapping keeps it alive so the
+        // returned slice stays valid without repacking the bytes onto the heap.
+        let map = sample.buffer_owned()?.into_mapped_buffer_readable().ok()?;
+        Some(H264Buffer { map, pts_ns })
     }
 
     /// The shared CUDA stream the per-frame RGBA→RGB pack runs on. **Build the
