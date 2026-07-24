@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -108,11 +109,40 @@ struct oak_device {
     std::shared_ptr<dai::ImgFrame> cur_rgb;
     std::shared_ptr<dai::ImgFrame> cur_depth;
     std::shared_ptr<dai::ImgFrame> cur_video;
+    std::vector<uint16_t> depth_repack;  // tightly-packed depth when the device row is stride-padded
     bool has_depth = false;   // StereoDepth running
     bool has_video = false;   // on-device H.264 colour stream running
     bool has_sync = false;    // colour(+depth) pipeline present; false = video-only fallback
     float fx = 0, fy = 0, cx = 0, cy = 0;
 };
+
+// Attach an NV12 output of `color` → a hardware H.264 encoder, handing the bitstream queue to `dev`.
+// Shared by the video-only and decoupled RGBD paths so their encoder settings (BASELINE for
+// Foxglove's decoder, ~4 keyframes/s for fast mid-stream join, OAK_H264_KBPS) can never drift apart.
+// `fps` is clamped to >= 1 by the caller.
+static void add_h264_encoder(dai::Pipeline& pipeline, const std::shared_ptr<dai::node::Camera>& color,
+                             int width, int height, int fps, oak_device* dev) {
+    auto* nv12_out = color->requestOutput(
+        std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
+        dai::ImgFrame::Type::NV12, dai::ImgResizeMode::CROP, (float)fps, /*undistort=*/true);
+    auto enc = pipeline.create<dai::node::VideoEncoder>();
+    enc->setDefaultProfilePreset((float)fps, dai::VideoEncoderProperties::Profile::H264_BASELINE);
+    enc->setKeyframeFrequency(std::max(fps / 4, 4));
+    enc->setBitrateKbps(h264_kbps());
+    nv12_out->link(enc->input);
+    dev->video_q = enc->bitstream.createOutputQueue(30, false);
+    dev->has_video = true;
+}
+
+// Read CAM_A factory intrinsics at the streamed size into `dev` (fx/fy/cx/cy). A wiped EEPROM or a
+// device without CAM_A leaves them zero — fine for viewing, so the failure is swallowed.
+static void read_rgb_intrinsics(oak_device* dev, int width, int height) {
+    try {
+        auto k = dev->device->readCalibration()
+                     .getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, width, height);
+        dev->fx = k[0][0]; dev->fy = k[1][1]; dev->cx = k[0][2]; dev->cy = k[1][2];
+    } catch (const std::exception&) { /* intrinsics stay zero */ }
+}
 
 // STEREO+IMU modality: the two mono cameras as a Sync'd RGB888 pair + the IMU on its own queue.
 // Shares no nodes with oak_open's colour/depth pipeline — deliberately a separate entry point so the
@@ -210,6 +240,7 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         dev->device = connect_device(device_id);
         dev->pipeline = std::make_unique<dai::Pipeline>(dev->device);
         auto& pipeline = *dev->pipeline;
+        if (fps < 1) fps = 30;   // 0/negative fps would poison the encoder preset + requestOutput rate
 
         // Auto-fall-back to video-only when depth was requested but the device can't actually produce it
         // (mono camera, or wiped/blank calibration → fx=0). Pulling raw RGB over XLink for a "synced RGBD"
@@ -224,24 +255,11 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         if (want_video_only) {
             auto color = pipeline.create<dai::node::Camera>();
             color->build(dai::CameraBoardSocket::CAM_A);
-            auto* nv12_out = color->requestOutput(
-                std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
-                dai::ImgFrame::Type::NV12, dai::ImgResizeMode::CROP, (float)fps, /*undistort=*/true);
-            auto enc = pipeline.create<dai::node::VideoEncoder>();
-            enc->setDefaultProfilePreset((float)fps, dai::VideoEncoderProperties::Profile::H264_BASELINE);
-            enc->setKeyframeFrequency(fps > 0 ? std::max(fps / 4, 4) : 8); // ~4 keyframes/s → fast decoder start
-            enc->setBitrateKbps(h264_kbps());
-            nv12_out->link(enc->input);
-            dev->video_q = enc->bitstream.createOutputQueue(30, false);
-            dev->has_video = true;
+            add_h264_encoder(pipeline, color, width, height, fps, dev.get());
             dev->has_depth = false;
             dev->has_sync = false;
             pipeline.start();
-            try {
-                auto k = dev->device->readCalibration()
-                             .getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, width, height);
-                dev->fx = k[0][0]; dev->fy = k[1][1]; dev->cx = k[0][2]; dev->cy = k[1][2];
-            } catch (const std::exception&) { /* intrinsics stay zero — irrelevant for viewing */ }
+            read_rgb_intrinsics(dev.get(), width, height);
             return dev.release();
         }
 
@@ -306,7 +324,9 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
             // so consumers scale coords by (rgb_w / depth_w).
             int ddiv = 2;
             if (const char* s = std::getenv("OAK_DEPTH_DIV")) { int v = std::atoi(s); if (v >= 1) ddiv = v; }
-            stereo->setOutputSize(std::max(1, width / ddiv), std::max(1, height / ddiv));
+            // XLink requires EVEN depth dims — an odd width/height tears the device connection down
+            // (X_LINK_ERROR, e.g. OAK_DEPTH_DIV=3 → 213x120). Round each down to even, floored at 2.
+            stereo->setOutputSize(std::max(2, (width / ddiv) & ~1), std::max(2, (height / ddiv) & ~1));
             dev->has_depth = true;
         } catch (const std::exception&) {
             dev->has_depth = false;   // e.g. OAK-1: no stereo pair
@@ -322,26 +342,11 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         // hardware H.264 encoder → its own queue. BASELINE (no B-frames) for Foxglove's decoder; a
         // keyframe ~4×/s lets a viewer/recorder join mid-stream.
         if (enable_h264 != 0) {
-            auto* nv12_out = color->requestOutput(
-                std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
-                dai::ImgFrame::Type::NV12, dai::ImgResizeMode::CROP, (float)fps, /*undistort=*/true);
-            auto enc = pipeline.create<dai::node::VideoEncoder>();
-            enc->setDefaultProfilePreset((float)fps, dai::VideoEncoderProperties::Profile::H264_BASELINE);
-            enc->setKeyframeFrequency(fps > 0 ? std::max(fps / 4, 4) : 8);
-            enc->setBitrateKbps(h264_kbps());
-            nv12_out->link(enc->input);
-            dev->video_q = enc->bitstream.createOutputQueue(30, false);
-            dev->has_video = true;
+            add_h264_encoder(pipeline, color, width, height, fps, dev.get());
         }
 
         pipeline.start();
-
-        // Factory intrinsics of the (aligned) RGB camera at the streamed size.
-        try {
-            auto k = dev->device->readCalibration()
-                         .getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, width, height);
-            dev->fx = k[0][0]; dev->fy = k[1][1]; dev->cx = k[0][2]; dev->cy = k[1][2];
-        } catch (const std::exception&) { /* intrinsics stay zero */ }
+        read_rgb_intrinsics(dev.get(), width, height);   // factory intrinsics of the aligned RGB camera
 
         return dev.release();
     } catch (const std::exception& e) { set_err(e.what()); return nullptr; }
@@ -388,13 +393,28 @@ extern "C" int oak_poll_depth(oak_device* dev, const uint16_t** depth_mm,
         if (!d) return 0;
         auto dd = d->getData();
         const int dw = (int)d->getWidth(), dh = (int)d->getHeight();
-        const unsigned int stride = d->getStride();
-        const bool tight = (stride == 0 || stride == (unsigned)dw * sizeof(uint16_t));
-        if (dw <= 0 || dh <= 0 || !tight || dd.size() < (size_t)dw * dh * sizeof(uint16_t)) {
-            return 0; // skip a malformed frame rather than kill the stream
+        if (dw <= 0 || dh <= 0) return 0;   // degenerate frame — skip, don't kill the stream
+        const size_t row = (size_t)dw * sizeof(uint16_t);
+        // A downscaled/aligned depth frame is often padded to a byte-alignment boundary
+        // (stride > dw*2). Honor the stride by repacking row-by-row instead of dropping every such
+        // frame — the old tight-only check silently left depth permanently empty when it was padded.
+        unsigned int stride = d->getStride();
+        if (stride == 0) stride = (unsigned)row;
+        if (stride < row || dd.size() < (size_t)stride * dh) {
+            return 0; // malformed — skip this frame rather than kill the stream
         }
-        dev->cur_depth = d;   // pin until the next poll
-        *depth_mm = reinterpret_cast<const uint16_t*>(dd.data());
+        if (stride == row) {
+            dev->cur_depth = d;   // tight → hand out zero-copy, pinned until the next poll
+            *depth_mm = reinterpret_cast<const uint16_t*>(dd.data());
+        } else {
+            dev->cur_depth.reset();   // repacked into our own buffer; no need to pin the padded frame
+            dev->depth_repack.resize((size_t)dw * dh);
+            const uint8_t* base = dd.data();
+            for (int y = 0; y < dh; ++y) {
+                std::memcpy(dev->depth_repack.data() + (size_t)y * dw, base + (size_t)y * stride, row);
+            }
+            *depth_mm = dev->depth_repack.data();
+        }
         *depth_w = dw; *depth_h = dh;
         *ts_ns = frame_epoch_ns(d);
         return 1;

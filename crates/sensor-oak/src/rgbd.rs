@@ -128,7 +128,6 @@ impl OakSource {
         let rc =
             unsafe { ffi::oak_poll_rgb(self.dev, &mut rgb, &mut w, &mut h, &mut len, &mut ts) };
         if rc == 1 && !rgb.is_null() && len > 0 {
-            self.seq += 1;
             // Copy the span out while the shim still pins it (valid only until the next poll).
             let bytes = unsafe { std::slice::from_raw_parts(rgb, len as usize) }.to_vec();
             Some((bytes, w as u32, h as u32, ts))
