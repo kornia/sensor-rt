@@ -13,7 +13,6 @@ name = "sensor_rtsp"
 nvbuf-sys     = { workspace = true }
 gstreamer     = { workspace = true }
 gstreamer-app = { workspace = true }
-vrt           = { workspace = true }
 sensor-types  = { workspace = true }
 kornia-image  = { workspace = true }
 kornia-tensor = { workspace = true }
@@ -23,6 +22,7 @@ cudarc        = { workspace = true }
 [dev-dependencies]
 # Examples only: the models they run, plus PNG output and CLI parsing. The driver
 # itself depends on none of this.
+vrt          = { workspace = true }
 vrt-xfeat    = { workspace = true }
 vrt-rfdetr   = { workspace = true }
 vrt-hub      = { workspace = true, features = ["hub", "builder"] }
