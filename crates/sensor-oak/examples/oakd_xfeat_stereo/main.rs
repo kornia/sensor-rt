@@ -6,7 +6,7 @@
 //!   xf_l.submit(left)   ─┐                        xf_r.submit(right)  ─┐   both async,
 //!                        └── neither has synced yet ───────────────────┘   both in flight
 //!   stream0.sync(); stream1.sync()
-//!   Matcher::submit_match(left, right)  →  mutual-NN pairs, all on device
+//!   Matcher::submit(left, right)  →  mutual-NN pairs, all on device
 //! ```
 //!
 //! The two streams let both eyes be in flight at once. **Measured on an AGX Orin
@@ -72,7 +72,7 @@ struct Args {
     image_every: u64,
 }
 use vrt::{BoxError, Engine, Logger, Runtime, Stream};
-use vrt_xfeat::{Matcher, XFeat, XFeatParams, XFeatResult};
+use vrt_xfeat::{Descriptors, Matcher, XFeat, XFeatParams, XFeatResult};
 
 mod viz;
 use viz::StereoViz;
@@ -105,15 +105,17 @@ fn main() -> Result<(), BoxError> {
     let s1 = s0.context().new_stream()?;
 
     // ── engine, shared by both extractors ─────────────────────────────────────
+    // `inputs` is a Vec since upstream #18: multi-input models (a matcher taking
+    // keypoints *and* descriptors) need one profile per dynamic input. XFeat has one.
     let profile = vrt_hub::EngineProfile {
-        input: Some((
+        inputs: vec![(
             "image".into(),
             vec![1, 3, 240, 320],
             vec![1, 3, 640, 640],
             vec![1, 3, 1088, 1920],
-        )),
+        )],
         fp16: true,
-        workspace_mb: 2048,
+        ..Default::default()
     };
     let engine_path =
         vrt_hub::EngineCache::default().resolve("xfeat-backbone", model_path, &profile)?;
@@ -229,11 +231,13 @@ fn main() -> Result<(), BoxError> {
 
         // Mutual nearest-neighbour on device — descriptors never leave the GPU.
         // Enqueued on s0, then synced before reading the pairs back.
-        matcher.submit_match(
-            &res_l.descs,
-            res_l.count(),
-            &res_r.descs,
-            res_r.count(),
+        // `Descriptors::from_xfeat` takes the descriptor width from the result that
+        // produced it. Upstream made that explicit because a width supplied by the caller
+        // — in particular the matcher's own — silently strides the buffer and returns
+        // plausible matches instead of erroring.
+        matcher.submit(
+            Descriptors::from_xfeat(&res_l),
+            Descriptors::from_xfeat(&res_r),
             0.82,
             &mut match_res,
         )?;

@@ -45,15 +45,16 @@ fn main() -> Result<(), vrt::BoxError> {
     let (model_path, rtsp_url, save_dir) = (&args.model, &args.url, args.save_dir.as_str());
 
     // .onnx → versioned engine cache (build on first run); .engine → as-is.
+    // `inputs` is a Vec since upstream #18 (one profile per dynamic input).
     let profile = vrt_hub::EngineProfile {
-        input: Some((
+        inputs: vec![(
             "image".into(),
             vec![1, 3, 240, 320],
             vec![1, 3, 640, 640],
             vec![1, 3, 1088, 1920],
-        )),
+        )],
         fp16: true,
-        workspace_mb: 2048,
+        ..Default::default()
     };
     let engine_path =
         vrt_hub::EngineCache::default().resolve("xfeat-backbone", model_path, &profile)?;

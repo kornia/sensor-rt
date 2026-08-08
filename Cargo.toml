@@ -40,10 +40,10 @@ cudarc = { version = "0.19", default-features = false, features = [
 #     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
 # NOTE: upstream's core crate is named `vrt` outright; the fork called it
 # `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
-vrt        = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
-vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
-vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
-vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "4875aa1d6e24f67f0335f46f89ecea0391e1bfa1" }
+vrt        = { git = "https://github.com/kornia/vision-rt", rev = "e1de223c25017bff5376f27b1cba3b1fb6e5c6b2" }
+vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "e1de223c25017bff5376f27b1cba3b1fb6e5c6b2" }
+vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "e1de223c25017bff5376f27b1cba3b1fb6e5c6b2" }
+vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "e1de223c25017bff5376f27b1cba3b1fb6e5c6b2" }
 # kornia GPU image/tensor types — pinned to the same rev vision-rt uses.
 kornia-image   = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.5", features = ["cuda"] }
 kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", tag = "v0.1.15-rc.5", features = ["cuda"] }
