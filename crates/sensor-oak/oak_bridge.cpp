@@ -406,6 +406,15 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         pipeline.start();
         read_rgb_intrinsics(dev.get(), width, height);   // factory intrinsics of the aligned RGB camera
 
+        // IR dot projector: passive stereo starves on texture-poor / dim scenes (single-digit
+        // valid-depth %). Default 0.8 intensity; OAK_IR=0 disables (e.g. multi-cam cross-talk),
+        // boards without a projector just return false. Set after start() — needs a live device.
+        {
+            float ir = 0.8f;
+            if (const char* s = std::getenv("OAK_IR")) { ir = std::max(0.0f, std::min(1.0f, (float)std::atof(s))); }
+            if (ir > 0.0f) dev->device->setIrLaserDotProjectorIntensity(ir);
+        }
+
         return dev.release();
     } catch (const std::exception& e) { set_err(e.what()); return nullptr; }
     catch (...) { set_err("unknown error in oak_open_rgbd"); return nullptr; }
