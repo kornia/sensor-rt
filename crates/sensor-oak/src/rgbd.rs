@@ -15,7 +15,7 @@
 //! out); the consumer owns any GPU upload. A `flux-oak`-style producer that only
 //! encodes + republishes builds no GPU stack at all.
 
-use crate::{device_id_cstring, ffi, last_error, BoxError, OakIntrinsics, OakSource};
+use crate::{device_id_cstring, ffi, last_error, BoxError, OakSource};
 
 impl OakSource {
     /// Open an OAK in the RGBD + H.264 modality: CAM_A colour (RGB888) + an on-device H.264 colour
@@ -29,7 +29,12 @@ impl OakSource {
     ///
     /// `imu_hz > 0` also runs the on-board IMU (accel + gyro) on its own queue, drained with
     /// [`next_imu`](Self::next_imu) on the same host-epoch timeline as the frames; `0` disables it.
-    /// A board without an IMU degrades ([`has_imu`](Self::has_imu) is `false`) — never an error.
+    /// The shim preflights with `getConnectedIMU()` and only builds the IMU node when the board
+    /// actually carries one, so an IMU-less board degrades ([`has_imu`](Self::has_imu) is `false`)
+    /// without ever risking the image streams — never an error. Rates above 400 Hz (the BNO086
+    /// gyro maximum) are clamped. When the EEPROM carries valid IMU extrinsics, samples come out
+    /// in the CAM_A optical frame — check [`imu_aligned`](Self::imu_aligned); an absent or
+    /// rejected calibration is logged to stderr by the shim with the reason.
     pub fn open_rgbd(
         device: Option<&str>,
         width: u32,
@@ -67,8 +72,20 @@ impl OakSource {
     ) -> Result<Self, BoxError> {
         let id_c = device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        // The BNO086 gyro tops out at 400 Hz — a wilder rate would just make the firmware's
+        // sensor-enable fail at pipeline start, so clamp here rather than surface a device error.
+        let imu_hz = if imu_hz > 400 {
+            eprintln!("sensor-oak: imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
+            400
+        } else {
+            imu_hz
+        };
         // H.264 is always on in this modality — the whole point is the efficient colour stream.
-        let open = |hz: u32| unsafe {
+        // No open-retry here: the shim preflights the IMU with getConnectedIMU() before building
+        // the node, so an IMU-less board already degrades inside ONE open. A failure at this
+        // point is a real device error, and retrying (especially with `device = None`) could
+        // silently bind a different physical camera on a multi-OAK rig.
+        let dev = unsafe {
             ffi::oak_open_rgbd(
                 id_ptr,
                 width as i32,
@@ -77,45 +94,13 @@ impl OakSource {
                 1,
                 depth as i32,
                 video_only as i32,
-                hz as i32,
+                imu_hz as i32,
             )
         };
-        let mut dev = open(imu_hz);
-        if dev.is_null() && imu_hz > 0 {
-            // The shim guards IMU-node *creation*, but an IMU-less board can also fail later, at
-            // pipeline start — outside that guard. "A failed IMU never costs the image streams"
-            // means retrying once without the IMU node before giving up (has_imu comes back false).
-            dev = open(0);
-        }
         if dev.is_null() {
             return Err(last_error("oak_open_rgbd"));
         }
-        Self::from_open_rgbd_device(dev, width, height)
-    }
-
-    /// Wrap an RGBD device the shim has already opened, reading its capabilities back from it rather
-    /// than assuming what the constructor asked for — `has_sync`/`has_depth` in particular depend on the
-    /// device's calibration, which the caller cannot predict.
-    fn from_open_rgbd_device(
-        dev: *mut ffi::OakDevice,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, BoxError> {
-        let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
-        unsafe { ffi::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
-        Ok(Self {
-            dev,
-            width,
-            height,
-            seq: 0,
-            intr: OakIntrinsics { fx, fy, cx, cy },
-            has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
-            imu_aligned: unsafe { ffi::oak_imu_aligned(dev) } != 0,
-            imu_scratch: Vec::new(),
-            has_depth: unsafe { ffi::oak_has_depth(dev) } != 0,
-            has_video: unsafe { ffi::oak_has_video(dev) } != 0,
-            has_sync: unsafe { ffi::oak_has_sync(dev) } != 0,
-        })
+        Self::from_open_device(dev, width, height)
     }
 
     /// Whether `StereoDepth` is running (so [`next_depth`](Self::next_depth) can yield aligned depth).

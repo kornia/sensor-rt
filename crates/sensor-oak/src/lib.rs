@@ -1,11 +1,11 @@
-//! OAK-D camera source: a time-synced **stereo pair + IMU**, plus factory
-//! intrinsics. Safe wrapper over the bundled depthai-core C shim (`oak_bridge.h`),
-//! which this crate's `build.rs` compiles and links.
+//! OAK-D camera source: a time-synced **stereo pair + IMU**, or **RGBD + H.264**,
+//! plus factory intrinsics. Safe wrapper over the bundled depthai-core C shim
+//! (`oak_bridge.h`), which this crate's `build.rs` compiles and links.
 //!
-//! Scope is deliberately narrow right now: the colour/depth (RGB-D) and H.264
-//! paths were removed while the stereo + inertial modality is the one under
-//! development. See [`stereo`] for the pair and [`imu`] for the inertial stream —
-//! they are drained independently, because the IMU reports far faster than frames.
+//! Two independent modalities behind one type: see [`stereo`] for the raw pair,
+//! [`rgbd`] for colour/depth/video, and [`imu`] for the inertial stream available
+//! alongside either — drained independently, because the IMU reports far faster
+//! than frames.
 //!
 //! **Nothing here touches CUDA**: frames come out on the host and the consumer owns
 //! any upload, so a process that only wants pixels builds no GPU stack.
@@ -66,8 +66,9 @@ pub struct OakSource {
     seq: u64,
     intr: OakIntrinsics,
     has_imu: bool,
-    /// IMU samples are calibration-rotated into the camera optical frame (RGBD modality only;
-    /// false = raw IMU-chip frame — see [`next_imu`](Self::next_imu)).
+    /// IMU samples are calibration-rotated into the modality's reference camera optical frame
+    /// (CAM_A on RGBD, CAM_B/left on stereo; false = raw IMU-chip frame — see
+    /// [`next_imu`](Self::next_imu)).
     imu_aligned: bool,
     /// Reused staging buffer for `next_imu`, so draining inertial samples every
     /// frame costs no allocation once it has grown.
@@ -84,9 +85,12 @@ pub struct OakSource {
 unsafe impl Send for OakSource {}
 
 impl OakSource {
-    /// Wrap a device the shim has already opened, reading its capabilities back from
-    /// it rather than assuming what the constructor asked for — the IMU in particular
-    /// may fail to start on a board that has none, which the caller cannot predict.
+    /// Wrap a device the shim has already opened (either modality), reading its
+    /// capabilities back from it rather than assuming what the constructor asked
+    /// for — the IMU may be absent on a given board, and `has_sync`/`has_depth`
+    /// depend on the device's calibration, none of which the caller can predict.
+    /// The RGBD-only getters simply report `false` on a stereo device, so one
+    /// constructor serves both open paths.
     ///
     /// `width`/`height` are the *requested* size and are kept only so callers can size
     /// buffers before the first frame; each frame reports its own actual dimensions.
@@ -106,9 +110,9 @@ impl OakSource {
             has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
             imu_aligned: unsafe { ffi::oak_imu_aligned(dev) } != 0,
             imu_scratch: Vec::new(),
-            has_depth: false,
-            has_video: false,
-            has_sync: false,
+            has_depth: unsafe { ffi::oak_has_depth(dev) } != 0,
+            has_video: unsafe { ffi::oak_has_video(dev) } != 0,
+            has_sync: unsafe { ffi::oak_has_sync(dev) } != 0,
         })
     }
 

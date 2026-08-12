@@ -26,10 +26,13 @@ pub struct ImuSample {
 }
 
 impl OakSource {
-    /// Whether IMU samples are calibration-rotated into the camera optical frame
-    /// (RGBD modality with IMU extrinsics in the EEPROM). `false` = raw IMU-chip
-    /// frame, axis-permuted vs the camera by the board mounting — consumers doing
-    /// gyro priors / gravity alignment should warn and expect a tilted gauge.
+    /// Whether IMU samples are calibration-rotated into the modality's reference
+    /// camera optical frame — CAM_A (colour) on RGBD, CAM_B (left) on stereo —
+    /// because the EEPROM carries IMU extrinsics that pass the shim's rotation
+    /// gate. `false` = raw IMU-chip frame, axis-permuted vs the camera by the
+    /// board mounting — consumers doing gyro priors / gravity alignment should
+    /// warn and expect a tilted gauge; the shim logs the reason (no extrinsics
+    /// vs rejected matrix) to stderr at open.
     pub fn imu_aligned(&self) -> bool {
         self.imu_aligned
     }

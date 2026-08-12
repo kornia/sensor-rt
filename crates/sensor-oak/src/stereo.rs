@@ -146,10 +146,14 @@ impl OakSource {
     /// Takes **no CUDA stream** — see the module docs: the consumer owns the
     /// upload, because it alone knows which stream each eye belongs on.
     ///
-    /// The IMU is optional: a board without one (or whose IMU fails to start)
-    /// still streams stereo, with [`has_imu`](OakSource::has_imu) `false`. A
-    /// device with no CAM_B/CAM_C pair is an error — unlike depth, there is no
-    /// meaningful degraded mode for a *stereo* source.
+    /// The IMU is optional: the shim preflights with `getConnectedIMU()` and only
+    /// builds the IMU node when the board carries one, so an IMU-less board still
+    /// streams stereo, with [`has_imu`](OakSource::has_imu) `false`. When the
+    /// EEPROM carries valid IMU extrinsics, samples come out rotated into the
+    /// **left (CAM_B) optical frame** — check
+    /// [`imu_aligned`](OakSource::imu_aligned); otherwise they stay in the raw
+    /// chip frame. A device with no CAM_B/CAM_C pair is an error — unlike depth,
+    /// there is no meaningful degraded mode for a *stereo* source.
     ///
     /// `imu_hz = 0` skips the IMU node entirely.
     pub fn open_stereo(

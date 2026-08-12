@@ -49,8 +49,12 @@ typedef struct {
  *                  it on the GPU instead.
  *   fps          : stereo pair rate.
  *   imu_hz       : accelerometer + gyroscope report rate (e.g. 200-400). The IMU
- *                  is OPTIONAL — a device without one (or whose IMU fails to
- *                  start) still streams stereo, with oak_has_imu() == 0.
+ *                  is OPTIONAL — the IMU node is only built after a
+ *                  getConnectedIMU() preflight confirms the board carries one, so
+ *                  an IMU-less device still streams stereo (oak_has_imu() == 0)
+ *                  and a missing IMU never reaches pipeline start. When the EEPROM
+ *                  carries the IMU extrinsics, samples are rotated into the LEFT
+ *                  (CAM_B) optical frame — see oak_imu_aligned().
  *
  * Returns NULL on failure (reason via oak_last_error). */
 oak_device *oak_open_stereo(const char *device_id, int width, int height,
@@ -81,9 +85,11 @@ int oak_has_imu(const oak_device *dev);
  *                  just the small bitstream for low-bandwidth viewing. oak_poll_rgb/
  *                  _depth yield nothing; drain oak_poll_video.
  *   imu_hz       : accelerometer + gyroscope rate (oak_poll_imu), same semantics as
- *                  oak_open_stereo's. 0 disables the IMU node; a missing/failed IMU
- *                  never costs the image streams (oak_has_imu()==0, streams run on).
- *                  Works in video_only mode too.
+ *                  oak_open_stereo's. 0 disables the IMU node; the node is only built
+ *                  after a getConnectedIMU() preflight confirms the board carries an
+ *                  IMU, so a missing IMU never costs the image streams
+ *                  (oak_has_imu()==0, streams run on) and never reaches pipeline
+ *                  start. Works in video_only mode too.
  *
  * Auto-fall-back: if enable_depth is set but the device can't actually produce depth
  * (no stereo pair, or a wiped/blank calibration → fx=0), the pipeline silently drops
@@ -163,10 +169,11 @@ void oak_frame_release(void *handle);
  * `max` samples, sets *n to how many were written (0 when none are queued or the
  * IMU isn't running). Returns 1 / 0 / -1 (error).
  *
- * Sample frame: on the RGBD modality, when the device calibration carries the IMU
- * extrinsics (oak_imu_aligned() == 1), samples are rotated into the CAM_A optical
- * frame; otherwise (and always on the stereo modality) they are the raw IMU-chip
- * frame, which is axis-permuted vs the camera by the board mounting.
+ * Sample frame: when the device calibration carries the IMU extrinsics
+ * (oak_imu_aligned() == 1), samples are rotated into the modality's reference
+ * camera optical frame — CAM_A (colour) on the RGBD modality, CAM_B (left) on the
+ * stereo modality. Otherwise they are the raw IMU-chip frame, which is
+ * axis-permuted vs the camera by the board mounting.
  *
  * The IMU reports far faster than the frame rate, so call this in a loop until
  * *n == 0 (or with a generous `max`) each iteration, otherwise the batch queue
@@ -174,8 +181,9 @@ void oak_frame_release(void *handle);
 int oak_poll_imu(oak_device *dev, oak_imu_sample *out, int max, int *n);
 
 /* True (1) when oak_poll_imu samples are calibration-rotated into the camera
- * optical frame (RGBD modality with IMU extrinsics in the EEPROM). 0 = raw
- * IMU-chip frame. */
+ * optical frame (CAM_A on the RGBD modality, CAM_B/left on the stereo modality —
+ * IMU extrinsics present in the EEPROM and validated as a proper rotation). 0 =
+ * raw IMU-chip frame; the shim logs WHY to stderr (no extrinsics vs rejected). */
 int oak_imu_aligned(const oak_device *dev);
 
 /* Recover a PoE OAK wedged in bootloader state: reboot it via a bootloader open+drop so the next
