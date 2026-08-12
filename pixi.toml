@@ -1,7 +1,7 @@
 [workspace]
 name = "sensor-rt"
 channels = ["conda-forge"]
-platforms = ["linux-aarch64"]
+platforms = ["linux-aarch64", "linux-64"]
 
 # pixi pins the native toolchain for the OAK-D path (depthai-core v3 builds from source). GStreamer
 # + libnvbufsurface (for sensor-rtsp/nvbuf-sys) are SYSTEM/JetPack, not conda — not listed here.
@@ -11,9 +11,14 @@ cmake = ">=3.28"
 ninja = "*"
 pkg-config = "*"
 libusb = "*"
+# depthai-core's Rectification/ImageAlign/PointCloud host nodes hard-require OpenCV (building with
+# DEPTHAI_OPENCV_SUPPORT=OFF leaves dangling vtable symbols) — pull it from conda-forge so x86
+# hosts need no system OpenCV.
+libopencv = "*"
 
-[activation.env]
 # Orin Nano ~7.4 GB RAM — cap parallel cargo so heavy template builds don't OOM the box.
+# (aarch64 only: x86 dev laptops have the RAM to run unconstrained.)
+[target.linux-aarch64.activation.env]
 CARGO_BUILD_JOBS = "2"
 
 [tasks]
