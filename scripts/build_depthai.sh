@@ -29,6 +29,15 @@ if [ ! -e "$SRC/CMakeLists.txt" ]; then
     git -C "$ROOT" submodule update --init --recursive vendor/depthai-core
 fi
 
+# Portability patches (idempotent: skip when already applied). See patches/*.patch.
+for patch in "$ROOT"/patches/depthai-core-*.patch; do
+    [ -e "$patch" ] || continue
+    if git -C "$SRC" apply --check "$patch" 2>/dev/null; then
+        echo "[depthai] applying $(basename "$patch")"
+        git -C "$SRC" apply "$patch"
+    fi
+done
+
 echo "[depthai] configuring (Release, shared) ..."
 cmake -S "$SRC" -B "$SRC/build" -G Ninja \
     -D CMAKE_BUILD_TYPE=Release \

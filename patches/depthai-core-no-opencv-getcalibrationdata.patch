@@ -1,0 +1,32 @@
+--- a/src/pipeline/node/Rectification.cpp
++++ b/src/pipeline/node/Rectification.cpp
+@@ -32,6 +32,14 @@
+     return runOnHostVar;
+ }
+ 
++CalibrationHandler Rectification::getCalibrationData() const {
++    if(device) {
++        return device->readCalibration();
++    } else {
++        return getParentPipeline().getCalibrationData();
++    }
++}
++
+ #if !defined(DEPTHAI_HAVE_OPENCV_SUPPORT)
+ void Rectification::run() {
+     throw std::runtime_error("Rectification node requires OpenCV support to run. Please enable OpenCV support in your build configuration.");
+@@ -95,14 +103,6 @@
+ 
+ }  // namespace
+ 
+-CalibrationHandler Rectification::getCalibrationData() const {
+-    if(device) {
+-        return device->readCalibration();
+-    } else {
+-        return getParentPipeline().getCalibrationData();
+-    }
+-}
+-
+ std::vector<std::vector<float> > applyRectificationMatrix(const dai::Extrinsics& extrinsics, const cv::Mat& rectificationMatrix) {
+     cv::Mat rectificationMatrixInv;
+     cv::invert(rectificationMatrix, rectificationMatrixInv);
