@@ -14,7 +14,7 @@ libusb = "*"
 # depthai-core's Rectification/ImageAlign/PointCloud host nodes hard-require OpenCV (building with
 # DEPTHAI_OPENCV_SUPPORT=OFF leaves dangling vtable symbols) — pull it from conda-forge so x86
 # hosts need no system OpenCV.
-libopencv = "*"
+libopencv = "4.*"
 
 # Orin Nano ~7.4 GB RAM — cap parallel cargo so heavy template builds don't OOM the box.
 # (aarch64 only: x86 dev laptops have the RAM to run unconstrained.)
