@@ -46,7 +46,8 @@ cmake -S "$SRC" -B "$SRC/build" -G Ninja \
     -D DEPTHAI_BUILD_TESTS=OFF \
     -D DEPTHAI_BUILD_DOCS=OFF \
     -D CMAKE_INSTALL_PREFIX="$PREFIX" \
-    -D CMAKE_INSTALL_RPATH='$ORIGIN'
+    -D CMAKE_INSTALL_RPATH='$ORIGIN' \
+    ${DEPTHAI_CMAKE_EXTRA:-}
 
 # Parallelism is RAM-bound here, NOT core-bound: depthai-core's TUs (xtensor /
 # nlohmann-json / spdlog templates) peak at ~1.5-2 GB each in cc1plus. On a small
