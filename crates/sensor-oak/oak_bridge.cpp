@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -100,6 +101,11 @@ struct oak_device {
     // IMU samples popped off the queue but not yet handed to the caller (see oak_poll_imu).
     std::vector<oak_imu_sample> imu_pending;
     bool has_imu = false;     // on-board IMU running (optional even in stereo mode)
+    // IMU-chip → camera-optical rotation (row-major) applied to every sample in oak_poll_imu.
+    // Identity + imu_aligned=false when the calibration carries no IMU extrinsics (samples then
+    // stay in the raw chip frame, which is axis-permuted vs the camera on most boards).
+    float imu_rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    bool imu_aligned = false;
     // RGBD+H.264 modality (oak_open_rgbd): colour, depth, and video are DECOUPLED — each on its own
     // queue, pulled independently and paired downstream by timestamp. The cur_* frames pin the buffer
     // handed out as a raw span until the next poll of that stream (zero-copy: no host repack).
@@ -132,6 +138,49 @@ static void add_h264_encoder(dai::Pipeline& pipeline, const std::shared_ptr<dai:
     nv12_out->link(enc->input);
     dev->video_q = enc->bitstream.createOutputQueue(30, false);
     dev->has_video = true;
+}
+
+// Attach the on-board IMU (ACCELEROMETER_RAW + GYROSCOPE_RAW at imu_hz) on its own queue, symmetric
+// to the block in oak_open_stereo. IMU is OPTIONAL: not every OAK carries one, and a failed IMU must
+// not cost the image streams — degrade rather than abort. No-op when imu_hz <= 0.
+static void add_imu_node(dai::Pipeline& pipeline, oak_device* dev, int imu_hz) {
+    if (imu_hz <= 0) return;
+    try {
+        auto imu = pipeline.create<dai::node::IMU>();
+        imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER_RAW, (uint32_t)imu_hz);
+        imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_RAW, (uint32_t)imu_hz);
+        // Batch a few reports per message (fewer, larger XLink transfers) but keep the batch
+        // small enough that inertial data stays fresh relative to the frames.
+        imu->setBatchReportThreshold(5);
+        imu->setMaxBatchReports(20);
+        dev->imu_q = imu->out.createOutputQueue(50, false);
+        dev->has_imu = true;
+    } catch (const std::exception&) {
+        dev->has_imu = false;   // no IMU on this board — the image streams still run
+    }
+}
+
+// Resolve the IMU-chip → camera-optical rotation from the device calibration so oak_poll_imu can
+// report samples in the camera frame (what gyro priors / gravity alignment consume). Raw depthai
+// reports are in the IMU chip frame, axis-permuted vs the camera by the board mounting. Falls back
+// to identity (raw chip frame, imu_aligned=false) when the EEPROM has no IMU link or the stored
+// matrix is not a rotation (wiped/unfilled calibration) — degrade, never abort.
+static void read_imu_rotation(oak_device* dev, dai::CameraBoardSocket socket) {
+    if (!dev->has_imu) return;
+    try {
+        auto m = dev->device->readCalibration().getImuToCameraExtrinsics(socket);
+        if (m.size() < 3 || m[0].size() < 3 || m[1].size() < 3 || m[2].size() < 3) return;
+        float r[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) r[i * 3 + j] = m[i][j];
+        // A proper rotation has det ≈ +1; an unfilled EEPROM entry (zeros/garbage) does not.
+        const float det = r[0] * (r[4] * r[8] - r[5] * r[7])
+                        - r[1] * (r[3] * r[8] - r[5] * r[6])
+                        + r[2] * (r[3] * r[7] - r[4] * r[6]);
+        if (std::fabs(det - 1.0f) > 0.1f) return;
+        std::copy(r, r + 9, dev->imu_rot);
+        dev->imu_aligned = true;
+    } catch (const std::exception&) { /* no IMU extrinsics in calibration — raw chip frame */ }
 }
 
 // Read CAM_A factory intrinsics at the streamed size into `dev` (fx/fy/cx/cy). A wiped EEPROM or a
@@ -230,11 +279,16 @@ extern "C" int oak_has_imu(const oak_device* dev) {
     return (dev && dev->has_imu) ? 1 : 0;
 }
 
+extern "C" int oak_imu_aligned(const oak_device* dev) {
+    return (dev && dev->imu_aligned) ? 1 : 0;
+}
+
 // RGBD + H.264 modality: CAM_A colour (RGB888) + StereoDepth aligned to it (uint16 mm) + an on-device
 // H.264 colour stream, all DECOUPLED onto their own queues. Shares no nodes with oak_open_stereo — a
 // separate entry point so neither modality can regress the other.
 extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int height, int fps,
-                                     int enable_h264, int enable_depth, int video_only) {
+                                     int enable_h264, int enable_depth, int video_only,
+                                     int imu_hz) {
     try {
         auto dev = std::make_unique<oak_device>();
         dev->device = connect_device(device_id);
@@ -256,6 +310,8 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
             auto color = pipeline.create<dai::node::Camera>();
             color->build(dai::CameraBoardSocket::CAM_A);
             add_h264_encoder(pipeline, color, width, height, fps, dev.get());
+            add_imu_node(pipeline, dev.get(), imu_hz);
+            read_imu_rotation(dev.get(), dai::CameraBoardSocket::CAM_A);
             dev->has_depth = false;
             dev->has_sync = false;
             pipeline.start();
@@ -344,6 +400,8 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         if (enable_h264 != 0) {
             add_h264_encoder(pipeline, color, width, height, fps, dev.get());
         }
+        add_imu_node(pipeline, dev.get(), imu_hz);
+        read_imu_rotation(dev.get(), dai::CameraBoardSocket::CAM_A);
 
         pipeline.start();
         read_rgb_intrinsics(dev.get(), width, height);   // factory intrinsics of the aligned RGB camera
@@ -512,8 +570,21 @@ extern "C" int oak_poll_imu(oak_device* dev, oak_imu_sample* out, int max, int* 
             for (const auto& p : data->packets) {
                 oak_imu_sample s;
                 s.ts_ns = steady_to_epoch_ns(p.acceleroMeter.getTimestamp(), offset);
-                s.ax = p.acceleroMeter.x; s.ay = p.acceleroMeter.y; s.az = p.acceleroMeter.z;
-                s.gx = p.gyroscope.x;     s.gy = p.gyroscope.y;     s.gz = p.gyroscope.z;
+                const float ax = p.acceleroMeter.x, ay = p.acceleroMeter.y, az = p.acceleroMeter.z;
+                const float gx = p.gyroscope.x,     gy = p.gyroscope.y,     gz = p.gyroscope.z;
+                if (dev->imu_aligned) {
+                    // chip frame → camera optical frame (see read_imu_rotation)
+                    const float* R = dev->imu_rot;
+                    s.ax = R[0] * ax + R[1] * ay + R[2] * az;
+                    s.ay = R[3] * ax + R[4] * ay + R[5] * az;
+                    s.az = R[6] * ax + R[7] * ay + R[8] * az;
+                    s.gx = R[0] * gx + R[1] * gy + R[2] * gz;
+                    s.gy = R[3] * gx + R[4] * gy + R[5] * gz;
+                    s.gz = R[6] * gx + R[7] * gy + R[8] * gz;
+                } else {
+                    s.ax = ax; s.ay = ay; s.az = az;
+                    s.gx = gx; s.gy = gy; s.gz = gz;
+                }
                 dev->imu_pending.push_back(s);
             }
         }

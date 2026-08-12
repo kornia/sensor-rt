@@ -80,6 +80,10 @@ int oak_has_imu(const oak_device *dev);
  *   video_only   : build ONLY the H.264 encoder (no RGB888/depth): the device ships
  *                  just the small bitstream for low-bandwidth viewing. oak_poll_rgb/
  *                  _depth yield nothing; drain oak_poll_video.
+ *   imu_hz       : accelerometer + gyroscope rate (oak_poll_imu), same semantics as
+ *                  oak_open_stereo's. 0 disables the IMU node; a missing/failed IMU
+ *                  never costs the image streams (oak_has_imu()==0, streams run on).
+ *                  Works in video_only mode too.
  *
  * Auto-fall-back: if enable_depth is set but the device can't actually produce depth
  * (no stereo pair, or a wiped/blank calibration → fx=0), the pipeline silently drops
@@ -88,7 +92,8 @@ int oak_has_imu(const oak_device *dev);
  *
  * Returns NULL on failure (reason via oak_last_error). */
 oak_device *oak_open_rgbd(const char *device_id, int width, int height, int fps,
-                          int enable_h264, int enable_depth, int video_only);
+                          int enable_h264, int enable_depth, int video_only,
+                          int imu_hz);
 
 /* True (1) if StereoDepth is running (oak_poll_depth can yield aligned depth). */
 int oak_has_depth(const oak_device *dev);
@@ -158,10 +163,20 @@ void oak_frame_release(void *handle);
  * `max` samples, sets *n to how many were written (0 when none are queued or the
  * IMU isn't running). Returns 1 / 0 / -1 (error).
  *
+ * Sample frame: on the RGBD modality, when the device calibration carries the IMU
+ * extrinsics (oak_imu_aligned() == 1), samples are rotated into the CAM_A optical
+ * frame; otherwise (and always on the stereo modality) they are the raw IMU-chip
+ * frame, which is axis-permuted vs the camera by the board mounting.
+ *
  * The IMU reports far faster than the frame rate, so call this in a loop until
  * *n == 0 (or with a generous `max`) each iteration, otherwise the batch queue
  * overflows and samples are silently dropped. */
 int oak_poll_imu(oak_device *dev, oak_imu_sample *out, int max, int *n);
+
+/* True (1) when oak_poll_imu samples are calibration-rotated into the camera
+ * optical frame (RGBD modality with IMU extrinsics in the EEPROM). 0 = raw
+ * IMU-chip frame. */
+int oak_imu_aligned(const oak_device *dev);
 
 /* Recover a PoE OAK wedged in bootloader state: reboot it via a bootloader open+drop so the next
  * oak_open succeeds. `target` = IP/name or deviceId (NULL = first wedged device). 1 = kicked (wait ~8s),

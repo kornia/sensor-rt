@@ -66,6 +66,9 @@ pub struct OakSource {
     seq: u64,
     intr: OakIntrinsics,
     has_imu: bool,
+    /// IMU samples are calibration-rotated into the camera optical frame (RGBD modality only;
+    /// false = raw IMU-chip frame — see [`next_imu`](Self::next_imu)).
+    imu_aligned: bool,
     /// Reused staging buffer for `next_imu`, so draining inertial samples every
     /// frame costs no allocation once it has grown.
     imu_scratch: Vec<ffi::OakImuSample>,
@@ -101,6 +104,7 @@ impl OakSource {
             seq: 0,
             intr: OakIntrinsics { fx, fy, cx, cy },
             has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
+            imu_aligned: unsafe { ffi::oak_imu_aligned(dev) } != 0,
             imu_scratch: Vec::new(),
             has_depth: false,
             has_video: false,

@@ -26,6 +26,14 @@ pub struct ImuSample {
 }
 
 impl OakSource {
+    /// Whether IMU samples are calibration-rotated into the camera optical frame
+    /// (RGBD modality with IMU extrinsics in the EEPROM). `false` = raw IMU-chip
+    /// frame, axis-permuted vs the camera by the board mounting — consumers doing
+    /// gyro priors / gravity alignment should warn and expect a tilted gauge.
+    pub fn imu_aligned(&self) -> bool {
+        self.imu_aligned
+    }
+
     /// Drain queued IMU samples, appending them to `out` in capture order;
     /// returns how many were appended. Non-blocking.
     ///

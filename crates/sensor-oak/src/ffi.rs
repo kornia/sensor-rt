@@ -42,6 +42,10 @@ extern "C" {
 
     pub fn oak_has_imu(dev: *const OakDevice) -> c_int;
 
+    /// 1 when IMU samples are calibration-rotated into the camera optical frame (RGBD modality with
+    /// IMU extrinsics in the EEPROM); 0 = raw IMU-chip frame. See `oak_bridge.h`.
+    pub fn oak_imu_aligned(dev: *const OakDevice) -> c_int;
+
     /// Open the RGBD (CAM_A colour + aligned StereoDepth) + on-device H.264 modality. See `oak_bridge.h`.
     pub fn oak_open_rgbd(
         device_id: *const c_char,
@@ -51,6 +55,7 @@ extern "C" {
         enable_h264: c_int,
         enable_depth: c_int,
         video_only: c_int,
+        imu_hz: c_int,
     ) -> *mut OakDevice;
 
     pub fn oak_has_depth(dev: *const OakDevice) -> c_int;

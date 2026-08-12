@@ -26,27 +26,34 @@ impl OakSource {
     /// at runtime and crash the pipeline. Even with `depth = true` the device auto-falls-back to
     /// video-only if it can't actually produce depth (mono, or blank calibration); check
     /// [`has_sync`](Self::has_sync) after opening to pick the drain loop.
+    ///
+    /// `imu_hz > 0` also runs the on-board IMU (accel + gyro) on its own queue, drained with
+    /// [`next_imu`](Self::next_imu) on the same host-epoch timeline as the frames; `0` disables it.
+    /// A board without an IMU degrades ([`has_imu`](Self::has_imu) is `false`) — never an error.
     pub fn open_rgbd(
         device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
         depth: bool,
+        imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        Self::open_rgbd_inner(device, width, height, fps, depth, false)
+        Self::open_rgbd_inner(device, width, height, fps, depth, false, imu_hz)
     }
 
     /// Open **video-only**: build ONLY the on-device H.264 encoder — no RGB888/depth output — so the
     /// device transmits just the small bitstream (low-bandwidth viewing over USB2 / a shared gigabit
     /// link, where raw RGBD would saturate it). [`next_rgb`](Self::next_rgb) / [`next_depth`](Self::next_depth)
-    /// yield nothing; drain [`next_video`](Self::next_video). `device`: see [`open_rgbd`](Self::open_rgbd).
+    /// yield nothing; drain [`next_video`](Self::next_video). `device` and `imu_hz`: see
+    /// [`open_rgbd`](Self::open_rgbd) — the IMU runs fine alongside the video-only pipeline.
     pub fn open_rgbd_video(
         device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
+        imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        Self::open_rgbd_inner(device, width, height, fps, false, true)
+        Self::open_rgbd_inner(device, width, height, fps, false, true, imu_hz)
     }
 
     fn open_rgbd_inner(
@@ -56,11 +63,12 @@ impl OakSource {
         fps: u32,
         depth: bool,
         video_only: bool,
+        imu_hz: u32,
     ) -> Result<Self, BoxError> {
         let id_c = device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         // H.264 is always on in this modality — the whole point is the efficient colour stream.
-        let dev = unsafe {
+        let open = |hz: u32| unsafe {
             ffi::oak_open_rgbd(
                 id_ptr,
                 width as i32,
@@ -69,8 +77,16 @@ impl OakSource {
                 1,
                 depth as i32,
                 video_only as i32,
+                hz as i32,
             )
         };
+        let mut dev = open(imu_hz);
+        if dev.is_null() && imu_hz > 0 {
+            // The shim guards IMU-node *creation*, but an IMU-less board can also fail later, at
+            // pipeline start — outside that guard. "A failed IMU never costs the image streams"
+            // means retrying once without the IMU node before giving up (has_imu comes back false).
+            dev = open(0);
+        }
         if dev.is_null() {
             return Err(last_error("oak_open_rgbd"));
         }
@@ -93,7 +109,8 @@ impl OakSource {
             height,
             seq: 0,
             intr: OakIntrinsics { fx, fy, cx, cy },
-            has_imu: false,
+            has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
+            imu_aligned: unsafe { ffi::oak_imu_aligned(dev) } != 0,
             imu_scratch: Vec::new(),
             has_depth: unsafe { ffi::oak_has_depth(dev) } != 0,
             has_video: unsafe { ffi::oak_has_video(dev) } != 0,
