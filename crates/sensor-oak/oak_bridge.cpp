@@ -123,6 +123,10 @@ struct oak_device {
     bool has_video = false;   // on-device H.264 colour stream running
     bool has_sync = false;    // colour(+depth) pipeline present; false = video-only fallback
     float fx = 0, fy = 0, cx = 0, cy = 0;
+    // Full CAM_B/CAM_C calibration, read once at oak_open_stereo (readCalibration() is an RPC, and
+    // a host rectifier needs these numbers before the first frame). `valid` stays 0 on the RGBD
+    // modality and on a wiped EEPROM.
+    oak_stereo_calib stereo_calib{};
 };
 
 // Attach an NV12 output of `color` → a hardware H.264 encoder, handing the bitstream queue to `dev`.
@@ -262,7 +266,75 @@ static void read_rgb_intrinsics(oak_device* dev, const dai::CalibrationHandler& 
     } catch (const std::exception&) { /* intrinsics stay zero */ }
 }
 
-// STEREO+IMU modality: the two mono cameras as a Sync'd RGB888 pair + the IMU on its own queue.
+// Read the FULL CAM_B/CAM_C calibration into `dev` for a host stereo rectifier: per-eye intrinsics
+// at the streamed size, per-eye distortion, and the CALIBRATED left->right extrinsic in METRES.
+//
+// Both depthai defaults on the extrinsics getter are traps we must not take: useSpecTranslation
+// defaults to true (board design numbers, not the measured calibration) and the length unit
+// defaults to centimetres. Either one silently rescales the entire reconstruction, so both are
+// passed explicitly. The baseline is derived from this same extrinsic rather than from
+// getBaselineDistance() (which has the identical two defaults) so rotation and baseline can never
+// come from different sources.
+//
+// A wiped/blank EEPROM leaves valid = 0 with everything zeroed; the caller decides whether that is
+// fatal (it is, for stereo VIO), so this does not fail the open.
+static void read_stereo_calib(oak_device* dev, const dai::CalibrationHandler& calib,
+                              int width, int height) {
+    const auto lsock = dai::CameraBoardSocket::CAM_B;
+    const auto rsock = dai::CameraBoardSocket::CAM_C;
+    oak_stereo_calib c{};
+    c.width = width;
+    c.height = height;
+    try {
+        auto kl = calib.getCameraIntrinsics(lsock, width, height);
+        auto kr = calib.getCameraIntrinsics(rsock, width, height);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                c.left_k[i * 3 + j] = kl[i][j];
+                c.right_k[i * 3 + j] = kr[i][j];
+            }
+        }
+
+        auto dl = calib.getDistortionCoefficients(lsock);
+        auto dr = calib.getDistortionCoefficients(rsock);
+        c.left_n_dist = (int)std::min<size_t>(dl.size(), 14);
+        c.right_n_dist = (int)std::min<size_t>(dr.size(), 14);
+        for (int i = 0; i < c.left_n_dist; ++i) c.left_dist[i] = dl[i];
+        for (int i = 0; i < c.right_n_dist; ++i) c.right_dist[i] = dr[i];
+        c.left_model = (int)calib.getDistortionModel(lsock);
+        c.right_model = (int)calib.getDistortionModel(rsock);
+
+        auto e = calib.getCameraExtrinsics(lsock, rsock, /*useSpecTranslation=*/false,
+                                           dai::LengthUnit::METER);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) c.t_left_right[i * 4 + j] = e[i][j];
+        const float tx = c.t_left_right[3], ty = c.t_left_right[7], tz = c.t_left_right[11];
+        c.baseline_m = std::sqrt(tx * tx + ty * ty + tz * tz);
+
+        c.valid = 1;
+    } catch (const std::exception& ex) {
+        // Zero the partial read rather than hand out half a calibration: a rectifier built from a
+        // valid K and a zero extrinsic produces NaN maps, which is far harder to diagnose than a
+        // flat "no calibration".
+        c = oak_stereo_calib{};
+        c.width = width;
+        c.height = height;
+        set_err(std::string("stereo calibration unavailable: ") + ex.what());
+    }
+    dev->stereo_calib = c;
+}
+
+extern "C" int oak_stereo_calibration(const oak_device* dev, oak_stereo_calib* out) {
+    if (!dev || !out) { set_err("null device or out pointer"); return -1; }
+    if (!dev->stereo_calib.valid) {
+        set_err("no stereo calibration (not a stereo device, or a wiped/blank EEPROM)");
+        return -1;
+    }
+    *out = dev->stereo_calib;
+    return 0;
+}
+
+// STEREO+IMU modality: the two mono cameras as a Sync'd GRAY8 pair + the IMU on its own queue.
 // Shares no nodes with oak_open's colour/depth pipeline — deliberately a separate entry point so the
 // working RGBD and H.264 paths cannot regress.
 extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int height,
@@ -295,12 +367,21 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         auto right = pipeline.create<dai::node::Camera>();
         right->build(dai::CameraBoardSocket::CAM_C);
         const std::pair<uint32_t, uint32_t> size((uint32_t)width, (uint32_t)height);
+        //
+        // enableUndistortion is deliberately FALSE here (it is true on the RGBD colour path).
+        // depthai's Camera node cannot rectify: ImageManip builds its map with
+        // cv::initUndistortRectifyMap(..., R = cv::Mat(), ...) — an identity rectifying rotation —
+        // so the two eyes come out undistorted but NOT row-aligned, which is useless to a stereo
+        // matcher. A stereo consumer therefore rectifies on the host from
+        // oak_stereo_calibration(), and feeding it pixels depthai had already undistorted would
+        // apply the distortion correction TWICE, silently (the output frame carries cleared
+        // distortion coefficients, so nothing downstream can tell). Raw in, host-rectified out.
         auto* lo = left->requestOutput(size, dai::ImgFrame::Type::GRAY8,
                                        dai::ImgResizeMode::CROP, (float)fps,
-                                       /*enableUndistortion=*/true);
+                                       /*enableUndistortion=*/false);
         auto* ro = right->requestOutput(size, dai::ImgFrame::Type::GRAY8,
                                         dai::ImgResizeMode::CROP, (float)fps,
-                                        /*enableUndistortion=*/true);
+                                        /*enableUndistortion=*/false);
 
         // Sync node: emit {left,right} as ONE MessageGroup so the host never has to pair by timestamp.
         // The eyes are frame-locked by the shared stereo trigger, so the threshold only has to absorb
@@ -335,6 +416,11 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
             dev->fx = k[0][0]; dev->fy = k[1][1];
             dev->cx = k[0][2]; dev->cy = k[1][2];
         } catch (const std::exception&) { /* intrinsics stay zero — uncalibrated board */ }
+
+        // Full stereo calibration for a HOST rectifier (the pair above is raw). Read from the same
+        // handler, so it costs no extra RPC. Failure is non-fatal: a stereo consumer will refuse to
+        // start on oak_stereo_calibration() == -1, but a plain "two raw eyes" consumer still works.
+        read_stereo_calib(dev.get(), calib, width, height);
 
         return dev.release();
     } catch (const std::exception& e) { set_err(e.what()); return nullptr; }

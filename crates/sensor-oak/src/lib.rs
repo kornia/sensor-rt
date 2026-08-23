@@ -32,7 +32,12 @@ pub(crate) fn last_error(what: &str) -> BoxError {
 /// Boxed error, `Send + Sync` so a source can be moved between threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Pinhole intrinsics of an OAK camera, in pixels, at the streamed resolution.
+/// Pinhole intrinsics of an OAK camera, in pixels, at the **requested** resolution.
+///
+/// Which camera depends on the modality — CAM_A on RGBD, CAM_B (left) on stereo — and the values
+/// are always the RAW factory ones: distorted, and on the stereo path unrectified, so they are
+/// *not* the intrinsics a rectified stereo consumer should use (see
+/// [`OakStereoCalib`]). A wiped EEPROM yields all zeros without an error, so check `fx > 0`.
 ///
 /// Defined here rather than pulled from an inference crate: this driver is a plain
 /// producer and must not drag a TensorRT runtime into anything that merely wants
@@ -50,10 +55,12 @@ pub struct OakIntrinsics {
 // Raw FFI over the depthai-core C shim (`oak_bridge.h`), built by this crate's
 // build.rs. Private: unsafe pointer soup is an implementation detail, and every
 // caller goes through the safe wrappers below.
+mod calib;
 mod ffi;
 mod imu;
 mod rgbd;
 mod stereo;
+pub use calib::{OakCameraCalib, OakCameraModel, OakStereoCalib};
 pub use imu::ImuSample;
 pub use stereo::OakStereoFrame;
 

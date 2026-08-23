@@ -33,11 +33,61 @@ typedef struct {
     float gx, gy, gz;  /* gyroscope, rad/s */
 } oak_imu_sample;
 
+/* Full factory stereo calibration, read once at oak_open_stereo and cached.
+ *
+ * This is what a HOST rectifier needs, and the stereo pair needs one: depthai's
+ * Camera node can only UNDISTORT (it calls initUndistortRectifyMap with R =
+ * identity), never rectify — only StereoDepth applies the rectification
+ * rotations. So oak_open_stereo delivers RAW distorted GRAY8 and the consumer
+ * builds the rectifying maps from these numbers.
+ *
+ * Both defaults depthai chose for the extrinsics are traps and are NOT used
+ * here: useSpecTranslation defaults to TRUE (board design data, not the measured
+ * calibration) and the length unit defaults to CENTIMETRES. This struct is
+ * always calibrated translation in METRES.
+ *
+ *   width/height  : the resolution the intrinsics are valid at (what
+ *                   oak_open_stereo was asked to stream).
+ *   *_k           : row-major 3x3 [[fx,0,cx],[0,fy,cy],[0,0,1]], pixels.
+ *   *_dist        : OpenCV order [k1,k2,p1,p2,k3,k4,k5,k6,s1,s2,s3,s4,taux,tauy]
+ *                   — note p1,p2 sit at indices 2,3. Resolution-independent.
+ *                   *_n_dist says how many the EEPROM actually carried; a
+ *                   consumer whose model has no thin-prism/tilt terms must check
+ *                   indices 8.. are zero rather than dropping them silently.
+ *   *_model       : dai::CameraModel (0 = Perspective, 1 = Fisheye). A rectifier
+ *                   built on Brown-Conrady must reject anything but 0.
+ *   t_left_right  : row-major 4x4, X_right = T * X_left, translation in METRES.
+ *   baseline_m    : ||translation of t_left_right||, metres. Derived from the
+ *                   SAME extrinsic as the rotation, so it can never disagree
+ *                   with it (getBaselineDistance() can, and defaults to spec cm).
+ *   valid         : 1 only if every field above was read. 0 = wiped/blank EEPROM
+ *                   (the fields are then zeroed, NOT left stale). */
+typedef struct {
+    int   width, height;
+    float left_k[9], right_k[9];
+    float left_dist[14], right_dist[14];
+    int   left_n_dist, right_n_dist;
+    int   left_model, right_model;
+    float t_left_right[16];
+    float baseline_m;
+    int   valid;
+} oak_stereo_calib;
+
+/* Copy out the cached stereo calibration (see oak_stereo_calib). Returns 0 on
+ * success, -1 on a null argument, a non-stereo device, or a device whose
+ * calibration could not be read (reason via oak_last_error). */
+int oak_stereo_calibration(const oak_device *dev, oak_stereo_calib *out);
+
 /* Open an OAK in the STEREO+IMU modality: the two mono cameras (CAM_B = left,
- * CAM_C = right) streamed as a time-synced RGB888 pair, plus the on-board IMU on
+ * CAM_C = right) streamed as a time-synced GRAY8 pair, plus the on-board IMU on
  * its own queue. NO colour camera, NO StereoDepth, NO encoder — this is the raw
  * stereo + inertial source for VIO / stereo-feature work, not the depth path
  * (for aligned depth use oak_open with enable_depth).
+ *
+ * The pair is RAW: neither undistorted nor rectified. depthai's Camera node can
+ * only undistort (R = identity), which is not enough for a stereo consumer and
+ * would silently DOUBLE-correct anything the host rectifies afterwards. Pair the
+ * frames with oak_stereo_calibration and rectify on the host.
  *
  * A separate entry point rather than more flags on oak_open: the pipeline shares
  * no nodes with it, and the RGBD/H.264 paths must not regress.
@@ -143,7 +193,10 @@ int oak_poll_depth(oak_device *dev, const uint16_t **depth_mm,
 int oak_poll_video(oak_device *dev, const uint8_t **data, int *len, uint64_t *ts_ns);
 
 /* Factory intrinsics of the LEFT (CAM_B) camera at the streamed size — the stereo
- * reference frame. Returns 0 on success, -1 on error. */
+ * reference frame. RAW, i.e. distorted and unrectified: a stereo consumer wants
+ * oak_stereo_calibration + a host rectifier, whose virtual focal differs from this
+ * fx. Zeros (with a 0 return!) on a wiped EEPROM — check fx > 0.
+ * Returns 0 on success, -1 on error. */
 int oak_intrinsics(const oak_device *dev,
                    float *fx, float *fy, float *cx, float *cy);
 

@@ -29,7 +29,56 @@ pub struct OakImuSample {
     pub gz: f32,
 }
 
+/// Full factory stereo calibration, cached at open. Mirrors `oak_stereo_calib` in `oak_bridge.h` —
+/// `#[repr(C)]`, and the field order must stay in lockstep with it.
+///
+/// Row-major throughout; `t_left_right` is `X_right = T * X_left` with the translation in METRES,
+/// taken from the *calibrated* (not board-spec) extrinsic.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OakStereoCalibRaw {
+    pub width: c_int,
+    pub height: c_int,
+    pub left_k: [f32; 9],
+    pub right_k: [f32; 9],
+    pub left_dist: [f32; 14],
+    pub right_dist: [f32; 14],
+    pub left_n_dist: c_int,
+    pub right_n_dist: c_int,
+    pub left_model: c_int,
+    pub right_model: c_int,
+    pub t_left_right: [f32; 16],
+    pub baseline_m: f32,
+    pub valid: c_int,
+}
+
+impl Default for OakStereoCalibRaw {
+    fn default() -> Self {
+        // All-zero is exactly what the shim writes for "no calibration", so this doubles as a safe
+        // out-param initialiser: a shim path that returns -1 without writing still leaves it
+        // invalid rather than uninitialised.
+        Self {
+            width: 0,
+            height: 0,
+            left_k: [0.0; 9],
+            right_k: [0.0; 9],
+            left_dist: [0.0; 14],
+            right_dist: [0.0; 14],
+            left_n_dist: 0,
+            right_n_dist: 0,
+            left_model: 0,
+            right_model: 0,
+            t_left_right: [0.0; 16],
+            baseline_m: 0.0,
+            valid: 0,
+        }
+    }
+}
+
 extern "C" {
+
+    /// Copy out the cached CAM_B/CAM_C calibration. 0 on success, -1 when unavailable.
+    pub fn oak_stereo_calibration(dev: *const OakDevice, out: *mut OakStereoCalibRaw) -> c_int;
 
     /// Open the stereo (CAM_B/CAM_C) + IMU modality. See `oak_bridge.h`.
     pub fn oak_open_stereo(

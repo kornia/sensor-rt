@@ -48,7 +48,10 @@ impl Drop for RetainedFrame {
 ///
 /// Both spans are GRAY8 (`w*h`, tightly packed) — these are monochrome sensors, so
 /// one byte per pixel is the whole signal — and are **valid only until the next
-/// [`OakSource::next_stereo`]**. The `'a` lifetime
+/// [`OakSource::next_stereo`]**. That applies to the borrowed *slices*
+/// ([`left`](Self::left) / [`right`](Self::right)) only: the [`Image`]s from
+/// [`left_image`](Self::left_image) / [`right_image`](Self::right_image) carry the frame's own
+/// retain handle and outlive it, so there is no need to copy pixels out defensively. The `'a` lifetime
 /// ties this frame to the `&mut OakSource` borrow, so the borrow checker forbids
 /// pulling the next pair while this one is still held — the same contract, and
 /// the same enforcement, as [`OakRgbFrame`](crate::OakRgbFrame).
@@ -139,9 +142,15 @@ impl OakStereoFrame<'_> {
 }
 
 impl OakSource {
-    /// Open the **stereo + IMU** modality: a Sync'd left/right RGB888 pair at
+    /// Open the **stereo + IMU** modality: a Sync'd left/right GRAY8 pair at
     /// `fps`, plus the IMU at `imu_hz` (accelerometer + gyroscope). `device`
     /// selects the camera exactly as in [`OakSource::open`].
+    ///
+    /// The pair is **raw**: neither undistorted nor rectified. depthai's Camera
+    /// node can only undistort (its rectifying rotation is hard-wired to
+    /// identity), which no stereo matcher can use, and pre-undistorted pixels
+    /// would then be silently double-corrected by a host rectifier. Pair this
+    /// with [`stereo_calib`](OakSource::stereo_calib) and rectify on the host.
     ///
     /// Takes **no CUDA stream** — see the module docs: the consumer owns the
     /// upload, because it alone knows which stream each eye belongs on.
