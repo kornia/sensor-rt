@@ -108,7 +108,7 @@ int oak_stereo_calibration(const oak_device *dev, oak_stereo_calib *out);
  *
  * Returns NULL on failure (reason via oak_last_error). */
 oak_device *oak_open_stereo(const char *device_id, int width, int height,
-                            int fps, int imu_hz);
+                            int fps, int imu_hz, int enable_h264);
 
 /* True (1) if the on-board IMU is running (oak_poll_imu yields samples). 0 on a
  * device with no IMU, or when the IMU node failed to start — the stereo pair is

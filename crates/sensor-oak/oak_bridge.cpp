@@ -338,7 +338,7 @@ extern "C" int oak_stereo_calibration(const oak_device* dev, oak_stereo_calib* o
 // Shares no nodes with oak_open's colour/depth pipeline — deliberately a separate entry point so the
 // working RGBD and H.264 paths cannot regress.
 extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int height,
-                                       int fps, int imu_hz) {
+                                       int fps, int imu_hz, int enable_h264) {
     try {
         auto dev = std::make_unique<oak_device>();
         dev->device = connect_device(device_id);
@@ -397,6 +397,25 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         // readCalibration() is an RPC per call, and a wiped EEPROM comes back as an empty
         // handler (its getters then throw, handled at each use) rather than throwing here.
         auto calib = dev->device->readCalibration();
+
+        // Optional on-device H.264 of the COLOUR camera (CAM_A), viz-only: the encoder runs on
+        // the device and only the ~OAK_H264_KBPS bitstream crosses the link, so it costs the
+        // stereo pair nothing on the host. Same degrade rule as the IMU: a board without CAM_A
+        // skips the stream (has_video stays false), it never costs the stereo pair.
+        if (enable_h264) {
+            bool has_a = false;
+            for (auto sck : dev->device->getConnectedCameras()) {
+                if (sck == dai::CameraBoardSocket::CAM_A) has_a = true;
+            }
+            if (has_a) {
+                auto color = pipeline.create<dai::node::Camera>();
+                color->build(dai::CameraBoardSocket::CAM_A);
+                add_h264_encoder(pipeline, color, width, height, fps > 0 ? fps : 30, dev.get());
+            } else {
+                std::fprintf(stderr,
+                             "sensor-oak: no CAM_A on this board — skipping the H.264 viz stream\n");
+            }
+        }
 
         // IMU is OPTIONAL: not every OAK carries one — add_imu_node preflights with
         // getConnectedIMU() and skips the node on an IMU-less board, so a missing IMU never

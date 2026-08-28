@@ -165,12 +165,17 @@ impl OakSource {
     /// there is no meaningful degraded mode for a *stereo* source.
     ///
     /// `imu_hz = 0` skips the IMU node entirely.
+    ///
+    /// `h264` additionally runs the on-device encoder over the COLOUR camera (viz stream,
+    /// drained with [`next_video`](OakSource::next_video)); a board without CAM_A degrades
+    /// to stereo-only ([`has_video`](OakSource::has_video) stays `false`).
     pub fn open_stereo(
         device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
         imu_hz: u32,
+        h264: bool,
     ) -> Result<Self, BoxError> {
         let id_c = crate::device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
@@ -181,6 +186,7 @@ impl OakSource {
                 height as i32,
                 fps as i32,
                 imu_hz as i32,
+                h264 as i32,
             )
         };
         if dev.is_null() {

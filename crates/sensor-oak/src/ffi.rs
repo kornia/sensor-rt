@@ -87,6 +87,7 @@ extern "C" {
         height: c_int,
         fps: c_int,
         imu_hz: c_int,
+        enable_h264: c_int,
     ) -> *mut OakDevice;
 
     pub fn oak_has_imu(dev: *const OakDevice) -> c_int;
