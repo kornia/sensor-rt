@@ -132,9 +132,9 @@ struct oak_device {
 // Attach an NV12 output of `color` → a hardware H.264 encoder, handing the bitstream queue to `dev`.
 // Shared by the video-only and decoupled RGBD paths so their encoder settings (BASELINE for
 // Foxglove's decoder, ~4 keyframes/s for fast mid-stream join, OAK_H264_KBPS) can never drift apart.
-// `fps` is clamped to >= 1 by the caller.
 static void add_h264_encoder(dai::Pipeline& pipeline, const std::shared_ptr<dai::node::Camera>& color,
                              int width, int height, int fps, oak_device* dev) {
+    if (fps <= 0) fps = 30;
     auto* nv12_out = color->requestOutput(
         std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
         dai::ImgFrame::Type::NV12, dai::ImgResizeMode::CROP, (float)fps, /*undistort=*/true);
@@ -347,9 +347,10 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
 
         // The stereo pair is the whole point of this modality — unlike depth (which oak_open silently
         // falls back from), a missing mono socket here has no meaningful degraded mode. Fail loudly.
-        bool has_b = false, has_c = false;
+        bool has_a = false, has_b = false, has_c = false;
         for (auto s : dev->device->getConnectedCameras()) {
-            if (s == dai::CameraBoardSocket::CAM_B) has_b = true;
+            if (s == dai::CameraBoardSocket::CAM_A) has_a = true;
+            else if (s == dai::CameraBoardSocket::CAM_B) has_b = true;
             else if (s == dai::CameraBoardSocket::CAM_C) has_c = true;
         }
         if (!has_b || !has_c) {
@@ -403,14 +404,10 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         // stereo pair nothing on the host. Same degrade rule as the IMU: a board without CAM_A
         // skips the stream (has_video stays false), it never costs the stereo pair.
         if (enable_h264) {
-            bool has_a = false;
-            for (auto sck : dev->device->getConnectedCameras()) {
-                if (sck == dai::CameraBoardSocket::CAM_A) has_a = true;
-            }
             if (has_a) {
                 auto color = pipeline.create<dai::node::Camera>();
                 color->build(dai::CameraBoardSocket::CAM_A);
-                add_h264_encoder(pipeline, color, width, height, fps > 0 ? fps : 30, dev.get());
+                add_h264_encoder(pipeline, color, width, height, fps, dev.get());
             } else {
                 std::fprintf(stderr,
                              "sensor-oak: no CAM_A on this board — skipping the H.264 viz stream\n");
@@ -429,7 +426,8 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         pipeline.start();
 
         // Left (CAM_B) is the reference frame of a stereo rig, so oak_intrinsics reports ITS
-        // intrinsics in this modality (CAM_A, the colour camera, isn't even in this pipeline).
+        // intrinsics in this modality — never CAM_A's, whose only role here is the optional
+        // viz-only H.264 stream.
         try {
             auto k = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, width, height);
             dev->fx = k[0][0]; dev->fy = k[1][1];
