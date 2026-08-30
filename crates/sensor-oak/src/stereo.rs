@@ -179,15 +179,7 @@ impl OakSource {
     ) -> Result<Self, BoxError> {
         let id_c = crate::device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        // Same clamp as the RGBD path: the BNO086 gyro tops out at 400 Hz, and a wilder
-        // rate makes the firmware's sensor-enable throw at pipeline start — which on this
-        // path would take the whole STEREO open down over an IMU rate.
-        let imu_hz = if imu_hz > 400 {
-            eprintln!("sensor-oak: imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
-            400
-        } else {
-            imu_hz
-        };
+        let imu_hz = crate::clamp_imu_hz(imu_hz);
         let dev = unsafe {
             crate::ffi::oak_open_stereo(
                 id_ptr,

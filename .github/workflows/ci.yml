@@ -38,7 +38,8 @@ jobs:
   # Register a runner on the Orin with labels [self-hosted, jetson] and provide
   # the depthai vendor libs, then remove the `if: false` guard.
   jetson:
-    # NOTE: while this is disabled, `check` above is the ONLY job that compiles anything.
+    # NOTE: while this is disabled, NOTHING in CI compiles — `fmt` only parses and
+    # `deps` only resolves. A signature change that misses a caller reaches main.
     if: false # enable once a self-hosted Jetson runner is registered
     runs-on: [self-hosted, jetson]
     env:

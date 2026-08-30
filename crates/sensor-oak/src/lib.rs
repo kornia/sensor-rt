@@ -12,6 +12,17 @@
 
 use std::ffi::CString;
 
+
+/// The BNO086 gyro tops out at 400 Hz; a wilder rate makes the firmware's sensor-enable
+/// throw at `pipeline.start()`, which fails the WHOLE open — losing the imagery over an
+/// IMU rate. Clamped on both open paths rather than surfaced as a device error.
+pub(crate) fn clamp_imu_hz(imu_hz: u32) -> u32 {
+    if imu_hz > 400 {
+        eprintln!("sensor-oak: imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
+        return 400;
+    }
+    imu_hz
+}
 /// Turn an optional device id into a C string (`None` → NULL, "first available").
 /// The caller keeps it alive across the FFI call.
 pub(crate) fn device_id_cstring(device: Option<&str>) -> Result<Option<CString>, BoxError> {

@@ -359,8 +359,8 @@ extern "C" int oak_stereo_calibration(const oak_device* dev, oak_stereo_calib* o
 // working RGBD and H.264 paths cannot regress.
 extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int height,
                                        int fps, int imu_hz, int enable_h264) {
-    // Same guard oak_open_rgbd applies: a zero/negative rate reaches requestOutput as a
-    // float and fails the whole open for a reason nothing in the error names.
+    // Same guard oak_open_rgbd applies: a zero/negative rate would poison the encoder
+    // preset and the requestOutput rate, failing the open for a reason nothing names.
     if (fps < 1) fps = 30;
     try {
         auto dev = std::make_unique<oak_device>();
@@ -605,7 +605,17 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         // hardware H.264 encoder → its own queue. BASELINE (no B-frames) for Foxglove's decoder; a
         // keyframe ~4×/s lets a viewer/recorder join mid-stream.
         if (enable_h264 != 0) {
-            add_h264_encoder(pipeline, color, width, height, fps, dev.get());
+            // OPTIONAL here (unlike the video-only modality, where the stream IS the point),
+            // so it degrades like the stereo path: a board that rejects the NV12 output must
+            // not cost the caller depth + RGB. No capability query exists for the encoder the
+            // way getConnectedIMU() preflights the IMU, so this attempts and catches.
+            try {
+                add_h264_encoder(pipeline, color, width, height, fps, dev.get());
+            } catch (const std::exception& ex) {
+                std::fprintf(stderr,
+                             "sensor-oak: H.264 stream unavailable (%s) — continuing without it\n",
+                             ex.what());
+            }
         }
         add_imu_node(pipeline, dev.get(), imu_hz);
         read_imu_rotation(dev.get(), calib, dai::CameraBoardSocket::CAM_A);

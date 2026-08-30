@@ -80,7 +80,8 @@ int oak_stereo_calibration(const oak_device *dev, oak_stereo_calib *out);
 
 /* Open an OAK in the STEREO+IMU modality: the two mono cameras (CAM_B = left,
  * CAM_C = right) streamed as a time-synced GRAY8 pair, plus the on-board IMU on
- * its own queue. NO StereoDepth; the colour camera + encoder attach ONLY when enable_h264 asks (viz stream, degrades without CAM_A) — this is the raw
+ * its own queue. NO StereoDepth. The colour camera + encoder attach ONLY when
+ * enable_h264 asks (viz stream; degrades to stereo-only without CAM_A) — this is the raw
  * stereo + inertial source for VIO / stereo-feature work, not the depth path
  * (for aligned depth use oak_open with enable_depth).
  *

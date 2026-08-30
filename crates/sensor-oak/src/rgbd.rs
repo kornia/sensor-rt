@@ -72,14 +72,7 @@ impl OakSource {
     ) -> Result<Self, BoxError> {
         let id_c = device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        // The BNO086 gyro tops out at 400 Hz — a wilder rate would just make the firmware's
-        // sensor-enable fail at pipeline start, so clamp here rather than surface a device error.
-        let imu_hz = if imu_hz > 400 {
-            eprintln!("sensor-oak: imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
-            400
-        } else {
-            imu_hz
-        };
+        let imu_hz = crate::clamp_imu_hz(imu_hz);
         // H.264 is always on in this modality — the whole point is the efficient colour stream.
         // No open-retry here: the shim preflights the IMU with getConnectedIMU() before building
         // the node, so an IMU-less board already degrades inside ONE open. A failure at this
