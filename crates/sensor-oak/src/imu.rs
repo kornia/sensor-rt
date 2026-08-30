@@ -63,7 +63,20 @@ impl OakSource {
         let rc = unsafe {
             crate::ffi::oak_poll_imu(self.dev, self.imu_scratch.as_mut_ptr(), cap as i32, &mut n)
         };
-        if rc != 1 || n <= 0 {
+        if rc != 1 {
+            // Surface the first shim failure instead of reading as a quiet sensor forever;
+            // rc == -1 is an exception inside oak_poll_imu, not "nothing queued".
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "sensor-oak: oak_poll_imu failed: {}",
+                    crate::last_error("oak_poll_imu")
+                );
+            }
+            return 0;
+        }
+        if n <= 0 {
             return 0;
         }
         let n = (n as usize).min(cap);

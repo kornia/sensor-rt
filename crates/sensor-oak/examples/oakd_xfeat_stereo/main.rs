@@ -88,7 +88,7 @@ fn main() -> Result<(), BoxError> {
     // ── camera ────────────────────────────────────────────────────────────────
     // Host-only by design: the source hands out spans, and *we* decide which CUDA
     // stream each eye lands on — which is the whole basis of the overlap below.
-    let mut cam = OakSource::open_stereo(None, w, h, fps, imu_hz)?;
+    let mut cam = OakSource::open_stereo(None, w, h, fps, imu_hz, false)?;
     println!(
         "OAK stereo up: {}×{} @{fps}  imu={}  (CAM_B fx={:.1})",
         cam.width(),

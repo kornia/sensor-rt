@@ -96,11 +96,19 @@ static bool device_has_stereo(const std::shared_ptr<dai::Device>& d,
 
 struct oak_device {
     std::shared_ptr<dai::Device> device;
+    // WHY the stereo calibration read failed (empty = it didn't): surfaced by
+    // oak_stereo_calibration instead of a generic guess, and kept off the thread-local
+    // error slot so a successful open doesn't leave a stale message there.
+    std::string stereo_calib_err;
     std::unique_ptr<dai::Pipeline> pipeline;
     // On-board IMU, SHARED by both modalities (optional in each):
     std::shared_ptr<dai::MessageQueue> imu_q;    // IMUData batches, far faster than the frame rate
     // IMU samples popped off the queue but not yet handed to the caller (see oak_poll_imu).
     std::vector<oak_imu_sample> imu_pending;
+    // Packets dropped by the zero-timestamp gate below — surfaced so a half-rate IMU (the
+    // gate eating every packet where one report is a default-initialised hole) is visible
+    // instead of reading as "firmware delivers 98 Hz".
+    uint64_t imu_ts_skipped = 0;
     bool has_imu = false;     // on-board IMU running (optional in both modalities)
     // IMU-chip → camera-optical rotation (row-major) applied to every sample in oak_poll_imu.
     // Identity + imu_aligned=false when the calibration carries no IMU extrinsics (samples then
@@ -319,7 +327,16 @@ static void read_stereo_calib(oak_device* dev, const dai::CalibrationHandler& ca
         c = oak_stereo_calib{};
         c.width = width;
         c.height = height;
-        set_err(std::string("stereo calibration unavailable: ") + ex.what());
+        dev->stereo_calib_err = std::string("stereo calibration unavailable: ") + ex.what();
+    }
+    // A present-but-zero extrinsic passes every read above and reaches a rectifier as NaN
+    // remap tables — the exact failure the rustdoc promises this struct cannot carry.
+    if (c.valid && c.baseline_m <= 0.0) {
+        c = oak_stereo_calib{};
+        c.width = width;
+        c.height = height;
+        dev->stereo_calib_err =
+            "stereo calibration has a zero baseline (extrinsic present but blank)";
     }
     dev->stereo_calib = c;
 }
@@ -327,7 +344,10 @@ static void read_stereo_calib(oak_device* dev, const dai::CalibrationHandler& ca
 extern "C" int oak_stereo_calibration(const oak_device* dev, oak_stereo_calib* out) {
     if (!dev || !out) { set_err("null device or out pointer"); return -1; }
     if (!dev->stereo_calib.valid) {
-        set_err("no stereo calibration (not a stereo device, or a wiped/blank EEPROM)");
+        set_err(dev->stereo_calib_err.empty()
+                    ? std::string(
+                          "no stereo calibration (not a stereo device, or a wiped/blank EEPROM)")
+                    : dev->stereo_calib_err);
         return -1;
     }
     *out = dev->stereo_calib;
@@ -339,6 +359,9 @@ extern "C" int oak_stereo_calibration(const oak_device* dev, oak_stereo_calib* o
 // working RGBD and H.264 paths cannot regress.
 extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int height,
                                        int fps, int imu_hz, int enable_h264) {
+    // Same guard oak_open_rgbd applies: a zero/negative rate reaches requestOutput as a
+    // float and fails the whole open for a reason nothing in the error names.
+    if (fps < 1) fps = 30;
     try {
         auto dev = std::make_unique<oak_device>();
         dev->device = connect_device(device_id);
@@ -405,9 +428,19 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         // skips the stream (has_video stays false), it never costs the stereo pair.
         if (enable_h264) {
             if (has_a) {
-                auto color = pipeline.create<dai::node::Camera>();
-                color->build(dai::CameraBoardSocket::CAM_A);
-                add_h264_encoder(pipeline, color, width, height, fps, dev.get());
+                // Guarded like the IMU: the stream is viz-only by contract, so a board that
+                // rejects the colour node or the stereo-sized NV12 output must DEGRADE
+                // (has_video stays false), never take the stereo pair down with it.
+                try {
+                    auto color = pipeline.create<dai::node::Camera>();
+                    color->build(dai::CameraBoardSocket::CAM_A);
+                    add_h264_encoder(pipeline, color, width, height, fps, dev.get());
+                } catch (const std::exception& ex) {
+                    std::fprintf(stderr,
+                                 "sensor-oak: H.264 viz stream unavailable (%s) — continuing "
+                                 "stereo-only\n",
+                                 ex.what());
+                }
             } else {
                 std::fprintf(stderr,
                              "sensor-oak: no CAM_A on this board — skipping the H.264 viz stream\n");
@@ -757,6 +790,14 @@ extern "C" int oak_poll_imu(oak_device* dev, oak_imu_sample* out, int max, int* 
                 // A zero/default timestamp on either report marks such a hole: skip the sample.
                 if ((p.acceleroMeter.timestamp.sec == 0 && p.acceleroMeter.timestamp.nsec == 0) ||
                     (p.gyroscope.timestamp.sec == 0 && p.gyroscope.timestamp.nsec == 0)) {
+                    dev->imu_ts_skipped++;
+                    if (dev->imu_ts_skipped == 1 || dev->imu_ts_skipped % 1000 == 0) {
+                        std::fprintf(stderr,
+                                     "sensor-oak: %llu IMU packet(s) skipped (zero-timestamp "
+                                     "report hole); a count near half the requested rate means "
+                                     "the gate, not the firmware, sets your IMU rate\n",
+                                     (unsigned long long)dev->imu_ts_skipped);
+                    }
                     continue;
                 }
                 // NOTE: do NOT gate on accuracy == UNRELIABLE here — firmware does not

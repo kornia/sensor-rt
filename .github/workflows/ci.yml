@@ -21,11 +21,24 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Dependency-resolution gate. Cannot COMPILE on a hosted runner (build.rs compiles the
+  # depthai C++ shim), but `cargo metadata --locked` resolves the whole graph without
+  # building — which catches a Cargo.lock that was never regenerated after a spec change
+  # (a stale lock silently re-resolves on a plain build and can split a crate in two).
+  # Compile coverage still needs `jetson` below.
+  deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo metadata --locked --format-version 1 > /dev/null
+
   # Self-hosted Jetson runner: real CUDA + NVMM (GStreamer) + depthai-core, and
   # the depthai vendor libs available.
   # Register a runner on the Orin with labels [self-hosted, jetson] and provide
   # the depthai vendor libs, then remove the `if: false` guard.
   jetson:
+    # NOTE: while this is disabled, `check` above is the ONLY job that compiles anything.
     if: false # enable once a self-hosted Jetson runner is registered
     runs-on: [self-hosted, jetson]
     env:

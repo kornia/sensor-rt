@@ -80,7 +80,7 @@ int oak_stereo_calibration(const oak_device *dev, oak_stereo_calib *out);
 
 /* Open an OAK in the STEREO+IMU modality: the two mono cameras (CAM_B = left,
  * CAM_C = right) streamed as a time-synced GRAY8 pair, plus the on-board IMU on
- * its own queue. NO colour camera, NO StereoDepth, NO encoder — this is the raw
+ * its own queue. NO StereoDepth; the colour camera + encoder attach ONLY when enable_h264 asks (viz stream, degrades without CAM_A) — this is the raw
  * stereo + inertial source for VIO / stereo-feature work, not the depth path
  * (for aligned depth use oak_open with enable_depth).
  *
@@ -97,7 +97,7 @@ int oak_stereo_calibration(const oak_device *dev, oak_stereo_calib *out);
  *                  depthai replicate gray across three channels and ship 3x the
  *                  bytes for no extra information — consumers that need RGB expand
  *                  it on the GPU instead.
- *   fps          : stereo pair rate.
+ *   fps          : stereo pair rate (also the H.264 viz stream rate; < 1 becomes 30).
  *   imu_hz       : accelerometer + gyroscope report rate (e.g. 200-400). The IMU
  *                  is OPTIONAL — the IMU node is only built after a
  *                  getConnectedIMU() preflight confirms the board carries one, so

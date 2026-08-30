@@ -2260,7 +2260,7 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 [[package]]
 name = "kornia-algebra"
 version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?tag=v0.1.15-rc.5#3ee6dfe40bcdad7077c77f8d16d8c5bea8240f0f"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
 dependencies = [
  "glam 0.33.2",
  "nalgebra",
@@ -2271,7 +2271,7 @@ dependencies = [
 [[package]]
 name = "kornia-image"
 version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?tag=v0.1.15-rc.5#3ee6dfe40bcdad7077c77f8d16d8c5bea8240f0f"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
 dependencies = [
  "cudarc",
  "kornia-tensor",
@@ -2283,7 +2283,7 @@ dependencies = [
 [[package]]
 name = "kornia-imgproc"
 version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?tag=v0.1.15-rc.5#3ee6dfe40bcdad7077c77f8d16d8c5bea8240f0f"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
 dependencies = [
  "cudarc",
  "half",
@@ -2299,7 +2299,7 @@ dependencies = [
 [[package]]
 name = "kornia-io"
 version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?tag=v0.1.15-rc.5#3ee6dfe40bcdad7077c77f8d16d8c5bea8240f0f"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -2316,7 +2316,7 @@ dependencies = [
 [[package]]
 name = "kornia-tensor"
 version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?tag=v0.1.15-rc.5#3ee6dfe40bcdad7077c77f8d16d8c5bea8240f0f"
+source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
 dependencies = [
  "cudarc",
  "num-traits",
@@ -5484,7 +5484,7 @@ dependencies = [
 [[package]]
 name = "trt-sys"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=e1de223c25017bff5376f27b1cba3b1fb6e5c6b2#e1de223c25017bff5376f27b1cba3b1fb6e5c6b2"
+source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
 dependencies = [
  "bindgen",
  "cc",
@@ -5685,7 +5685,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vrt"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=e1de223c25017bff5376f27b1cba3b1fb6e5c6b2#e1de223c25017bff5376f27b1cba3b1fb6e5c6b2"
+source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
 dependencies = [
  "cudarc",
  "half",
@@ -5698,7 +5698,7 @@ dependencies = [
 [[package]]
 name = "vrt-hub"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=e1de223c25017bff5376f27b1cba3b1fb6e5c6b2#e1de223c25017bff5376f27b1cba3b1fb6e5c6b2"
+source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
 dependencies = [
  "cudarc",
  "hf-hub",
@@ -5710,7 +5710,7 @@ dependencies = [
 [[package]]
 name = "vrt-rfdetr"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=e1de223c25017bff5376f27b1cba3b1fb6e5c6b2#e1de223c25017bff5376f27b1cba3b1fb6e5c6b2"
+source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
 dependencies = [
  "cudarc",
  "kornia-image",
@@ -5723,7 +5723,7 @@ dependencies = [
 [[package]]
 name = "vrt-xfeat"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=e1de223c25017bff5376f27b1cba3b1fb6e5c6b2#e1de223c25017bff5376f27b1cba3b1fb6e5c6b2"
+source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
 dependencies = [
  "cudarc",
  "kornia-image",
