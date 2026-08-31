@@ -8,12 +8,23 @@
 //! Both land on the SAME host-synced epoch timeline (the shim shifts depthai's
 //! steady clock once per batch), so no clock alignment step is needed.
 
+/// The BNO086 gyro tops out at 400 Hz; a wilder rate makes the firmware's sensor-enable
+/// throw at `pipeline.start()`, which fails the WHOLE open — losing the imagery over an
+/// IMU rate. Clamped on both open paths rather than surfaced as a device error.
+pub(crate) fn clamp_imu_hz(imu_hz: u32) -> u32 {
+    if imu_hz > 400 {
+        eprintln!("sensor-oak: imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
+        return 400;
+    }
+    imu_hz
+}
+
 use crate::OakSource;
 
 /// One IMU reading: accelerometer + gyroscope, sampled together.
 ///
 /// `ts_ns` is on the **same host-synced epoch timeline as the image frames**, so
-/// samples can be interpolated directly against a the stereo frame's timestamp
+/// samples can be interpolated directly against the stereo frame's timestamp
 /// without a clock alignment step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImuSample {

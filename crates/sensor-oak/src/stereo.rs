@@ -144,7 +144,7 @@ impl OakStereoFrame<'_> {
 impl OakSource {
     /// Open the **stereo + IMU** modality: a Sync'd left/right GRAY8 pair at
     /// `fps`, plus the IMU at `imu_hz` (accelerometer + gyroscope). `device`
-    /// selects the camera exactly as in [`OakSource::open`].
+    /// selects the camera exactly as in [`OakSource::open_rgbd`].
     ///
     /// The pair is **raw**: neither undistorted nor rectified. depthai's Camera
     /// node can only undistort (its rectifying rotation is hard-wired to
@@ -179,7 +179,7 @@ impl OakSource {
     ) -> Result<Self, BoxError> {
         let id_c = crate::device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        let imu_hz = crate::clamp_imu_hz(imu_hz);
+        let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
         let dev = unsafe {
             crate::ffi::oak_open_stereo(
                 id_ptr,

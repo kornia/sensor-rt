@@ -193,10 +193,9 @@ int oak_poll_depth(oak_device *dev, const uint16_t **depth_mm,
  * never overflows (a dropped P-frame glitches the stream until the next keyframe). */
 int oak_poll_video(oak_device *dev, const uint8_t **data, int *len, uint64_t *ts_ns);
 
-/* Factory intrinsics of the LEFT (CAM_B) camera at the streamed size — the stereo
- * reference frame. RAW, i.e. distorted and unrectified: a stereo consumer wants
- * oak_stereo_calibration + a host rectifier, whose virtual focal differs from this
- * fx. Zeros (with a 0 return!) on a wiped EEPROM — check fx > 0.
+/* Factory intrinsics at the STREAMED size of each modality's reference camera: CAM_A on
+ * oak_open_rgbd (the colour camera the depth is aligned to), CAM_B (left) on
+ * oak_open_stereo (the stereo reference frame). Zero on a wiped EEPROM — check before use.
  * Returns 0 on success, -1 on error. */
 int oak_intrinsics(const oak_device *dev,
                    float *fx, float *fy, float *cx, float *cy);

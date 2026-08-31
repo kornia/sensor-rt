@@ -5,7 +5,7 @@ edition.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
-description = "OAK-D source: a time-synced stereo pair + IMU; produces host kornia Images"
+description = "OAK camera source: RGBD (colour + aligned depth + H.264), a time-synced stereo pair, and the on-board IMU"
 # The depthai-core C shim is built and linked here rather than by a separate `-sys`
 # crate: it has exactly one consumer (this crate), and `links` still guarantees only
 # one copy of the native library in the graph.
