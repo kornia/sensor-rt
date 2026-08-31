@@ -12,7 +12,6 @@
 
 use std::ffi::CString;
 
-
 /// The BNO086 gyro tops out at 400 Hz; a wilder rate makes the firmware's sensor-enable
 /// throw at `pipeline.start()`, which fails the WHOLE open — losing the imagery over an
 /// IMU rate. Clamped on both open paths rather than surfaced as a device error.
