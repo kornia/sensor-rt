@@ -4703,6 +4703,7 @@ dependencies = [
  "argh",
  "cudarc",
  "depthai",
+ "depthai-sys",
  "env_logger",
  "kornia-image",
  "kornia-imgproc",

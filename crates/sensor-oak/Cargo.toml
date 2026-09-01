@@ -7,6 +7,8 @@ license.workspace = true
 publish = false
 description = "OAK camera source: RGBD (colour + aligned depth + H.264), a time-synced stereo pair, and the on-board IMU"
 
+build = "build.rs"
+
 [lib]
 name = "sensor_oak"
 
@@ -20,6 +22,7 @@ name = "sensor_oak"
 # env knobs, steady->epoch clock shift, IMU rotation gate, calibration unit
 # traps, degrade rules — lives here in Rust, where it is unit-testable.
 depthai       = { workspace = true }
+depthai-sys   = { workspace = true }
 kornia-image  = { workspace = true }
 # For the borrowed (zero-copy) image storage — see OakStereoFrame::left_image.
 kornia-tensor = { workspace = true }
