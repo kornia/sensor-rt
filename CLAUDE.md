@@ -67,7 +67,7 @@ already tight RGB8 (zero extra copies).
 
 ```bash
 export CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_BUILD_JOBS=2
-export DEPTHAI_PREFIX="$PWD/vendor/depthai"
+export DEPTHAI_PREFIX="$PWD/vendor/depthai"   # or a prefix built by kornia/depthai-rs
 export LD_LIBRARY_PATH=$DEPTHAI_PREFIX/lib
 cargo build -j2
 cargo fmt --all --check
