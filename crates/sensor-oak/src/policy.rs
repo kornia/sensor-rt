@@ -61,26 +61,23 @@ impl Knobs {
         Self::parse(|k| std::env::var(k).ok())
     }
 
-    /// Parse from any key → value source (tests pass a map).
+    /// Parse from any key → value source (tests pass a map). Numbers are read like
+    /// C's `atoi`/`atof` — a leading number, trailing junk ignored, nothing → 0 —
+    /// so `OAK_DEPTH_FPS=7.5` is 7 and `OAK_IR=` / `OAK_IR=off` is 0 (projector
+    /// OFF), exactly as they always were.
     pub(crate) fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
-        let positive = |k: &str| {
-            get(k)
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .filter(|&v| v >= 1)
-        };
+        let int = |k: &str| get(k).map(|s| atoi(&s)).filter(|&v| v >= 1);
         Knobs {
             usb_speed: match get("OAK_USB_SPEED").as_deref() {
                 Some("super") | Some("SUPER") => UsbSpeed::Super,
                 _ => UsbSpeed::High,
             },
-            h264_kbps: positive("OAK_H264_KBPS").map_or(2000, |v| v.min(i32::MAX as i64) as i32),
-            depth_fps: positive("OAK_DEPTH_FPS").map(|v| v.min(u32::MAX as i64) as u32),
-            rgb_fps: positive("OAK_RGB_FPS").map(|v| v.min(u32::MAX as i64) as u32),
-            depth_div: positive("OAK_DEPTH_DIV").map_or(2, |v| v.min(u32::MAX as i64) as u32),
+            h264_kbps: int("OAK_H264_KBPS").map_or(2000, |v| v.min(i32::MAX as i64) as i32),
+            depth_fps: int("OAK_DEPTH_FPS").map(|v| v.min(u32::MAX as i64) as u32),
+            rgb_fps: int("OAK_RGB_FPS").map(|v| v.min(u32::MAX as i64) as u32),
+            depth_div: int("OAK_DEPTH_DIV").map_or(2, |v| v.min(u32::MAX as i64) as u32),
             subpixel: !matches!(get("OAK_SUBPIXEL").as_deref(), Some("0") | Some("false")),
-            ir: get("OAK_IR")
-                .and_then(|s| s.trim().parse::<f32>().ok())
-                .map_or(0.8, |x| x.clamp(0.0, 1.0)),
+            ir: get("OAK_IR").map_or(0.8, |s| atof(&s).clamp(0.0, 1.0)),
         }
     }
 
@@ -93,6 +90,41 @@ impl Knobs {
     pub(crate) fn rgb_fps(&self, fps: u32) -> u32 {
         self.rgb_fps.unwrap_or(10).min(fps).max(1)
     }
+}
+
+/// The longest prefix of `s` (after whitespace) that parses as `[+-]digits[.digits]`.
+fn numeric_prefix(s: &str) -> &str {
+    let s = s.trim_start();
+    let mut end = 0;
+    let mut seen_dot = false;
+    for (i, c) in s.char_indices() {
+        let ok = match c {
+            '0'..='9' => true,
+            '+' | '-' => i == 0,
+            '.' if !seen_dot => {
+                seen_dot = true;
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    &s[..end]
+}
+
+/// C `atoi`: leading integer, junk ignored, nothing → 0.
+pub(crate) fn atoi(s: &str) -> i64 {
+    let p = numeric_prefix(s);
+    let p = p.split('.').next().unwrap_or("");
+    p.parse().unwrap_or(0)
+}
+
+/// C `atof`: leading number, junk ignored, nothing → 0.
+pub(crate) fn atof(s: &str) -> f32 {
+    numeric_prefix(s).parse().unwrap_or(0.0)
 }
 
 /// XLink requires EVEN depth dims — an odd width/height tears the device
@@ -286,11 +318,32 @@ mod tests {
         assert!(!k.subpixel);
         assert_eq!(k.ir, 1.0);
         assert_eq!(knobs(&[("OAK_IR", "-1")]).ir, 0.0);
-        assert_eq!(knobs(&[("OAK_IR", "abc")]).ir, 0.8);
+        // atof semantics: a set-but-unparsable (or empty) OAK_IR disables the projector.
+        assert_eq!(knobs(&[("OAK_IR", "abc")]).ir, 0.0);
+        assert_eq!(knobs(&[("OAK_IR", "")]).ir, 0.0);
+        assert_eq!(knobs(&[("OAK_IR", "off")]).ir, 0.0);
+        assert_eq!(knobs(&[("OAK_IR", "0.5x")]).ir, 0.5);
+        // atoi semantics: leading integer, junk ignored.
+        assert_eq!(knobs(&[("OAK_DEPTH_FPS", "7.5")]).depth_fps(30), 7);
+        assert_eq!(knobs(&[("OAK_H264_KBPS", "1500k")]).h264_kbps, 1500);
+        assert_eq!(knobs(&[("OAK_DEPTH_DIV", "x")]).depth_div, 2);
         assert_eq!(
             knobs(&[("OAK_USB_SPEED", "nonsense")]).usb_speed,
             UsbSpeed::High
         );
+    }
+
+    #[test]
+    fn c_style_number_parsing() {
+        assert_eq!(atoi(" 42abc"), 42);
+        assert_eq!(atoi("-3"), -3);
+        assert_eq!(atoi("7.9"), 7);
+        assert_eq!(atoi(""), 0);
+        assert_eq!(atoi("abc"), 0);
+        assert_eq!(atof("0.8"), 0.8);
+        assert_eq!(atof(".5"), 0.5);
+        assert_eq!(atof("1.2.3"), 1.2);
+        assert_eq!(atof("off"), 0.0);
     }
 
     #[test]

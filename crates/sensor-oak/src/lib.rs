@@ -7,10 +7,11 @@
 //! alongside either — drained independently, because the IMU reports far faster
 //! than frames.
 //!
-//! Everything OAK-specific that is a *decision* — the `OAK_*` knobs, the
-//! steady→epoch clock shift, the IMU rotation gate, the calibration unit traps,
-//! the degrade rules — lives in [`policy`] and [`graph`], unit-tested. The
-//! `depthai` crate underneath is faithful and unopinionated.
+//! Everything OAK-specific that is a *decision* lives in Rust here: the pure
+//! rules (`OAK_*` knobs, the steady→epoch clock shift, the IMU rotation gate,
+//! depth sizing, stride repacks) in [`policy`] / [`rgbd`] with unit tests, and
+//! the graph builders with their degrade rules in [`graph`]. The `depthai` crate
+//! underneath is faithful and unopinionated.
 //!
 //! **Nothing here touches CUDA**: frames come out on the host and the consumer owns
 //! any upload, so a process that only wants pixels builds no GPU stack.
@@ -120,9 +121,31 @@ pub struct OakSource {
     /// Full CAM_B/CAM_C calibration, read once at `open_stereo`; surfaced by
     /// `stereo_calib()`.
     stereo_calib: Result<OakStereoCalib, StereoCalibError>,
-    /// First poll failure is logged, later ones are not (a dying device would
+    /// Per-queue "first poll failure logged" latch (a dying device would
     /// otherwise spam every drain).
-    poll_warned: Cell<bool>,
+    poll_warned: Cell<u8>,
+}
+
+/// Which queue a poll is for — its bit in `poll_warned`.
+#[derive(Clone, Copy)]
+pub(crate) enum Which {
+    Stereo = 1,
+    Rgb = 2,
+    Depth = 4,
+    Video = 8,
+    Imu = 16,
+}
+
+impl Which {
+    fn name(self) -> &'static str {
+        match self {
+            Which::Stereo => "stereo",
+            Which::Rgb => "rgb",
+            Which::Depth => "depth",
+            Which::Video => "video",
+            Which::Imu => "IMU",
+        }
+    }
 }
 
 /// The image queues an open path produced (all `None` where a modality does not
@@ -169,31 +192,30 @@ impl OakSource {
             imu_packets: Vec::new(),
             imu_ts_skipped: 0,
             stereo_calib: built.stereo_calib,
-            poll_warned: Cell::new(false),
+            poll_warned: Cell::new(0),
         }
     }
 
-    /// Pop from `q` (blocking up to `timeout`, or non-blocking when `None`),
-    /// logging the first device error and treating it as "nothing".
+    /// Pop from `q` (blocking up to `timeout`, or non-blocking when `None`).
+    /// `Err(())` = a device/queue error (logged once per queue): the stream is
+    /// unusable. `Ok(None)` = nothing queued / timed out.
     pub(crate) fn pop<M: Message>(
         &self,
         q: &OutputQueue<M>,
-        what: &str,
+        which: Which,
         timeout: Option<Duration>,
-    ) -> Option<M> {
+    ) -> Result<Option<M>, ()> {
         let r = match timeout {
             Some(t) => q.get(t),
             None => q.try_get(),
         };
-        match r {
-            Ok(m) => m,
-            Err(e) => {
-                if !self.poll_warned.replace(true) {
-                    degrade!("{what} poll failed: {e}");
-                }
-                None
+        r.map_err(|e| {
+            let bit = which as u8;
+            if self.poll_warned.get() & bit == 0 {
+                self.poll_warned.set(self.poll_warned.get() | bit);
+                degrade!("{} poll failed: {e}", which.name());
             }
-        }
+        })
     }
 
     pub fn intrinsics(&self) -> OakIntrinsics {
@@ -214,6 +236,7 @@ impl OakSource {
 /// was nothing to kick (target absent or healthy), `Err` on a driver error. Blocking — call from the
 /// reconnect path, not the drain loop.
 pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
+    let target = target.filter(|t| !t.is_empty()); // "" = any, like open_*
     let infos = Device::all_available().ctx("enumerate devices")?;
     // The wedge: a PoE device stuck in the bootloader. A healthy device enumerates
     // UNBOOTED / BOOTED / FLASH_BOOTED and opens normally — kicking it would be a

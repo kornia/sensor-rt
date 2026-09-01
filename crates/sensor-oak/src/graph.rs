@@ -3,7 +3,8 @@
 //! thing it attaches, so that rule cannot drift between the two open paths), and
 //! the calibration readers.
 
-use depthai::node::{Camera, Imu, StereoDepth, VideoEncoder};
+use depthai::node::{Camera, Imu, Node, StereoDepth, VideoEncoder};
+use depthai::NodeHandle;
 use depthai::{
     CalibrationHandler, CameraBoardSocket, Device, ImgFrame, ImgFrameType, ImgResizeMode, ImuData,
     ImuSensor, LengthUnit, Output, OutputQueue, Pipeline, StereoPresetMode, VideoEncoderProfile,
@@ -57,18 +58,26 @@ impl Session {
     pub(crate) fn can_do_depth(&self, width: u32, height: u32) -> bool {
         self.has(CameraBoardSocket::CamB)
             && self.has(CameraBoardSocket::CamC)
-            && self
-                .calib
-                .camera_intrinsics(CameraBoardSocket::CamA, Some((width, height)))
-                .map(|k| k[0][0] > 0.0)
-                .unwrap_or(false)
+            && read_intrinsics(&self.calib, CameraBoardSocket::CamA, width, height).fx > 0.0
     }
 
-    /// Create a `Camera` node bound to `socket`.
+    /// Create a `Camera` node bound to `socket`; a node whose build fails is removed
+    /// again so it cannot poison `Pipeline::start`.
     pub(crate) fn camera(&self, socket: CameraBoardSocket) -> depthai::Result<Camera> {
         let cam = self.pipeline.create::<Camera>()?;
-        cam.build(socket)?;
+        if let Err(e) = cam.build(socket) {
+            let _ = self.pipeline.remove(&cam);
+            return Err(e);
+        }
         Ok(cam)
+    }
+
+    /// Remove nodes an optional subgraph created before failing, so the degraded
+    /// pipeline can still start.
+    pub(crate) fn remove_all(&self, nodes: &[&NodeHandle]) {
+        for n in nodes {
+            let _ = self.pipeline.remove(*n);
+        }
     }
 }
 
@@ -117,7 +126,7 @@ pub(crate) fn try_add_h264_encoder(
 }
 
 /// StereoDepth (CAM_B/CAM_C) aligned to `rgb_out`'s grid, downscaled on-device,
-/// returning the depth queue.
+/// returning the depth queue. On failure every node it created is removed again.
 pub(crate) fn add_stereo_depth(
     s: &Session,
     rgb_out: &Output<ImgFrame>,
@@ -126,51 +135,66 @@ pub(crate) fn add_stereo_depth(
     dfps: u32,
 ) -> depthai::Result<OutputQueue<ImgFrame>> {
     let left = s.camera(CameraBoardSocket::CamB)?;
-    let right = s.camera(CameraBoardSocket::CamC)?;
-    let stereo = s.pipeline.create::<StereoDepth>()?;
-    // ROBOTICS preset (depthai v3) is tuned for mobile-robot people/obstacle depth.
-    // Subpixel gives ~8× finer disparity (removes the z-quantization that flickers
-    // a standing person's depth) but ~halves the stereo FPS; OAK_SUBPIXEL=0 trades
-    // precision for rate. LR-check on for occlusion.
-    stereo.set_default_profile_preset(StereoPresetMode::Robotics)?;
-    stereo.set_left_right_check(true)?;
-    stereo.set_subpixel(s.knobs.subpixel)?;
-    // Passive-stereo depth cleanup (no IR projector): SPATIAL edge-preserving
-    // hole-fill + TEMPORAL averaging + THRESHOLD clamp to the useful range
-    // (0.4 m .. 8 m).
-    stereo
-        .post_processing()
-        .set_spatial_filter_enable(true)?
-        .set_temporal_filter_enable(true)?
-        .set_threshold_filter(400, 8000)?;
-    left.request_output(
-        (640, 400),
-        None,
-        ImgResizeMode::Crop,
-        Some(dfps as f32),
-        None,
-    )?
-    .link(&stereo.left()?)?;
-    right
-        .request_output(
+    let right = match s.camera(CameraBoardSocket::CamC) {
+        Ok(r) => r,
+        Err(e) => {
+            s.remove_all(&[left.handle()]);
+            return Err(e);
+        }
+    };
+    let stereo = match s.pipeline.create::<StereoDepth>() {
+        Ok(n) => n,
+        Err(e) => {
+            s.remove_all(&[left.handle(), right.handle()]);
+            return Err(e);
+        }
+    };
+    let wire = || -> depthai::Result<OutputQueue<ImgFrame>> {
+        // ROBOTICS preset (depthai v3) is tuned for mobile-robot people/obstacle
+        // depth. Subpixel gives ~8× finer disparity (removes the z-quantization
+        // that flickers a standing person's depth) but ~halves the stereo FPS;
+        // OAK_SUBPIXEL=0 trades precision for rate. LR-check on for occlusion.
+        stereo.set_default_profile_preset(StereoPresetMode::Robotics)?;
+        stereo.set_left_right_check(true)?;
+        stereo.set_subpixel(s.knobs.subpixel)?;
+        // Passive-stereo depth cleanup (no IR projector): SPATIAL edge-preserving
+        // hole-fill + TEMPORAL averaging + THRESHOLD clamp to the useful range
+        // (0.4 m .. 8 m).
+        stereo
+            .post_processing()
+            .set_spatial_filter_enable(true)?
+            .set_temporal_filter_enable(true)?
+            .set_threshold_filter(400, 8000)?;
+        left.request_output(
             (640, 400),
             None,
             ImgResizeMode::Crop,
             Some(dfps as f32),
             None,
         )?
-        .link(&stereo.right()?)?;
-    // Align depth to the RGB OUTPUT (not just the CAM_A socket), so depth[u,v]
-    // matches RGB[u,v] exactly — same CROP, same size, same intrinsics.
-    rgb_out.link(&stereo.input_align_to()?)?;
-    // Downscale the aligned depth ON-DEVICE before XLink. A room-scale point cloud
-    // doesn't need per-RGB-pixel depth, and the full-res depth pull is the dominant
-    // XLink cost (it caps the co-hosted H.264 on a PoE link). Default /2 → 1/4 the
-    // bytes; still aligned to the RGB grid, so consumers scale coords by
-    // (rgb_w / depth_w).
-    let (dw, dh) = policy::depth_output_size(width, height, s.knobs.depth_div);
-    stereo.set_output_size(dw, dh)?;
-    stereo.depth()?.create_output_queue(4, false)
+        .link(&stereo.left()?)?;
+        right
+            .request_output(
+                (640, 400),
+                None,
+                ImgResizeMode::Crop,
+                Some(dfps as f32),
+                None,
+            )?
+            .link(&stereo.right()?)?;
+        // Align depth to the RGB OUTPUT (not just the CAM_A socket), so depth[u,v]
+        // matches RGB[u,v] exactly — same CROP, same size, same intrinsics.
+        rgb_out.link(&stereo.input_align_to()?)?;
+        // Downscale the aligned depth ON-DEVICE before XLink. A room-scale point
+        // cloud doesn't need per-RGB-pixel depth, and the full-res depth pull is the
+        // dominant XLink cost (it caps the co-hosted H.264 on a PoE link). Default
+        // /2 → 1/4 the bytes; still aligned to the RGB grid, so consumers scale
+        // coords by (rgb_w / depth_w).
+        let (dw, dh) = policy::depth_output_size(width, height, s.knobs.depth_div);
+        stereo.set_output_size(dw, dh)?;
+        stereo.depth()?.create_output_queue(4, false)
+    };
+    wire().inspect_err(|_| s.remove_all(&[left.handle(), right.handle(), stereo.handle()]))
 }
 
 /// The OPTIONAL attach (e.g. OAK-1: no stereo pair): degrade to colour + video.
@@ -202,33 +226,36 @@ pub(crate) struct ImuAttach {
 /// The IMU is OPTIONAL: not every OAK carries one, and a missing IMU must not cost
 /// the image streams — so BEFORE creating the node (and thus before it can ever
 /// reach `Pipeline::start`), preflight with `connected_imu()`: a board without one
-/// reports `""`/`"NONE"` and we skip the node. Nothing when `imu_hz == 0`.
-pub(crate) fn attach_imu(s: &Session, imu_hz: u32, socket: CameraBoardSocket) -> ImuAttach {
+/// reports `""`/`"NONE"` (or the query fails) and we skip the node. A board that
+/// HAS an IMU but whose node cannot be built is a real device error and fails the
+/// open, like any other node. Nothing when `imu_hz == 0`.
+pub(crate) fn attach_imu(
+    s: &Session,
+    imu_hz: u32,
+    socket: CameraBoardSocket,
+) -> Result<ImuAttach, OakError> {
     if imu_hz == 0 {
-        return ImuAttach::default();
+        return Ok(ImuAttach::default());
     }
-    let name = match s.dev.connected_imu() {
-        Ok(n) => n,
+    let present = match s.dev.connected_imu() {
+        Ok(name) if name.is_empty() || name == "NONE" => {
+            degrade!("no on-board IMU (getConnectedIMU={name:?}) — skipping the IMU node");
+            false
+        }
+        Ok(_) => true,
         Err(e) => {
             degrade!("getConnectedIMU failed ({e}) — skipping the IMU node");
-            return ImuAttach::default();
+            false
         }
     };
-    if name.is_empty() || name == "NONE" {
-        degrade!("no on-board IMU (getConnectedIMU={name:?}) — skipping the IMU node");
-        return ImuAttach::default();
+    if !present {
+        return Ok(ImuAttach::default());
     }
-    let queue = match add_imu_node(s, imu_hz) {
-        Ok(q) => q,
-        Err(e) => {
-            degrade!("IMU node setup failed ({e}) — skipping the IMU node");
-            return ImuAttach::default();
-        }
-    };
-    ImuAttach {
+    let queue = add_imu_node(s, imu_hz).ctx("IMU node")?;
+    Ok(ImuAttach {
         queue: Some(queue),
         rot: read_imu_rotation(&s.calib, socket),
-    }
+    })
 }
 
 fn add_imu_node(s: &Session, imu_hz: u32) -> depthai::Result<OutputQueue<ImuData>> {

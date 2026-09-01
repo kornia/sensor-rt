@@ -20,12 +20,11 @@ use std::time::Duration;
 use depthai::node::Sync as SyncNode;
 use depthai::{CameraBoardSocket, ImgFrame, ImgFrameType, ImgResizeMode, MessageGroup};
 use kornia_image::Image;
-use kornia_tensor::resource::MemoryDomain;
-use kornia_tensor::{host_alloc, storage::TensorStorage, Tensor};
+use kornia_tensor::Tensor;
 use sensor_types::FrameMeta;
 
 use crate::graph::{self, Session};
-use crate::{policy, BoxError, Built, Ctx, OakSource, Queues};
+use crate::{policy, BoxError, Built, Ctx, OakSource, Queues, Which};
 
 /// One time-synced stereo pair, borrowed from the source.
 ///
@@ -98,36 +97,25 @@ fn eye_image(frame: &ImgFrame) -> Result<Image<u8, 1>, BoxError> {
     let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(frame.clone());
     let (w, h) = (frame.width() as usize, frame.height() as usize);
     let span = gray8(frame);
-    // SAFETY:
-    //   - `span` points at the frame's pixels, non-null and `w*h` long
-    //     (`tight_len` validated tight GRAY8 before this frame was built).
-    //   - `keepalive` shares the frame's handle, so the memory outlives this storage.
-    //   - Host memory: MemoryDomain::Host, and the OAK delivers frames to host RAM.
-    let storage = unsafe {
-        TensorStorage::from_borrowed_readonly(
-            span.as_ptr(),
-            span.len(),
-            host_alloc(),
-            MemoryDomain::Host,
-            keepalive,
-        )
-    };
-    // Row-major [H, W, 1]; tight rows, so these strides are exact.
-    // (kornia's own `get_strides_from_shape` is not reachable from outside the crate,
-    // which is why its v4l/gstreamer backends spell this out the same way.)
-    let tensor = Tensor {
-        storage,
-        shape: [h, w, 1],
-        strides: [w, 1, 1],
-    };
+    // SAFETY: `span` points at the frame's pixels, `w*h` long (validated tight
+    // GRAY8 before this frame was built), in host memory, and `keepalive` shares
+    // the frame's handle so the memory outlives the storage.
+    let tensor = unsafe {
+        Tensor::from_borrowed_host_readonly([h, w, 1], span.as_ptr(), span.len(), keepalive)
+    }
+    .map_err(|e| format!("borrowed tensor: {e}"))?;
     Image::try_from(tensor).map_err(|e| format!("borrowed Image<u8,1>: {e}").into())
 }
 
-/// Validate that `f` is tightly packed at `bpp` bytes per pixel (depthai may report
-/// stride 0, which the docs single out as "treat as tight only after checking the
-/// length"). Returns the tight byte length.
-pub(crate) fn tight_len(f: &ImgFrame, bpp: u32) -> Result<usize, String> {
+/// Check a frame's row layout at `bpp` bytes per pixel. `Ok(None)` = a degenerate
+/// (zero-sized) frame to skip; `Ok(Some(len))` = the tight byte length; `Err` =
+/// not tightly packed (depthai may report stride 0, which the docs single out as
+/// "treat as tight only after checking the length") or too short.
+pub(crate) fn tight_len(f: &ImgFrame, bpp: u32) -> Result<Option<usize>, String> {
     let (w, h) = (f.width(), f.height());
+    if w == 0 || h == 0 {
+        return Ok(None);
+    }
     let stride = f.stride();
     if stride != 0 && stride != w * bpp {
         return Err(format!(
@@ -138,7 +126,7 @@ pub(crate) fn tight_len(f: &ImgFrame, bpp: u32) -> Result<usize, String> {
     if f.data().len() < len {
         return Err("frame buffer is shorter than width * height".into());
     }
-    Ok(len)
+    Ok(Some(len))
 }
 
 /// Unpack a Sync group into a validated pair. `Ok(None)` = a degenerate (empty)
@@ -151,15 +139,14 @@ fn take_pair(group: &MessageGroup) -> Result<Option<(ImgFrame, ImgFrame)>, Strin
             .ok_or_else(|| format!("stereo group missing the {name} eye"))
     };
     let (l, r) = (eye("left")?, eye("right")?);
-    if l.width() == 0 || l.height() == 0 {
-        return Ok(None);
-    }
     if (l.width(), l.height()) != (r.width(), r.height()) {
         return Err("stereo eyes differ in size".into());
     }
-    tight_len(&l, 1).map_err(|e| format!("left {e}"))?;
-    tight_len(&r, 1).map_err(|e| format!("right {e}"))?;
-    Ok(Some((l, r)))
+    let (tl, tr) = (
+        tight_len(&l, 1).map_err(|e| format!("left {e}"))?,
+        tight_len(&r, 1).map_err(|e| format!("right {e}"))?,
+    );
+    Ok(tl.and(tr).map(|_| (l, r)))
 }
 
 impl OakSource {
@@ -226,7 +213,7 @@ impl OakSource {
         // reaches pipeline start). Left (CAM_B) is the stereo reference frame, so IMU
         // samples are rotated into ITS optical frame when the EEPROM carries the
         // extrinsics — same gate as RGBD, different reference socket.
-        let imu = graph::attach_imu(&s, imu_hz, CameraBoardSocket::CamB);
+        let imu = graph::attach_imu(&s, imu_hz, CameraBoardSocket::CamB)?;
         s.pipeline.start().ctx("pipeline start")?;
 
         let built = Built {
@@ -253,27 +240,29 @@ impl OakSource {
     /// the stream ended: a device error, or ~5 s with no pair.
     pub fn next_stereo(&mut self) -> Option<OakStereoFrame<'_>> {
         let q = self.stereo_q.clone()?;
-        let mut tries = 0;
-        let (left, right) = loop {
-            // ~1 s per poll → ~5 s with no pair ⇒ treat as ended.
-            if tries >= 5 {
-                return None;
-            }
-            tries += 1;
-            // A poll error is logged by `pop` and lands here as "no group" until the
-            // retry budget runs out.
-            let Some(group) = self.pop(&q, "stereo", Some(Duration::from_secs(1))) else {
+        // Five 1 s polls (~5 s with no pair) before treating the stream as ended; a
+        // device error ends it at once.
+        let mut pair = None;
+        for _ in 0..5 {
+            let Some(group) = self
+                .pop(&q, Which::Stereo, Some(Duration::from_secs(1)))
+                .ok()?
+            else {
                 continue;
             };
             match take_pair(&group) {
-                Ok(Some(pair)) => break pair,
+                Ok(Some(p)) => {
+                    pair = Some(p);
+                    break;
+                }
                 Ok(None) => continue, // degenerate frame — skip, don't kill the stream
                 Err(e) => {
                     degrade!("{e}");
                     return None;
                 }
             }
-        };
+        }
+        let (left, right) = pair?;
 
         self.seq += 1;
         let meta = FrameMeta {

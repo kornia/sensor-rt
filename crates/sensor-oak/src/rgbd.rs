@@ -18,8 +18,7 @@ use depthai::{CameraBoardSocket, ImgFrameType, ImgResizeMode};
 
 use crate::calib::StereoCalibError;
 use crate::graph::{self, Session};
-use crate::stereo::tight_len;
-use crate::{policy, BoxError, Built, Ctx, OakSource, Queues};
+use crate::{policy, BoxError, Built, Ctx, OakSource, Queues, Which};
 
 impl OakSource {
     /// Open an OAK in the RGBD + H.264 modality: CAM_A colour (RGB888) + an on-device H.264 colour
@@ -96,21 +95,18 @@ impl OakSource {
             build_decoupled(&s, width, height, fps, depth).ctx("build RGBD graph")?
         };
 
-        let imu = graph::attach_imu(&s, imu_hz, CameraBoardSocket::CamA);
+        let imu = graph::attach_imu(&s, imu_hz, CameraBoardSocket::CamA)?;
         s.pipeline.start().ctx("pipeline start")?;
 
-        if !want_video_only {
+        if !want_video_only && s.knobs.ir > 0.0 {
             // IR dot projector: passive stereo starves on texture-poor / dim scenes
             // (single-digit valid-depth %). Default 0.8 intensity; OAK_IR=0 disables
             // (e.g. multi-cam cross-talk), boards without a projector just return false.
-            // Set after start() — needs a live device. Ok(false) = no projector (fine);
-            // Err = a real device RPC failure: degrade, but say so.
-            let ir = s.knobs.ir;
-            if ir > 0.0 {
-                if let Err(e) = s.dev.set_ir_laser_dot_projector_intensity(ir, None) {
-                    degrade!("IR dot-projector intensity failed ({e}) — continuing without it");
-                }
-            }
+            // Set after start() — needs a live device; an RPC failure here means the
+            // device is already unhealthy, so it fails the open.
+            s.dev
+                .set_ir_laser_dot_projector_intensity(s.knobs.ir, None)
+                .ctx("IR dot projector")?;
         }
 
         let built = Built {
@@ -145,34 +141,21 @@ impl OakSource {
     /// [`next_depth`](Self::next_depth) — pair them by timestamp on the consumer. Drain in a loop until
     /// `None` each iteration.
     pub fn next_rgb(&mut self) -> Option<(Vec<u8>, u32, u32, u64)> {
-        let f = self.pop(self.rgb_q.as_ref()?, "rgb", None)?;
-        if f.width() == 0 || f.height() == 0 {
-            return None; // degenerate frame — skip, don't kill the stream
-        }
-        let len = match tight_len(&f, 3) {
-            Ok(len) => len,
-            Err(e) => {
-                degrade!("rgb {e}");
-                return None;
-            }
-        };
-        Some((
-            f.data()[..len].to_vec(),
-            f.width(),
-            f.height(),
-            policy::frame_epoch_ns(&f),
-        ))
+        let f = self.pop(self.rgb_q.as_ref()?, Which::Rgb, None).ok()??;
+        let (w, h) = (f.width(), f.height());
+        // Tight or row-padded, either way one copy out (the owned-Vec API's copy).
+        let bytes = repack_rows(f.data(), w as usize * 3, h as usize, f.stride() as usize)?;
+        Some((bytes, w, h, policy::frame_epoch_ns(&f)))
     }
 
     /// Decoupled depth poll: the next aligned uint16-mm depth frame from its own queue (non-blocking) at
     /// the stereo rate, copied out with its dims (may be `<` colour size) + capture timestamp. `None`
     /// when none is queued. Drain in a loop until `None`.
     pub fn next_depth(&mut self) -> Option<(Vec<u16>, u32, u32, u64)> {
-        let d = self.pop(self.depth_q.as_ref()?, "depth", None)?;
+        let d = self
+            .pop(self.depth_q.as_ref()?, Which::Depth, None)
+            .ok()??;
         let (dw, dh) = (d.width(), d.height());
-        if dw == 0 || dh == 0 {
-            return None;
-        }
         let vals = repack_depth(d.data(), dw, dh, d.stride())?;
         Some((vals, dw, dh, policy::frame_epoch_ns(&d)))
     }
@@ -182,7 +165,9 @@ impl OakSource {
     /// when no frame is queued or H.264 isn't running. Call in a loop until `None` each iteration so the
     /// encoder queue never overflows — a dropped P-frame glitches the stream until the next keyframe.
     pub fn next_video(&mut self) -> Option<(Vec<u8>, u64)> {
-        let f = self.pop(self.video_q.as_ref()?, "video", None)?;
+        let f = self
+            .pop(self.video_q.as_ref()?, Which::Video, None)
+            .ok()??;
         if f.data().is_empty() {
             return None;
         }
@@ -254,33 +239,59 @@ fn build_decoupled(
     })
 }
 
-/// Copy a `RAW16` depth frame out as tightly packed `u16`s — the one copy the
-/// owned-`Vec` API mandates. A downscaled/aligned depth frame is often padded to a
-/// byte-alignment boundary (stride > dw*2); honour the stride by repacking
-/// row-by-row instead of dropping every such frame — a tight-only check silently
-/// left depth permanently empty when it was padded. `None` on a malformed frame
-/// (skip it rather than kill the stream).
-pub(crate) fn repack_depth(data: &[u8], dw: u32, dh: u32, stride: u32) -> Option<Vec<u16>> {
-    let (dw, dh) = (dw as usize, dh as usize);
-    let row = dw * 2;
-    let stride = if stride == 0 { row } else { stride as usize };
-    if stride < row || data.len() < stride * dh {
+/// Copy `h` rows of `row` bytes out of a frame whose rows are `stride` bytes apart
+/// (`stride == 0` = tight, as depthai reports it), into one tightly packed Vec —
+/// the one copy the owned-Vec API mandates. A downscaled/aligned frame is often
+/// padded to an alignment boundary; honouring the stride instead of dropping every
+/// such frame is what keeps the stream alive. `None` on a malformed (zero-sized or
+/// too short) frame: skip it rather than kill the stream.
+pub(crate) fn repack_rows(data: &[u8], row: usize, h: usize, stride: usize) -> Option<Vec<u8>> {
+    if row == 0 || h == 0 {
         return None;
     }
-    let mut out = Vec::with_capacity(dw * dh);
-    for y in 0..dh {
-        let src = &data[y * stride..y * stride + row];
-        out.extend(
-            src.chunks_exact(2)
-                .map(|b| u16::from_le_bytes([b[0], b[1]])),
-        );
+    let stride = if stride == 0 { row } else { stride };
+    // The last row need not be padded.
+    if stride < row || data.len() < (h - 1) * stride + row {
+        return None;
+    }
+    if stride == row {
+        return Some(data[..row * h].to_vec());
+    }
+    let mut out = Vec::with_capacity(row * h);
+    for y in 0..h {
+        out.extend_from_slice(&data[y * stride..y * stride + row]);
     }
     Some(out)
 }
 
+/// [`repack_rows`] for a `RAW16` depth frame, as little-endian `u16` millimetres.
+pub(crate) fn repack_depth(data: &[u8], dw: u32, dh: u32, stride: u32) -> Option<Vec<u16>> {
+    let bytes = repack_rows(data, dw as usize * 2, dh as usize, stride as usize)?;
+    Some(
+        bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::repack_depth;
+    use super::{repack_depth, repack_rows};
+
+    #[test]
+    fn repack_rows_accepts_unpadded_last_row() {
+        // 2 rows of 3 bytes, stride 4, last row unpadded: 4 + 3 = 7 bytes suffice.
+        let data = [1u8, 2, 3, 0xEE, 4, 5, 6];
+        assert_eq!(repack_rows(&data, 3, 2, 4).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert!(repack_rows(&data[..6], 3, 2, 4).is_none());
+        assert!(repack_rows(&data, 3, 0, 4).is_none());
+        // Tight input is a straight copy.
+        assert_eq!(
+            repack_rows(&data[..6], 3, 2, 0).unwrap(),
+            vec![1, 2, 3, 0xEE, 4, 5]
+        );
+    }
 
     #[test]
     fn repack_honours_padded_stride() {

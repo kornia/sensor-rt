@@ -111,7 +111,7 @@ fn main() -> Result<(), BoxError> {
     if rgb > 1 {
         println!(
             "rgb timestamps span {:.2}s (epoch ns {first_ts}..{last_ts})",
-            (last_ts - first_ts) as f64 / 1e9
+            last_ts.abs_diff(first_ts) as f64 / 1e9
         );
     }
     if src.has_depth() && depth_dims.0 > 0 {

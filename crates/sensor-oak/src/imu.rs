@@ -108,7 +108,7 @@ impl OakSource {
         // One clock pair for the whole drain, taken only if a batch actually arrives.
         let mut offset: Option<i128> = None;
         while out.len() - start < cap {
-            let Some(batch) = self.pop(&q, "IMU", None) else {
+            let Some(batch) = self.pop(&q, crate::Which::Imu, None).ok().flatten() else {
                 break;
             };
             let offset = *offset.get_or_insert_with(policy::steady_epoch_offset_now);
