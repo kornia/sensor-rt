@@ -2,7 +2,7 @@
 //! it (uint16 mm) + an on-device H.264 colour stream.
 //!
 //! This is the colour/depth counterpart to the raw [`stereo`](crate::stereo) path —
-//! the camera-producer source for the site (`flux-oak`). The three outputs are
+//! the source a camera producer publishes from. The three outputs are
 //! **decoupled**: colour, depth, and encoded video each come out of their own queue
 //! ([`next_rgb`](OakSource::next_rgb) / [`next_depth`](OakSource::next_depth) /
 //! [`next_video`](OakSource::next_video)), pulled independently and paired downstream
@@ -12,8 +12,8 @@
 //!
 //! **Host-only, no CUDA, no `vrt`.** Frames come out as owned host buffers (the shim
 //! pins the device buffer only until the next poll, so each `next_*` copies its bytes
-//! out); the consumer owns any GPU upload. A `flux-oak`-style producer that only
-//! encodes + republishes builds no GPU stack at all.
+//! out); the consumer owns any GPU upload. A producer that only encodes and
+//! republishes builds no GPU stack at all.
 
 use crate::{device_id_cstring, ffi, last_error, BoxError, OakSource};
 

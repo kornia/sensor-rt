@@ -52,8 +52,8 @@ already tight RGB8 (zero extra copies).
   (`open_stereo`) AND the restored RGBD + H.264 path (`open_rgbd` /
   `open_rgbd_video` — colour, aligned depth, on-device H.264, all un-gated since
   d89fa82), with the on-board IMU available in both. The repo lives at the
-  **kornia org** (`kornia/sensor-rt`); `flux-oak` no longer needs the old
-  `edgarriba/sensor-rt` pin.
+  **kornia org** (`kornia/sensor-rt`); downstream consumers no longer need the
+  old `edgarriba/sensor-rt` pin.
 - **Build cap**: `-j2` (`CARGO_BUILD_JOBS=2`) — parallel heavy builds OOM the 7.4 GB Orin.
 
 ## Commands

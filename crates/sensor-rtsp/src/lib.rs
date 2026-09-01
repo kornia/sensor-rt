@@ -346,7 +346,7 @@ impl RtspSource {
         // never parsed as pipeline DSL, fully removing the injection surface.
         // A `tee` right after h264parse forks the compressed bitstream: one branch keeps the existing
         // decode path (NVMM RGBD + CPU RGBA appsinks), the other exposes the ENCODED H.264 to
-        // `next_h264()` for zero-transcode republish (e.g. flux-web/Foxglove/recording). `config-interval
+        // `next_h264()` for zero-transcode republish (a viewer, Foxglove, a recorder). `config-interval
         // =-1` re-sends SPS/PPS before every keyframe so a mid-stream subscriber can start decoding, and
         // `stream-format=byte-stream,alignment=au` yields Annex-B access units (what browsers/Foxglove
         // want). Each tee branch gets its own queue (tee requirement); the h264 branch leaks downstream

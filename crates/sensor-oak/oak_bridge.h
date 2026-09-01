@@ -11,8 +11,8 @@
  *     it (uint16 mm) + an on-device H.264 colour stream. The colour, depth, and
  *     video are DECOUPLED — each on its own queue, pulled + timestamped
  *     independently (oak_poll_rgb / oak_poll_depth / oak_poll_video), paired
- *     downstream by their shared host-synced timeline. This is the site's camera
- *     producer path (flux-oak). */
+ *     downstream by their shared host-synced timeline. This is the camera-producer
+ *     path: encode + republish, no host-side pairing required. */
 #ifndef OAK_BRIDGE_H
 #define OAK_BRIDGE_H
 

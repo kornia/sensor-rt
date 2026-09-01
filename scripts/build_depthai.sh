@@ -39,9 +39,9 @@ fi
 
 # NO patches are applied here: this repo builds depthai-core AS PINNED. A configuration
 # that needs source changes (e.g. DEPTHAI_OPENCV_SUPPORT=OFF, which does not link upstream
-# as of v3.7.1) is the CALLER's choice, so the caller owns the fixes — see
-# flux-xlerobot/deploy/depthai-patches/ and its laptop_setup.sh. The real fix is upstreaming
-# them; until then, nothing in this library repo modifies vendored third-party source.
+# as of v3.7.1) is the CALLER's choice, so the caller owns the fixes and applies them to
+# the checkout before invoking this script. The real fix is upstreaming them; until then,
+# nothing in this library repo modifies vendored third-party source.
 
 echo "[depthai] configuring (Release, shared) ..."
 cmake -S "$SRC" -B "$SRC/build" -G Ninja \
