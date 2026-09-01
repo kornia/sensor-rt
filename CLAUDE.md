@@ -17,7 +17,7 @@ Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
 |-------|-----|------|
 | `crates/nvbuf-sys` | `nvbuf_sys` | FFI: NvBufSurface → CUDA device ptr from NVMM DMA-BUF (`links = nvbufsurface`) |
 | `crates/sensor-rtsp` | `sensor_rtsp` | RTSP/H.264 source, NVMM → CUDA, emits device `Image<u8,3>` |
-| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`) and **RGBD + H.264** (`open_rgbd`). Bundles the depthai C shim (no separate `-sys` crate); depends on NO inference runtime and never touches CUDA |
+| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`) and **RGBD + H.264** (`open_rgbd`). **Pure Rust** on the `depthai` safe wrapper (kornia/depthai-rs); all OAK policy lives in `src/policy.rs` + `src/graph.rs`, unit-tested. Depends on NO inference runtime and never touches CUDA |
 | `crates/sensor-types` | `sensor_types` | Frame-timing leaf shared by every driver: `FrameMeta`, `Stamped<T>` (zero deps) |
 
 ## Architecture
@@ -36,11 +36,18 @@ already tight RGB8 (zero extra copies).
 
 - **GStreamer + libnvbufsurface are system/JetPack** (build + runtime) — NOT conda.
 - **OAK-D needs the depthai prefix** under `vendor/depthai` (or `DEPTHAI_PREFIX=…`);
-  runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath). `sensor-oak`
-  bakes an absolute rpath — rebuild from scratch if `vendor/` moves. The source is
-  the **`vendor/depthai-core` git submodule** pinned to a release tag (`v3.7.1`):
+  runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath). The native
+  link now happens in **`depthai-sys`** (kornia/depthai-rs), which bakes an absolute
+  rpath — rebuild from scratch if `vendor/` moves. The source is still the
+  **`vendor/depthai-core` git submodule** pinned to `v3.7.1`:
   `git submodule update --init --recursive` then `pixi run depthai-build` to
-  produce the prefix.
+  produce the prefix. `DEPTHAI_SYS_SKIP_NATIVE=1` gives a check-only build
+  (error-only stub) on a machine without the prefix.
+- **sensor-oak has no C++.** Everything OAK-specific that is a *decision* — env knobs
+  (`OAK_*`), the steady→epoch clock shift, the IMU rotation gate, the calibration
+  unit/spec traps, the degrade rules, stride repacks — is Rust in
+  `crates/sensor-oak/src/{policy,graph}.rs` with unit tests. The `depthai` crate
+  underneath is faithful and unopinionated; do not push policy down into it.
 - **Upstream only**: all `vrt-*` deps come from the public `kornia/vision-rt`. Do
   NOT point them at a fork. Upstream deliberately has no
   `FrameMeta`/`Stamped` (producer concepts) — those live in `crates/sensor-types`.

@@ -7,17 +7,18 @@
 //! per-eye intrinsics at the streamed size, per-eye distortion, and the metric left→right
 //! extrinsic.
 //!
-//! Two conventions are worth stating out loud, because depthai's own defaults get both wrong for
-//! this purpose and neither error is visible in the output:
+//! Two conventions are worth stating out loud, because depthai's getters default them
+//! inconsistently (`getCameraExtrinsics` → calibrated + centimetres,
+//! `getBaselineDistance` → spec + centimetres) and neither error is visible in the output:
 //!
 //! * the translation is the **calibrated** one, not the board-design ("spec") one, and
 //! * it is in **metres**, not depthai's default centimetres.
 //!
 //! [`OakStereoCalib::baseline_m`] is derived from the very same extrinsic as the rotation, so the
-//! two can never come from different sources — unlike `getBaselineDistance()`, which carries the
-//! identical pair of defaults independently.
+//! two can never come from different sources. The read itself lives in
+//! `graph::read_stereo_calib`, where both choices are passed explicitly.
 
-use crate::{last_error, BoxError, OakSource};
+use crate::{BoxError, OakSource};
 
 /// Lens model the factory calibration was fitted with. Mirrors `dai::CameraModel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,11 +34,11 @@ pub enum OakCameraModel {
 }
 
 impl OakCameraModel {
-    fn from_raw(v: i32) -> Self {
-        match v {
-            0 => Self::Perspective,
-            1 => Self::Fisheye,
-            other => Self::Other(other),
+    pub(crate) fn from_depthai(m: depthai::CameraModel) -> Self {
+        match m {
+            depthai::CameraModel::Perspective => Self::Perspective,
+            depthai::CameraModel::Fisheye => Self::Fisheye,
+            other => Self::Other(other.to_raw()),
         }
     }
 }
@@ -114,60 +115,15 @@ impl OakSource {
     /// there is no useful degraded mode for a metric stereo consumer, and a zero baseline would
     /// otherwise reach a rectifier as `NaN` remap tables.
     pub fn stereo_calib(&self) -> Result<OakStereoCalib, BoxError> {
-        let mut raw = crate::ffi::OakStereoCalibRaw::default();
-        // SAFETY: `self.dev` is a live handle owned by this source, and `raw` is a valid,
-        // fully-initialised out-param of exactly the type the shim writes.
-        let rc = unsafe { crate::ffi::oak_stereo_calibration(self.dev, &mut raw) };
-        if rc != 0 || raw.valid == 0 {
-            return Err(last_error("oak_stereo_calibration"));
-        }
-
-        let eye = |k: &[f32; 9], d: &[f32; 14], n: i32, model: i32| OakCameraCalib {
-            fx: k[0] as f64,
-            fy: k[4] as f64,
-            cx: k[2] as f64,
-            cy: k[5] as f64,
-            dist: std::array::from_fn(|i| d[i] as f64),
-            n_dist: n.clamp(0, 14) as usize,
-            model: OakCameraModel::from_raw(model),
-        };
-
-        // The 4x4 is row-major, so the rotation block is rows 0..3 cols 0..3 and the translation is
-        // column 3 — indices 3, 7, 11.
-        let e = &raw.t_left_right;
-        let r_left_right = std::array::from_fn(|i| std::array::from_fn(|j| e[i * 4 + j] as f64));
-        let t_left_right = [e[3] as f64, e[7] as f64, e[11] as f64];
-
-        Ok(OakStereoCalib {
-            width: raw.width.max(0) as u32,
-            height: raw.height.max(0) as u32,
-            left: eye(&raw.left_k, &raw.left_dist, raw.left_n_dist, raw.left_model),
-            right: eye(
-                &raw.right_k,
-                &raw.right_dist,
-                raw.right_n_dist,
-                raw.right_model,
-            ),
-            r_left_right,
-            t_left_right,
-            baseline_m: raw.baseline_m as f64,
-        })
+        self.stereo_calib
+            .clone()
+            .map_err(|why| format!("stereo calibration failed: {why}").into())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // The `#[repr(C)]` mirror must not drift from the C struct's layout. There is no way to ask the
-    // C compiler here, so pin the sizes/offsets the header's field order implies: 2 ints + 18 + 28
-    // floats + 4 ints + 16 floats + 1 float + 1 int, all 4-byte, no padding.
-    #[test]
-    fn raw_calib_layout_is_packed_as_the_header_declares() {
-        let expect = 4 * (2 + 9 + 9 + 14 + 14 + 2 + 2 + 16 + 1 + 1);
-        assert_eq!(std::mem::size_of::<crate::ffi::OakStereoCalibRaw>(), expect);
-        assert_eq!(std::mem::align_of::<crate::ffi::OakStereoCalibRaw>(), 4);
-    }
 
     // p1/p2 live at indices 2,3 (OpenCV order), so a calibration with only tangential terms must
     // NOT look like one with radial terms. Guards the mapping comment on `dist`.
@@ -190,5 +146,21 @@ mod tests {
         c.dist[8] = 0.0;
         c.model = OakCameraModel::Fisheye;
         assert!(!c.is_brown_conrady());
+    }
+
+    #[test]
+    fn camera_model_maps_unknowns_to_other() {
+        assert_eq!(
+            OakCameraModel::from_depthai(depthai::CameraModel::Perspective),
+            OakCameraModel::Perspective
+        );
+        assert_eq!(
+            OakCameraModel::from_depthai(depthai::CameraModel::Fisheye),
+            OakCameraModel::Fisheye
+        );
+        assert_eq!(
+            OakCameraModel::from_depthai(depthai::CameraModel::Equirectangular),
+            OakCameraModel::Other(2)
+        );
     }
 }

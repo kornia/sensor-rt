@@ -59,6 +59,10 @@ kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", branch = "main",
 # repos together, or neither.
 kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main", features = ["cuda"] }
 kornia-io      = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+# depthai-core, via the safe `depthai` wrapper (kornia/depthai-rs). sensor-oak
+# holds no C++ any more; depthai-sys builds/links the native shim. Pin by git rev
+# once kornia/depthai-rs is published; the path is for lockstep local development.
+depthai = { path = "../depthai-rs/depthai" }
 # sensor-rt internal crates
 nvbuf-sys    = { path = "crates/nvbuf-sys" }
 sensor-types = { path = "crates/sensor-types" }

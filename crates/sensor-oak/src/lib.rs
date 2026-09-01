@@ -1,33 +1,23 @@
 //! OAK-D camera source: a time-synced **stereo pair + IMU**, or **RGBD + H.264**,
-//! plus factory intrinsics. Safe wrapper over the bundled depthai-core C shim
-//! (`oak_bridge.h`), which this crate's `build.rs` compiles and links.
+//! plus factory intrinsics. Pure Rust on top of the [`depthai`] safe wrapper
+//! (kornia/depthai-rs) — no C++ shim in this crate.
 //!
 //! Two independent modalities behind one type: see [`stereo`] for the raw pair,
 //! [`rgbd`] for colour/depth/video, and [`imu`] for the inertial stream available
 //! alongside either — drained independently, because the IMU reports far faster
 //! than frames.
 //!
+//! Everything OAK-specific that is a *decision* — env knobs, the steady→epoch
+//! clock shift, the IMU rotation gate, the calibration unit traps, the degrade
+//! rules — lives in [`policy`] and [`graph`], unit-tested, instead of inside a
+//! C++ shim. The `depthai` crate underneath is faithful and unopinionated.
+//!
 //! **Nothing here touches CUDA**: frames come out on the host and the consumer owns
 //! any upload, so a process that only wants pixels builds no GPU stack.
 
-use std::ffi::CString;
+use std::collections::VecDeque;
 
-/// Turn an optional device id into a C string (`None` → NULL, "first available").
-/// The caller keeps it alive across the FFI call.
-pub(crate) fn device_id_cstring(device: Option<&str>) -> Result<Option<CString>, BoxError> {
-    device
-        .map(CString::new)
-        .transpose()
-        .map_err(|e| format!("bad device id: {e}").into())
-}
-
-/// The shim's last error for the calling thread, as a `BoxError`.
-pub(crate) fn last_error(what: &str) -> BoxError {
-    let e = unsafe { std::ffi::CStr::from_ptr(ffi::oak_last_error()) }
-        .to_string_lossy()
-        .into_owned();
-    format!("{what} failed: {e}").into()
-}
+use depthai::{Device, ImgFrame, ImuData, MessageGroup, OutputQueue, Pipeline};
 
 /// Boxed error, `Send + Sync` so a source can be moved between threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -52,12 +42,10 @@ pub struct OakIntrinsics {
     pub cy: f32,
 }
 
-// Raw FFI over the depthai-core C shim (`oak_bridge.h`), built by this crate's
-// build.rs. Private: unsafe pointer soup is an implementation detail, and every
-// caller goes through the safe wrappers below.
 mod calib;
-mod ffi;
+mod graph;
 mod imu;
+mod policy;
 mod rgbd;
 mod stereo;
 pub use calib::{OakCameraCalib, OakCameraModel, OakStereoCalib};
@@ -66,61 +54,81 @@ pub use stereo::OakStereoFrame;
 
 /// OAK-D source: [`open_stereo`](Self::open_stereo), then [`next_stereo`](Self::next_stereo)
 /// in a loop, draining [`next_imu`](Self::next_imu) alongside it.
+///
+/// Field order matters for drop order: queues first, then the pipeline (stopped
+/// in [`Drop`]), then the device (closed there too).
 pub struct OakSource {
-    dev: *mut ffi::OakDevice,
+    // STEREO+IMU modality (open_stereo): Sync'd {left,right} MessageGroup.
+    stereo_q: Option<OutputQueue<MessageGroup>>,
+    // RGBD+H.264 modality (open_rgbd): colour, depth, and video are DECOUPLED — each
+    // on its own queue, pulled independently and paired downstream by timestamp.
+    rgb_q: Option<OutputQueue<ImgFrame>>,
+    depth_q: Option<OutputQueue<ImgFrame>>,
+    video_q: Option<OutputQueue<ImgFrame>>,
+    // On-board IMU, SHARED by both modalities (optional in each). The `has_*`
+    // accessors derive from these queue options: a present queue IS the capability.
+    imu_q: Option<OutputQueue<ImuData>>,
+    pipeline: Pipeline,
+    device: Device,
     width: u32,
     height: u32,
     seq: u64,
     intr: OakIntrinsics,
-    has_imu: bool,
-    /// IMU samples are calibration-rotated into the modality's reference camera optical frame
-    /// (CAM_A on RGBD, CAM_B/left on stereo; false = raw IMU-chip frame — see
-    /// [`next_imu`](Self::next_imu)).
+    /// IMU-chip → camera-optical rotation (row-major) applied to every sample in
+    /// `next_imu`. Identity + `imu_aligned = false` when the calibration carries no
+    /// usable IMU extrinsics (samples then stay in the raw chip frame).
+    imu_rot: [f32; 9],
     imu_aligned: bool,
-    /// Reused staging buffer for `next_imu`, so draining inertial samples every
-    /// frame costs no allocation once it has grown.
-    imu_scratch: Vec<ffi::OakImuSample>,
-    // RGBD modality (oak_open_rgbd) capabilities, read back from the device after open. All false for a
-    // stereo source. `has_sync` is false when the device auto-fell-back to video-only (mono/uncalibrated).
-    has_depth: bool,
-    has_video: bool,
-    has_sync: bool,
+    /// IMU samples popped off the queue but not yet handed to the caller.
+    imu_pending: VecDeque<ImuSample>,
+    /// Packets dropped by the zero-timestamp gate — surfaced so a half-rate IMU is
+    /// visible instead of reading as "firmware delivers 98 Hz".
+    imu_ts_skipped: u64,
+    /// Tightly-packed depth when the device row is stride-padded.
+    depth_repack: Vec<u16>,
+    /// Full CAM_B/CAM_C calibration, read once at `open_stereo`. `Err(why)` on the
+    /// RGBD modality and on a wiped EEPROM; surfaced by `stereo_calib()`.
+    stereo_calib: Result<OakStereoCalib, String>,
 }
 
-// SAFETY: the device handle is used single-threaded by the owning loop; the CUDA
-// stream is Arc-backed. (depthai's own threads live behind the C shim.)
-unsafe impl Send for OakSource {}
-
 impl OakSource {
-    /// Wrap a device the shim has already opened (either modality), reading its
-    /// capabilities back from it rather than assuming what the constructor asked
-    /// for — the IMU may be absent on a given board, and `has_sync`/`has_depth`
-    /// depend on the device's calibration, none of which the caller can predict.
-    /// The RGBD-only getters simply report `false` on a stereo device, so one
-    /// constructor serves both open paths.
+    /// Assemble a source from an opened device + started pipeline and its queues.
+    /// Capabilities are whatever queues the open path managed to create — the IMU
+    /// may be absent on a given board, and `has_sync`/`has_depth` depend on the
+    /// device's calibration, none of which the caller can predict.
     ///
     /// `width`/`height` are the *requested* size and are kept only so callers can size
     /// buffers before the first frame; each frame reports its own actual dimensions.
-    pub(crate) fn from_open_device(
-        dev: *mut ffi::OakDevice,
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble(
+        device: Device,
+        pipeline: Pipeline,
         width: u32,
         height: u32,
-    ) -> Result<Self, BoxError> {
-        let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
-        unsafe { ffi::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
-        Ok(Self {
-            dev,
+        intr: OakIntrinsics,
+        queues: Queues,
+        imu: (Option<OutputQueue<ImuData>>, [f32; 9], bool),
+        stereo_calib: Result<OakStereoCalib, String>,
+    ) -> Self {
+        Self {
+            stereo_q: queues.stereo,
+            rgb_q: queues.rgb,
+            depth_q: queues.depth,
+            video_q: queues.video,
+            imu_q: imu.0,
+            pipeline,
+            device,
             width,
             height,
             seq: 0,
-            intr: OakIntrinsics { fx, fy, cx, cy },
-            has_imu: unsafe { ffi::oak_has_imu(dev) } != 0,
-            imu_aligned: unsafe { ffi::oak_imu_aligned(dev) } != 0,
-            imu_scratch: Vec::new(),
-            has_depth: unsafe { ffi::oak_has_depth(dev) } != 0,
-            has_video: unsafe { ffi::oak_has_video(dev) } != 0,
-            has_sync: unsafe { ffi::oak_has_sync(dev) } != 0,
-        })
+            intr,
+            imu_rot: imu.1,
+            imu_aligned: imu.2,
+            imu_pending: VecDeque::new(),
+            imu_ts_skipped: 0,
+            depth_repack: Vec::new(),
+            stereo_calib,
+        }
     }
 
     pub fn intrinsics(&self) -> OakIntrinsics {
@@ -134,25 +142,56 @@ impl OakSource {
     }
 }
 
+/// The image queues an open path produced (all `None` where a modality does not
+/// have that stream, or degraded).
+#[derive(Default)]
+pub(crate) struct Queues {
+    pub(crate) stereo: Option<OutputQueue<MessageGroup>>,
+    pub(crate) rgb: Option<OutputQueue<ImgFrame>>,
+    pub(crate) depth: Option<OutputQueue<ImgFrame>>,
+    pub(crate) video: Option<OutputQueue<ImgFrame>>,
+}
+
 /// Reboot a PoE OAK that has wedged in bootloader state — the failure mode where a camera drops off and
-/// no amount of in-process `open_video*` retrying recovers it (the firmware needs a bootloader-triggered
+/// no amount of in-process `open_*` retrying recovers it (the firmware needs a bootloader-triggered
 /// reboot). `target` = the camera's IP/name or deviceId (`None` = first wedged device found). Returns
 /// `Ok(true)` if a device was kicked (wait ~8s for it to reboot before re-opening), `Ok(false)` if there
 /// was nothing to kick (target absent or healthy), `Err` on a driver error. Blocking — call from the
 /// reconnect path, not the drain loop.
 pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
-    let c = device_id_cstring(target)?;
-    let ptr = c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
-    let rc = unsafe { ffi::oak_kick(ptr) };
-    match rc {
-        1 => Ok(true),
-        0 => Ok(false),
-        _ => Err(last_error("oak_kick")),
+    let infos = Device::all_available().map_err(|e| format!("enumerate devices failed: {e}"))?;
+    for info in &infos {
+        if let Some(t) = target {
+            if info.name != t && info.device_id != t {
+                continue;
+            }
+        }
+        // The wedge: a PoE device stuck in the bootloader. A healthy device enumerates
+        // UNBOOTED / BOOTED / FLASH_BOOTED and opens normally — kicking it would be a
+        // pointless reboot.
+        if info.state != depthai::DeviceState::Bootloader {
+            if target.is_some() {
+                return Ok(false);
+            }
+            continue;
+        }
+        // Open+drop the bootloader connection: construction connects to the wedged
+        // firmware, and destruction reboots the device to an unbooted state (the
+        // manual recovery, in-process).
+        let bl = depthai::DeviceBootloader::open(info)
+            .map_err(|e| format!("bootloader open failed: {e}"))?;
+        drop(bl);
+        return Ok(true);
     }
+    Ok(false)
 }
 
 impl Drop for OakSource {
     fn drop(&mut self) {
-        unsafe { ffi::oak_close(self.dev) };
+        // Stop the pipeline, then gracefully close the XLink connection before the
+        // handles are released, so the firmware isn't torn down mid-stream (avoids a
+        // spurious crash-dump on USB2 disconnect). Errors are irrelevant on the way out.
+        let _ = self.pipeline.stop();
+        let _ = self.device.close();
     }
 }
