@@ -17,7 +17,7 @@ Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
 |-------|-----|------|
 | `crates/nvbuf-sys` | `nvbuf_sys` | FFI: NvBufSurface → CUDA device ptr from NVMM DMA-BUF (`links = nvbufsurface`) |
 | `crates/sensor-rtsp` | `sensor_rtsp` | RTSP/H.264 source, NVMM → CUDA, emits device `Image<u8,3>` |
-| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`). Bundles the depthai C shim (no separate `-sys` crate); depends on NO inference runtime and never touches CUDA |
+| `crates/sensor-oak` | `sensor_oak` | OAK-D **stereo pair + IMU** (`open_stereo`) and **RGBD + H.264** (`open_rgbd`). Bundles the depthai C shim (no separate `-sys` crate); depends on NO inference runtime and never touches CUDA |
 | `crates/sensor-types` | `sensor_types` | Frame-timing leaf shared by every driver: `FrameMeta`, `Stamped<T>` (zero deps) |
 
 ## Architecture
@@ -48,14 +48,12 @@ already tight RGB8 (zero extra copies).
   **driver crates must not depend on `vrt`**, so nothing that merely wants frames has
   to build TensorRT. Upstream model crates are **submit-only** (`alloc_result` +
   `submit` + an explicit `stream.synchronize()`); there is no `run()`.
-- **Colour / depth / H.264 are deliberately absent, and are planned to return.** The
-  RGB-D and video pipelines were removed while stereo+IMU is the modality under
-  development — not abandoned. They are recoverable from this repo's history (see
-  `feat(oak)!: reduce the driver to the stereo + IMU pipeline only`). Until they are
-  back, `flux-oak` — whose whole job is publishing H.264 + RGB + depth — **must stay
-  pinned to a pre-removal rev of the old `edgarriba/sensor-rt`**, which is also why
-  that repo cannot be retired yet. When restoring, prefer bringing them back behind a
-  cargo feature so the lean stereo default is preserved.
+- **Two OAK modalities, both first-class.** `sensor-oak` exposes stereo+IMU
+  (`open_stereo`) AND the restored RGBD + H.264 path (`open_rgbd` /
+  `open_rgbd_video` — colour, aligned depth, on-device H.264, all un-gated since
+  d89fa82), with the on-board IMU available in both. The repo lives at the
+  **kornia org** (`kornia/sensor-rt`); downstream consumers no longer need the
+  old `edgarriba/sensor-rt` pin.
 - **Build cap**: `-j2` (`CARGO_BUILD_JOBS=2`) — parallel heavy builds OOM the 7.4 GB Orin.
 
 ## Commands

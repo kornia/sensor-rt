@@ -2,7 +2,7 @@
 //! it (uint16 mm) + an on-device H.264 colour stream.
 //!
 //! This is the colour/depth counterpart to the raw [`stereo`](crate::stereo) path —
-//! the camera-producer source for the site (`flux-oak`). The three outputs are
+//! the source a camera producer publishes from. The three outputs are
 //! **decoupled**: colour, depth, and encoded video each come out of their own queue
 //! ([`next_rgb`](OakSource::next_rgb) / [`next_depth`](OakSource::next_depth) /
 //! [`next_video`](OakSource::next_video)), pulled independently and paired downstream
@@ -12,10 +12,10 @@
 //!
 //! **Host-only, no CUDA, no `vrt`.** Frames come out as owned host buffers (the shim
 //! pins the device buffer only until the next poll, so each `next_*` copies its bytes
-//! out); the consumer owns any GPU upload. A `flux-oak`-style producer that only
-//! encodes + republishes builds no GPU stack at all.
+//! out); the consumer owns any GPU upload. A producer that only encodes and
+//! republishes builds no GPU stack at all.
 
-use crate::{device_id_cstring, ffi, last_error, BoxError, OakIntrinsics, OakSource};
+use crate::{device_id_cstring, ffi, last_error, BoxError, OakSource};
 
 impl OakSource {
     /// Open an OAK in the RGBD + H.264 modality: CAM_A colour (RGB888) + an on-device H.264 colour
@@ -26,27 +26,39 @@ impl OakSource {
     /// at runtime and crash the pipeline. Even with `depth = true` the device auto-falls-back to
     /// video-only if it can't actually produce depth (mono, or blank calibration); check
     /// [`has_sync`](Self::has_sync) after opening to pick the drain loop.
+    ///
+    /// `imu_hz > 0` also runs the on-board IMU (accel + gyro) on its own queue, drained with
+    /// [`next_imu`](Self::next_imu) on the same host-epoch timeline as the frames; `0` disables it.
+    /// The shim preflights with `getConnectedIMU()` and only builds the IMU node when the board
+    /// actually carries one, so an IMU-less board degrades ([`has_imu`](Self::has_imu) is `false`)
+    /// without ever risking the image streams — never an error. Rates above 400 Hz (the BNO086
+    /// gyro maximum) are clamped. When the EEPROM carries valid IMU extrinsics, samples come out
+    /// in the CAM_A optical frame — check [`imu_aligned`](Self::imu_aligned); an absent or
+    /// rejected calibration is logged to stderr by the shim with the reason.
     pub fn open_rgbd(
         device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
         depth: bool,
+        imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        Self::open_rgbd_inner(device, width, height, fps, depth, false)
+        Self::open_rgbd_inner(device, width, height, fps, depth, false, imu_hz)
     }
 
     /// Open **video-only**: build ONLY the on-device H.264 encoder — no RGB888/depth output — so the
     /// device transmits just the small bitstream (low-bandwidth viewing over USB2 / a shared gigabit
     /// link, where raw RGBD would saturate it). [`next_rgb`](Self::next_rgb) / [`next_depth`](Self::next_depth)
-    /// yield nothing; drain [`next_video`](Self::next_video). `device`: see [`open_rgbd`](Self::open_rgbd).
+    /// yield nothing; drain [`next_video`](Self::next_video). `device` and `imu_hz`: see
+    /// [`open_rgbd`](Self::open_rgbd) — the IMU runs fine alongside the video-only pipeline.
     pub fn open_rgbd_video(
         device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
+        imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        Self::open_rgbd_inner(device, width, height, fps, false, true)
+        Self::open_rgbd_inner(device, width, height, fps, false, true, imu_hz)
     }
 
     fn open_rgbd_inner(
@@ -56,10 +68,16 @@ impl OakSource {
         fps: u32,
         depth: bool,
         video_only: bool,
+        imu_hz: u32,
     ) -> Result<Self, BoxError> {
         let id_c = device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
         // H.264 is always on in this modality — the whole point is the efficient colour stream.
+        // No open-retry here: the shim preflights the IMU with getConnectedIMU() before building
+        // the node, so an IMU-less board already degrades inside ONE open. A failure at this
+        // point is a real device error, and retrying (especially with `device = None`) could
+        // silently bind a different physical camera on a multi-OAK rig.
         let dev = unsafe {
             ffi::oak_open_rgbd(
                 id_ptr,
@@ -69,36 +87,13 @@ impl OakSource {
                 1,
                 depth as i32,
                 video_only as i32,
+                imu_hz as i32,
             )
         };
         if dev.is_null() {
             return Err(last_error("oak_open_rgbd"));
         }
-        Self::from_open_rgbd_device(dev, width, height)
-    }
-
-    /// Wrap an RGBD device the shim has already opened, reading its capabilities back from it rather
-    /// than assuming what the constructor asked for — `has_sync`/`has_depth` in particular depend on the
-    /// device's calibration, which the caller cannot predict.
-    fn from_open_rgbd_device(
-        dev: *mut ffi::OakDevice,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, BoxError> {
-        let (mut fx, mut fy, mut cx, mut cy) = (0.0f32, 0.0, 0.0, 0.0);
-        unsafe { ffi::oak_intrinsics(dev, &mut fx, &mut fy, &mut cx, &mut cy) };
-        Ok(Self {
-            dev,
-            width,
-            height,
-            seq: 0,
-            intr: OakIntrinsics { fx, fy, cx, cy },
-            has_imu: false,
-            imu_scratch: Vec::new(),
-            has_depth: unsafe { ffi::oak_has_depth(dev) } != 0,
-            has_video: unsafe { ffi::oak_has_video(dev) } != 0,
-            has_sync: unsafe { ffi::oak_has_sync(dev) } != 0,
-        })
+        Self::from_open_device(dev, width, height)
     }
 
     /// Whether `StereoDepth` is running (so [`next_depth`](Self::next_depth) can yield aligned depth).

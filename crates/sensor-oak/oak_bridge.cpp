@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -40,8 +42,16 @@ static uint64_t steady_to_epoch_ns(std::chrono::steady_clock::time_point t,
     return (uint64_t)(duration_cast<nanoseconds>(t.time_since_epoch()) + offset).count();
 }
 
+// ONE offset for the whole process, like the IMU drain hoists it per batch: frames and IMU
+// samples are promised the same timeline (oak_bridge.h), and recomputing per frame let the
+// two clocks' relative jitter separate a frame stamp from an IMU stamp taken at one instant.
+static std::chrono::nanoseconds steady_epoch_offset_cached() {
+    static const std::chrono::nanoseconds off = steady_epoch_offset();
+    return off;
+}
+
 static uint64_t frame_epoch_ns(const std::shared_ptr<dai::ImgFrame>& f) {
-    return steady_to_epoch_ns(f->getTimestamp(), steady_epoch_offset());
+    return steady_to_epoch_ns(f->getTimestamp(), steady_epoch_offset_cached());
 }
 
 // Connect to an OAK by id (NULL/"" = first available), honouring the USB-speed cap below.
@@ -78,7 +88,17 @@ static int h264_kbps() {
 // (CAM_B + CAM_C) AND a readable factory calibration (a wiped/blank EEPROM reads back fx=0, which makes
 // StereoDepth emit garbage/zero-scale depth). Used to auto-fall-back an uncalibrated or mono camera to
 // the lean video-only pipeline instead of pulling raw RGB for a depth that would be unusable.
-static bool device_has_stereo(const std::shared_ptr<dai::Device>& d, int w, int h) {
+// Is `socket` present on this device? One enumeration per call — the open paths ask about at
+// most three sockets, so the RPC cost is noise against pipeline construction.
+static bool has_socket(const std::shared_ptr<dai::Device>& device, dai::CameraBoardSocket socket) {
+    for (auto s : device->getConnectedCameras()) {
+        if (s == socket) return true;
+    }
+    return false;
+}
+
+static bool device_has_stereo(const std::shared_ptr<dai::Device>& d,
+                              const dai::CalibrationHandler& calib, int w, int h) {
     try {
         bool has_b = false, has_c = false;
         for (auto s : d->getConnectedCameras()) {
@@ -86,20 +106,35 @@ static bool device_has_stereo(const std::shared_ptr<dai::Device>& d, int w, int 
             else if (s == dai::CameraBoardSocket::CAM_C) has_c = true;
         }
         if (!has_b || !has_c) return false;
-        auto k = d->readCalibration().getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, w, h);
+        auto k = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, w, h);
         return k[0][0] > 0.0f;   // fx > 0 → real calibration present
     } catch (const std::exception&) { return false; }
 }
 
 struct oak_device {
     std::shared_ptr<dai::Device> device;
+    // WHY the stereo calibration read failed (empty = it didn't): surfaced by
+    // oak_stereo_calibration instead of a generic guess, and kept off the thread-local
+    // error slot so a successful open doesn't leave a stale message there.
+    std::string stereo_calib_err;
     std::unique_ptr<dai::Pipeline> pipeline;
-    // STEREO+IMU modality (oak_open_stereo):
-    std::shared_ptr<dai::MessageQueue> stereo_q; // Sync'd {left,right} MessageGroup
+    // On-board IMU, SHARED by both modalities (optional in each):
+    // NOTE the `oak_has_*` accessors derive from these queue pointers: a non-null queue IS
+    // the capability. Mirror bools existed here and could only ever restate the same fact.
     std::shared_ptr<dai::MessageQueue> imu_q;    // IMUData batches, far faster than the frame rate
     // IMU samples popped off the queue but not yet handed to the caller (see oak_poll_imu).
     std::vector<oak_imu_sample> imu_pending;
-    bool has_imu = false;     // on-board IMU running (optional even in stereo mode)
+    // Packets dropped by the zero-timestamp gate below — surfaced so a half-rate IMU (the
+    // gate eating every packet where one report is a default-initialised hole) is visible
+    // instead of reading as "firmware delivers 98 Hz".
+    uint64_t imu_ts_skipped = 0;
+    // IMU-chip → camera-optical rotation (row-major) applied to every sample in oak_poll_imu.
+    // Identity + imu_aligned=false when the calibration carries no IMU extrinsics (samples then
+    // stay in the raw chip frame, which is axis-permuted vs the camera on most boards).
+    float imu_rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+    bool imu_aligned = false;
+    // STEREO+IMU modality (oak_open_stereo):
+    std::shared_ptr<dai::MessageQueue> stereo_q; // Sync'd {left,right} MessageGroup
     // RGBD+H.264 modality (oak_open_rgbd): colour, depth, and video are DECOUPLED — each on its own
     // queue, pulled independently and paired downstream by timestamp. The cur_* frames pin the buffer
     // handed out as a raw span until the next poll of that stream (zero-copy: no host repack).
@@ -110,18 +145,19 @@ struct oak_device {
     std::shared_ptr<dai::ImgFrame> cur_depth;
     std::shared_ptr<dai::ImgFrame> cur_video;
     std::vector<uint16_t> depth_repack;  // tightly-packed depth when the device row is stride-padded
-    bool has_depth = false;   // StereoDepth running
-    bool has_video = false;   // on-device H.264 colour stream running
-    bool has_sync = false;    // colour(+depth) pipeline present; false = video-only fallback
     float fx = 0, fy = 0, cx = 0, cy = 0;
+    // Full CAM_B/CAM_C calibration, read once at oak_open_stereo (readCalibration() is an RPC, and
+    // a host rectifier needs these numbers before the first frame). `valid` stays 0 on the RGBD
+    // modality and on a wiped EEPROM.
+    oak_stereo_calib stereo_calib{};
 };
 
 // Attach an NV12 output of `color` → a hardware H.264 encoder, handing the bitstream queue to `dev`.
-// Shared by the video-only and decoupled RGBD paths so their encoder settings (BASELINE for
+// Shared by the video-only, decoupled RGBD and stereo-viz paths so their encoder settings (BASELINE for
 // Foxglove's decoder, ~4 keyframes/s for fast mid-stream join, OAK_H264_KBPS) can never drift apart.
-// `fps` is clamped to >= 1 by the caller.
 static void add_h264_encoder(dai::Pipeline& pipeline, const std::shared_ptr<dai::node::Camera>& color,
                              int width, int height, int fps, oak_device* dev) {
+    if (fps <= 0) fps = 30;
     auto* nv12_out = color->requestOutput(
         std::pair<uint32_t, uint32_t>((uint32_t)width, (uint32_t)height),
         dai::ImgFrame::Type::NV12, dai::ImgResizeMode::CROP, (float)fps, /*undistort=*/true);
@@ -131,24 +167,255 @@ static void add_h264_encoder(dai::Pipeline& pipeline, const std::shared_ptr<dai:
     enc->setBitrateKbps(h264_kbps());
     nv12_out->link(enc->input);
     dev->video_q = enc->bitstream.createOutputQueue(30, false);
-    dev->has_video = true;
 }
 
-// Read CAM_A factory intrinsics at the streamed size into `dev` (fx/fy/cx/cy). A wiped EEPROM or a
-// device without CAM_A leaves them zero — fine for viewing, so the failure is swallowed.
-static void read_rgb_intrinsics(oak_device* dev, int width, int height) {
+// The OPTIONAL attach: same encoder settings, but a board that rejects the colour node or the
+// requested NV12 output must DEGRADE (has_video stays false) rather than fail the whole open.
+// One home so the degrade POLICY cannot drift between the two optional call sites the way the
+// encoder settings cannot drift between all three. `ctx` names the modality in the log.
+static bool try_add_h264_encoder(dai::Pipeline& pipeline,
+                                 const std::shared_ptr<dai::node::Camera>& color, int width,
+                                 int height, int fps, oak_device* dev, const char* ctx) {
     try {
-        auto k = dev->device->readCalibration()
-                     .getCameraIntrinsics(dai::CameraBoardSocket::CAM_A, width, height);
+        add_h264_encoder(pipeline, color, width, height, fps, dev);
+        return true;
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "sensor-oak: H.264 viz stream unavailable on the %s path (%s) — \
+continuing without it\n", ctx, ex.what());
+        return false;
+    }
+}
+
+// Attach the on-board IMU (ACCELEROMETER_RAW + GYROSCOPE_RAW at imu_hz) on its own queue, shared by
+// both open paths. IMU is OPTIONAL: not every OAK carries one, and a missing IMU must not cost the
+// image streams — so BEFORE creating the node (and thus before it can ever reach pipeline.start()),
+// preflight with getConnectedIMU(): a board without one reports "NONE"/empty, and we skip the node
+// (has_imu stays false, streams run on). The node setup itself is host-side property setters, which
+// cannot throw — only the preflight RPC is guarded. No-op when imu_hz <= 0.
+static void add_imu_node(dai::Pipeline& pipeline, oak_device* dev, int imu_hz) {
+    if (imu_hz <= 0) return;
+    std::string imu_name;
+    try {
+        imu_name = dev->device->getConnectedIMU();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "sensor-oak: getConnectedIMU failed (%s) — skipping the IMU node\n",
+                     e.what());
+        return;
+    }
+    if (imu_name.empty() || imu_name == "NONE") {
+        std::fprintf(stderr, "sensor-oak: no on-board IMU (getConnectedIMU=\"%s\") — "
+                             "skipping the IMU node\n", imu_name.c_str());
+        return;
+    }
+    auto imu = pipeline.create<dai::node::IMU>();
+    imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER_RAW, (uint32_t)imu_hz);
+    imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_RAW, (uint32_t)imu_hz);
+    // Batch a few reports per message (fewer, larger XLink transfers) but keep the batch
+    // small enough that inertial data stays fresh relative to the frames. 5 is also the
+    // documented maxBatchReports ceiling (IMUProperties.hpp).
+    imu->setBatchReportThreshold(5);
+    imu->setMaxBatchReports(5);
+    dev->imu_q = imu->out.createOutputQueue(50, false);
+}
+
+// Resolve the IMU-chip → camera-optical rotation from the device calibration so oak_poll_imu can
+// report samples in the camera frame (what gyro priors / gravity alignment consume). Raw depthai
+// reports are in the IMU chip frame, axis-permuted vs the camera by the board mounting. Falls back
+// to identity (raw chip frame, imu_aligned=false) when the EEPROM has no IMU link or the stored
+// matrix is not a proper rotation (wiped/unfilled calibration) — degrade, never abort, but say WHY
+// on stderr so a tilted gravity gauge is diagnosable without a debugger.
+//
+// The gate is a real rotation test, not just a det check: det≈1 alone admits shears (a k=100 shear
+// has det=1 and would turn 9.81 m/s² into ~981) and ±3% scales, and every IEEE compare with NaN is
+// false, so a NaN-laced matrix sailed through `fabs(det-1) > 0.1`. Requirements, in order:
+// all 9 entries finite; det > 0 (proper, not a reflection); R·Rᵀ = I to 1e-3 (orthonormal, which
+// also pins |det| to 1); and not the EXACT identity — depthai stores identity as the "no
+// calibration" sentinel, and a real chip→camera mounting is never a perfect identity.
+static void read_imu_rotation(oak_device* dev, const dai::CalibrationHandler& calib,
+                              dai::CameraBoardSocket socket) {
+    // ONE wording for every reject path — the shared "samples stay in the raw chip frame"
+    // consequence was retyped at all six gates. Each caller supplies only WHY, so the
+    // reasons stay specific (they are the whole diagnostic value) while the consequence
+    // cannot drift.
+    auto reject = [](const char* why) {
+        std::fprintf(stderr,
+                     "sensor-oak: IMU extrinsics rejected (%s) — IMU samples stay in the raw "
+                     "chip frame\n",
+                     why);
+    };
+    if (!dev->imu_q) return;
+    try {
+        auto m = calib.getImuToCameraExtrinsics(socket);
+        if (m.size() < 3 || m[0].size() < 3 || m[1].size() < 3 || m[2].size() < 3) {
+            reject("matrix smaller than 3x3");
+            return;
+        }
+        float r[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) r[i * 3 + j] = m[i][j];
+        for (int i = 0; i < 9; ++i) {
+            if (!std::isfinite(r[i])) {
+                reject("non-finite entry");
+                return;
+            }
+        }
+        const float det = r[0] * (r[4] * r[8] - r[5] * r[7])
+                        - r[1] * (r[3] * r[8] - r[5] * r[6])
+                        + r[2] * (r[3] * r[7] - r[4] * r[6]);
+        if (det <= 0.0f) {
+            reject("determinant <= 0: a reflection, not a rotation");
+            return;
+        }
+        // Orthonormality: max |(R·Rᵀ − I)| entry. Bounds scale AND shear at once; with det > 0
+        // above this admits only proper rotations (to the EEPROM's float precision).
+        float ortho_err = 0.0f;
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                const float dot = r[i * 3] * r[j * 3] + r[i * 3 + 1] * r[j * 3 + 1]
+                                + r[i * 3 + 2] * r[j * 3 + 2];
+                ortho_err = std::max(ortho_err, std::fabs(dot - (i == j ? 1.0f : 0.0f)));
+            }
+        }
+        if (ortho_err > 1e-3f) {
+            reject("not orthonormal: |R*Rt - I| exceeds 1e-3, so it scales or shears");
+            return;
+        }
+        bool exact_identity = true;
+        for (int i = 0; i < 9; ++i) {
+            if (r[i] != (i % 4 == 0 ? 1.0f : 0.0f)) { exact_identity = false; break; }
+        }
+        if (exact_identity) {
+            reject("exact identity: depthai's not-calibrated sentinel, not a measured pose");
+            return;
+        }
+        std::copy(r, r + 9, dev->imu_rot);
+        dev->imu_aligned = true;
+    } catch (const std::exception& e) {
+        // No IMU extrinsics in the EEPROM (or the calibration read failed) — raw chip frame.
+        reject(e.what());
+    }
+}
+
+// Attach the IMU and load its extrinsics — ALWAYS both, in this order: read_imu_rotation
+// early-returns unless add_imu_node actually started the IMU, and the reference socket
+// differs per modality (CAM_A on RGBD, CAM_B on stereo). Calling only the first leaves a
+// silently unaligned IMU, indistinguishable from a board that carries no extrinsics.
+static void attach_imu(dai::Pipeline& pipeline, oak_device* dev, int imu_hz,
+                       const dai::CalibrationHandler& calib, dai::CameraBoardSocket socket) {
+    add_imu_node(pipeline, dev, imu_hz);
+    read_imu_rotation(dev, calib, socket);
+}
+
+// Read one socket's factory intrinsics at the streamed size into `dev` (fx/fy/cx/cy). A wiped
+// EEPROM or a missing socket leaves them ZERO — fine for viewing, so the failure is swallowed.
+// The reference socket differs per modality (CAM_A on RGBD, CAM_B on stereo); the zeros-on-failure
+// contract does not, which is why both paths come through here.
+static void read_intrinsics(oak_device* dev, const dai::CalibrationHandler& calib,
+                            dai::CameraBoardSocket socket, int width, int height) {
+    try {
+        auto k = calib.getCameraIntrinsics(socket, width, height);
         dev->fx = k[0][0]; dev->fy = k[1][1]; dev->cx = k[0][2]; dev->cy = k[1][2];
     } catch (const std::exception&) { /* intrinsics stay zero */ }
 }
 
-// STEREO+IMU modality: the two mono cameras as a Sync'd RGB888 pair + the IMU on its own queue.
-// Shares no nodes with oak_open's colour/depth pipeline — deliberately a separate entry point so the
+// Read the FULL CAM_B/CAM_C calibration into `dev` for a host stereo rectifier: per-eye intrinsics
+// at the streamed size, per-eye distortion, and the CALIBRATED left->right extrinsic in METRES.
+//
+// Both depthai defaults on the extrinsics getter are traps we must not take: useSpecTranslation
+// defaults to true (board design numbers, not the measured calibration) and the length unit
+// defaults to centimetres. Either one silently rescales the entire reconstruction, so both are
+// passed explicitly. The baseline is derived from this same extrinsic rather than from
+// getBaselineDistance() (which has the identical two defaults) so rotation and baseline can never
+// come from different sources.
+//
+// A wiped/blank EEPROM leaves valid = 0 with everything zeroed; the caller decides whether that is
+// fatal (it is, for stereo VIO), so this does not fail the open.
+static void read_stereo_calib(oak_device* dev, const dai::CalibrationHandler& calib,
+                              int width, int height) {
+    // One blank: forgetting to restore width/height here yields a calibration whose ONLY
+    // wrong field is the resolution — a silent rescale, the exact failure the zeroing exists
+    // to prevent.
+    auto blank = [&] {
+        oak_stereo_calib z{};
+        z.width = width;
+        z.height = height;
+        return z;
+    };
+    const auto lsock = dai::CameraBoardSocket::CAM_B;
+    const auto rsock = dai::CameraBoardSocket::CAM_C;
+    oak_stereo_calib c{};
+    c.width = width;
+    c.height = height;
+    try {
+        auto kl = calib.getCameraIntrinsics(lsock, width, height);
+        auto kr = calib.getCameraIntrinsics(rsock, width, height);
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                c.left_k[i * 3 + j] = kl[i][j];
+                c.right_k[i * 3 + j] = kr[i][j];
+            }
+        }
+
+        auto dl = calib.getDistortionCoefficients(lsock);
+        auto dr = calib.getDistortionCoefficients(rsock);
+        c.left_n_dist = (int)std::min<size_t>(dl.size(), 14);
+        c.right_n_dist = (int)std::min<size_t>(dr.size(), 14);
+        for (int i = 0; i < c.left_n_dist; ++i) c.left_dist[i] = dl[i];
+        for (int i = 0; i < c.right_n_dist; ++i) c.right_dist[i] = dr[i];
+        c.left_model = (int)calib.getDistortionModel(lsock);
+        c.right_model = (int)calib.getDistortionModel(rsock);
+
+        auto e = calib.getCameraExtrinsics(lsock, rsock, /*useSpecTranslation=*/false,
+                                           dai::LengthUnit::METER);
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) c.t_left_right[i * 4 + j] = e[i][j];
+        const float tx = c.t_left_right[3], ty = c.t_left_right[7], tz = c.t_left_right[11];
+        c.baseline_m = std::sqrt(tx * tx + ty * ty + tz * tz);
+
+        c.valid = 1;
+    } catch (const std::exception& ex) {
+        // Zero the partial read rather than hand out half a calibration: a rectifier built from a
+        // valid K and a zero extrinsic produces NaN maps, which is far harder to diagnose than a
+        // flat "no calibration".
+        c = blank();
+        dev->stereo_calib_err = std::string("stereo calibration unavailable: ") + ex.what();
+    }
+    // A present-but-zero extrinsic passes every read above and reaches a rectifier as NaN
+    // remap tables — the exact failure the rustdoc promises this struct cannot carry.
+    if (c.valid && c.baseline_m <= 0.0) {
+        c = blank();
+        dev->stereo_calib_err =
+            "stereo calibration has a zero baseline (extrinsic present but blank)";
+    }
+    dev->stereo_calib = c;
+}
+
+// The Rust mirror (OakStereoCalibRaw) pins its own size; this pins OURS, so a header edit
+// that changes the layout fails HERE instead of silently disagreeing across the boundary.
+static_assert(sizeof(oak_stereo_calib) == 280,
+              "oak_stereo_calib layout changed — update OakStereoCalibRaw in src/calib.rs");
+
+extern "C" int oak_stereo_calibration(const oak_device* dev, oak_stereo_calib* out) {
+    if (!dev || !out) { set_err("null device or out pointer"); return -1; }
+    if (!dev->stereo_calib.valid) {
+        set_err(dev->stereo_calib_err.empty()
+                    ? std::string(
+                          "no stereo calibration (not a stereo device, or a wiped/blank EEPROM)")
+                    : dev->stereo_calib_err);
+        return -1;
+    }
+    *out = dev->stereo_calib;
+    return 0;
+}
+
+// STEREO+IMU modality: the two mono cameras as a Sync'd GRAY8 pair + the IMU on its own queue.
+// Builds its own pipeline instance; oak_open_rgbd's colour/depth nodes are not reused — deliberately a separate entry point so the
 // working RGBD and H.264 paths cannot regress.
 extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int height,
-                                       int fps, int imu_hz) {
+                                       int fps, int imu_hz, int enable_h264) {
+    // Same guard oak_open_rgbd applies: a zero/negative rate would poison the encoder
+    // preset and the requestOutput rate, failing the open for a reason nothing names.
+    if (fps < 1) fps = 30;
     try {
         auto dev = std::make_unique<oak_device>();
         dev->device = connect_device(device_id);
@@ -157,11 +424,9 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
 
         // The stereo pair is the whole point of this modality — unlike depth (which oak_open silently
         // falls back from), a missing mono socket here has no meaningful degraded mode. Fail loudly.
-        bool has_b = false, has_c = false;
-        for (auto s : dev->device->getConnectedCameras()) {
-            if (s == dai::CameraBoardSocket::CAM_B) has_b = true;
-            else if (s == dai::CameraBoardSocket::CAM_C) has_c = true;
-        }
+        const bool has_a = has_socket(dev->device, dai::CameraBoardSocket::CAM_A);
+        const bool has_b = has_socket(dev->device, dai::CameraBoardSocket::CAM_B);
+        const bool has_c = has_socket(dev->device, dai::CameraBoardSocket::CAM_C);
         if (!has_b || !has_c) {
             set_err("device has no stereo pair (CAM_B/CAM_C) — oak_open_stereo needs both");
             return nullptr;
@@ -177,12 +442,21 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         auto right = pipeline.create<dai::node::Camera>();
         right->build(dai::CameraBoardSocket::CAM_C);
         const std::pair<uint32_t, uint32_t> size((uint32_t)width, (uint32_t)height);
+        //
+        // enableUndistortion is deliberately FALSE here (it is true on the RGBD colour path).
+        // depthai's Camera node cannot rectify: ImageManip builds its map with
+        // cv::initUndistortRectifyMap(..., R = cv::Mat(), ...) — an identity rectifying rotation —
+        // so the two eyes come out undistorted but NOT row-aligned, which is useless to a stereo
+        // matcher. A stereo consumer therefore rectifies on the host from
+        // oak_stereo_calibration(), and feeding it pixels depthai had already undistorted would
+        // apply the distortion correction TWICE, silently (the output frame carries cleared
+        // distortion coefficients, so nothing downstream can tell). Raw in, host-rectified out.
         auto* lo = left->requestOutput(size, dai::ImgFrame::Type::GRAY8,
                                        dai::ImgResizeMode::CROP, (float)fps,
-                                       /*enableUndistortion=*/true);
+                                       /*enableUndistortion=*/false);
         auto* ro = right->requestOutput(size, dai::ImgFrame::Type::GRAY8,
                                         dai::ImgResizeMode::CROP, (float)fps,
-                                        /*enableUndistortion=*/true);
+                                        /*enableUndistortion=*/false);
 
         // Sync node: emit {left,right} as ONE MessageGroup so the host never has to pair by timestamp.
         // The eyes are frame-locked by the shared stereo trigger, so the threshold only has to absorb
@@ -194,32 +468,43 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
         ro->link(sync->inputs["right"]);
         dev->stereo_q = sync->out.createOutputQueue(4, false);
 
-        // IMU is OPTIONAL: not every OAK carries one, and a failed IMU must not cost us the stereo
-        // pair — degrade rather than lose the stereo stream over a missing IMU.
-        if (imu_hz > 0) try {
-            auto imu = pipeline.create<dai::node::IMU>();
-            imu->enableIMUSensor(dai::IMUSensor::ACCELEROMETER_RAW, (uint32_t)imu_hz);
-            imu->enableIMUSensor(dai::IMUSensor::GYROSCOPE_RAW, (uint32_t)imu_hz);
-            // Batch a few reports per message (fewer, larger XLink transfers) but keep the batch
-            // small enough that inertial data stays fresh relative to the frames.
-            imu->setBatchReportThreshold(5);
-            imu->setMaxBatchReports(20);
-            dev->imu_q = imu->out.createOutputQueue(50, false);
-            dev->has_imu = true;
-        } catch (const std::exception&) {
-            dev->has_imu = false;   // no IMU on this board — stereo still streams
+        // One EEPROM read shared by the IMU-extrinsics gate and the intrinsics below —
+        // readCalibration() is an RPC per call, and a wiped EEPROM comes back as an empty
+        // handler (its getters then throw, handled at each use) rather than throwing here.
+        auto calib = dev->device->readCalibration();
+
+        // Optional on-device H.264 of the COLOUR camera (CAM_A), viz-only: the encoder runs on
+        // the device and only the ~OAK_H264_KBPS bitstream crosses the link, so it costs the
+        // stereo pair nothing on the host. Same degrade rule as the IMU: a board without CAM_A
+        // skips the stream (has_video stays false), it never costs the stereo pair.
+        if (enable_h264 && has_a) {
+            auto color = pipeline.create<dai::node::Camera>();
+            color->build(dai::CameraBoardSocket::CAM_A);
+            try_add_h264_encoder(pipeline, color, width, height, fps, dev.get(), "stereo");
+        } else if (enable_h264) {
+            std::fprintf(stderr,
+                         "sensor-oak: no CAM_A on this board — skipping the H.264 viz stream\n");
         }
+
+        // IMU is OPTIONAL: not every OAK carries one — add_imu_node preflights with
+        // getConnectedIMU() and skips the node on an IMU-less board, so a missing IMU never
+        // costs the stereo pair (and never reaches pipeline.start()).
+        // Left (CAM_B) is the stereo reference frame, so IMU samples are rotated into ITS
+        // optical frame when the EEPROM carries the extrinsics — same gate as RGBD, different
+        // reference socket.
+        attach_imu(pipeline, dev.get(), imu_hz, calib, dai::CameraBoardSocket::CAM_B);
 
         pipeline.start();
 
         // Left (CAM_B) is the reference frame of a stereo rig, so oak_intrinsics reports ITS
-        // intrinsics in this modality (CAM_A, the colour camera, isn't even in this pipeline).
-        try {
-            auto calib = dev->device->readCalibration();
-            auto k = calib.getCameraIntrinsics(dai::CameraBoardSocket::CAM_B, width, height);
-            dev->fx = k[0][0]; dev->fy = k[1][1];
-            dev->cx = k[0][2]; dev->cy = k[1][2];
-        } catch (const std::exception&) { /* intrinsics stay zero — uncalibrated board */ }
+        // intrinsics in this modality — never CAM_A's, whose only role here is the optional
+        // viz-only H.264 stream.
+        read_intrinsics(dev.get(), calib, dai::CameraBoardSocket::CAM_B, width, height);
+
+        // Full stereo calibration for a HOST rectifier (the pair above is raw). Read from the same
+        // handler, so it costs no extra RPC. Failure is non-fatal: a stereo consumer will refuse to
+        // start on oak_stereo_calibration() == -1, but a plain "two raw eyes" consumer still works.
+        read_stereo_calib(dev.get(), calib, width, height);
 
         return dev.release();
     } catch (const std::exception& e) { set_err(e.what()); return nullptr; }
@@ -227,14 +512,19 @@ extern "C" oak_device* oak_open_stereo(const char* device_id, int width, int hei
 }
 
 extern "C" int oak_has_imu(const oak_device* dev) {
-    return (dev && dev->has_imu) ? 1 : 0;
+    return (dev && dev->imu_q) ? 1 : 0;
+}
+
+extern "C" int oak_imu_aligned(const oak_device* dev) {
+    return (dev && dev->imu_aligned) ? 1 : 0;
 }
 
 // RGBD + H.264 modality: CAM_A colour (RGB888) + StereoDepth aligned to it (uint16 mm) + an on-device
 // H.264 colour stream, all DECOUPLED onto their own queues. Shares no nodes with oak_open_stereo — a
 // separate entry point so neither modality can regress the other.
 extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int height, int fps,
-                                     int enable_h264, int enable_depth, int video_only) {
+                                     int enable_h264, int enable_depth, int video_only,
+                                     int imu_hz) {
     try {
         auto dev = std::make_unique<oak_device>();
         dev->device = connect_device(device_id);
@@ -242,12 +532,17 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         auto& pipeline = *dev->pipeline;
         if (fps < 1) fps = 30;   // 0/negative fps would poison the encoder preset + requestOutput rate
 
+        // One EEPROM read shared by the stereo check, the IMU-extrinsics gate, and the intrinsics —
+        // readCalibration() is an RPC per call, and a wiped EEPROM comes back as an empty handler
+        // (its getters then throw, handled at each use) rather than throwing here.
+        auto calib = dev->device->readCalibration();
+
         // Auto-fall-back to video-only when depth was requested but the device can't actually produce it
         // (mono camera, or wiped/blank calibration → fx=0). Pulling raw RGB over XLink for a "synced RGBD"
         // pair whose depth is garbage just caps the H.264 stream for nothing — build the lean video-only
         // pipeline instead. Policy: always ship compressed video; add RGBD only when depth works.
         bool want_video_only = (video_only != 0) ||
-                               (enable_depth != 0 && !device_has_stereo(dev->device, width, height));
+                               (enable_depth != 0 && !device_has_stereo(dev->device, calib, width, height));
 
         // VIDEO-ONLY: just the H.264 encoder (CAM_A NV12 → encoder → queue). No RGB888/depth output, so
         // the device transmits ONLY the small H.264 bitstream (low-bandwidth viewing over USB2 / shared
@@ -255,11 +550,20 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         if (want_video_only) {
             auto color = pipeline.create<dai::node::Camera>();
             color->build(dai::CameraBoardSocket::CAM_A);
-            add_h264_encoder(pipeline, color, width, height, fps, dev.get());
-            dev->has_depth = false;
-            dev->has_sync = false;
+            // MANDATORY here — the stream is this modality's whole output — but this path is
+            // also where an RGBD request LANDS when the board cannot do depth, so an encoder
+            // failure must say that rather than surface as a bare device error.
+            if (!try_add_h264_encoder(pipeline, color, width, height, fps, dev.get(),
+                                      "video-only")) {
+                set_err("H.264 encoder unavailable and this device cannot produce depth — "
+                        "nothing left to stream");
+                return nullptr;
+            }
+            attach_imu(pipeline, dev.get(), imu_hz, calib, dai::CameraBoardSocket::CAM_A);
+            // No rgb_q / depth_q on this path: oak_has_sync + oak_has_depth report false
+            // because the queues are absent — the same fact the old mirror flags restated.
             pipeline.start();
-            read_rgb_intrinsics(dev.get(), width, height);
+            read_intrinsics(dev.get(), calib, dai::CameraBoardSocket::CAM_A, width, height);
             return dev.release();
         }
 
@@ -288,6 +592,9 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
         // StereoDepth aligned to the RGB OUTPUT (not just the CAM_A socket), so depth[u,v] matches
         // RGB[u,v] exactly — same CROP, same size, same intrinsics.
         std::shared_ptr<dai::node::StereoDepth> stereo;
+        // Cleared by the catch below on a board with no stereo pair; gates the depth QUEUE,
+        // whose presence is what oak_has_depth reports.
+        bool depth_ok = true;
         if (enable_depth) try {
             auto left = pipeline.create<dai::node::Camera>();
             left->build(dai::CameraBoardSocket::CAM_B);
@@ -327,35 +634,48 @@ extern "C" oak_device* oak_open_rgbd(const char* device_id, int width, int heigh
             // XLink requires EVEN depth dims — an odd width/height tears the device connection down
             // (X_LINK_ERROR, e.g. OAK_DEPTH_DIV=3 → 213x120). Round each down to even, floored at 2.
             stereo->setOutputSize(std::max(2, (width / ddiv) & ~1), std::max(2, (height / ddiv) & ~1));
-            dev->has_depth = true;
         } catch (const std::exception&) {
-            dev->has_depth = false;   // e.g. OAK-1: no stereo pair
+            depth_ok = false;   // e.g. OAK-1: no stereo pair
         }
 
         // Each stream to its OWN non-blocking queue, pulled + published independently (consumer pairs by
         // timestamp). Frees depth from the rgb-pull rate.
         dev->rgb_q = rgb_out->createOutputQueue(4, false);
-        if (dev->has_depth) dev->depth_q = stereo->depth.createOutputQueue(4, false);
-        dev->has_sync = true; // has a colour(+depth) source to poll
+        // The queue IS the capability: creating it is what makes oak_has_depth true.
+        if (depth_ok) dev->depth_q = stereo->depth.createOutputQueue(4, false);
 
         // Optional standalone H.264 colour stream: a SECOND CAM_A output (NV12, the encoder's input) →
         // hardware H.264 encoder → its own queue. BASELINE (no B-frames) for Foxglove's decoder; a
         // keyframe ~4×/s lets a viewer/recorder join mid-stream.
         if (enable_h264 != 0) {
-            add_h264_encoder(pipeline, color, width, height, fps, dev.get());
+            // OPTIONAL here (unlike the video-only modality, where the stream IS the point):
+            // a board that rejects the NV12 output must not cost the caller depth + RGB. No
+            // capability query exists for the encoder the way getConnectedIMU() preflights
+            // the IMU, so the shared helper attempts and catches.
+            try_add_h264_encoder(pipeline, color, width, height, fps, dev.get(), "RGBD");
         }
+        attach_imu(pipeline, dev.get(), imu_hz, calib, dai::CameraBoardSocket::CAM_A);
 
         pipeline.start();
-        read_rgb_intrinsics(dev.get(), width, height);   // factory intrinsics of the aligned RGB camera
+        read_intrinsics(dev.get(), calib, dai::CameraBoardSocket::CAM_A, width, height);   // factory intrinsics of the aligned RGB camera
+
+        // IR dot projector: passive stereo starves on texture-poor / dim scenes (single-digit
+        // valid-depth %). Default 0.8 intensity; OAK_IR=0 disables (e.g. multi-cam cross-talk),
+        // boards without a projector just return false. Set after start() — needs a live device.
+        {
+            float ir = 0.8f;
+            if (const char* s = std::getenv("OAK_IR")) { ir = std::max(0.0f, std::min(1.0f, (float)std::atof(s))); }
+            if (ir > 0.0f) dev->device->setIrLaserDotProjectorIntensity(ir);
+        }
 
         return dev.release();
     } catch (const std::exception& e) { set_err(e.what()); return nullptr; }
     catch (...) { set_err("unknown error in oak_open_rgbd"); return nullptr; }
 }
 
-extern "C" int oak_has_depth(const oak_device* dev) { return (dev && dev->has_depth) ? 1 : 0; }
-extern "C" int oak_has_video(const oak_device* dev) { return (dev && dev->has_video) ? 1 : 0; }
-extern "C" int oak_has_sync(const oak_device* dev)  { return (dev && dev->has_sync)  ? 1 : 0; }
+extern "C" int oak_has_depth(const oak_device* dev) { return (dev && dev->depth_q) ? 1 : 0; }
+extern "C" int oak_has_video(const oak_device* dev) { return (dev && dev->video_q) ? 1 : 0; }
+extern "C" int oak_has_sync(const oak_device* dev)  { return (dev && dev->rgb_q)    ? 1 : 0; }
 
 extern "C" int oak_poll_rgb(oak_device* dev, const uint8_t** rgb,
                             int* width, int* height, int* len, uint64_t* ts_ns) {
@@ -458,6 +778,13 @@ extern "C" int oak_poll_stereo(oak_device* dev,
                                int* width, int* height, int* len, uint64_t* ts_ns,
                                void** l_hnd, void** r_hnd) {
     if (!dev) { set_err("null device"); return -1; }
+    // The queue is absent on an RGBD device: ONE handle type serves every modality, so the
+    // compiler cannot stop a caller polling the wrong one. Every sibling poll guards this
+    // way; without it this dereferenced a null shared_ptr.
+    if (!dev->stereo_q) {
+        set_err("this device was not opened with oak_open_stereo (no stereo queue)");
+        return -1;
+    }
     if (!left || !right || !width || !height || !len || !ts_ns || !l_hnd || !r_hnd) {
         set_err("null out pointer"); return -1;
     }
@@ -500,7 +827,7 @@ extern "C" int oak_poll_imu(oak_device* dev, oak_imu_sample* out, int max, int* 
     if (!dev) { set_err("null device"); return -1; }
     if (!out || !n) { set_err("null out pointer"); return -1; }
     *n = 0;
-    if (!dev->has_imu || !dev->imu_q || max <= 0) return 0;
+    if (!dev->imu_q || max <= 0) return 0;
     try {
         // tryGet pops the batch destructively, so a batch that doesn't fit in the caller's array
         // CANNOT simply be left behind — it would be gone. Convert whole batches into a staging
@@ -510,10 +837,42 @@ extern "C" int oak_poll_imu(oak_device* dev, oak_imu_sample* out, int max, int* 
             auto data = dev->imu_q->tryGet<dai::IMUData>();
             if (!data) break;
             for (const auto& p : data->packets) {
+                // IMUPacket's acceleroMeter/gyroscope are VALUE members, default-initialised to
+                // zeros with timestamp {0,0} — a packet missing one report would otherwise emit
+                // gyro=(0,0,0) "not rotating" (or a boot-epoch stamp) as if it were real data.
+                // A zero/default timestamp on either report marks such a hole: skip the sample.
+                if ((p.acceleroMeter.timestamp.sec == 0 && p.acceleroMeter.timestamp.nsec == 0) ||
+                    (p.gyroscope.timestamp.sec == 0 && p.gyroscope.timestamp.nsec == 0)) {
+                    dev->imu_ts_skipped++;
+                    if (dev->imu_ts_skipped == 1 || dev->imu_ts_skipped % 1000 == 0) {
+                        std::fprintf(stderr,
+                                     "sensor-oak: %llu IMU packet(s) skipped (zero-timestamp "
+                                     "report hole); a count near half the requested rate means "
+                                     "the gate, not the firmware, sets your IMU rate\n",
+                                     (unsigned long long)dev->imu_ts_skipped);
+                    }
+                    continue;
+                }
+                // NOTE: do NOT gate on accuracy == UNRELIABLE here — firmware does not
+                // populate the accuracy field for the *_RAW streams (measured: every raw
+                // report arrives UNRELIABLE, so the gate silenced the stream entirely).
+                // The zero-timestamp gate ABOVE is the effective default-report guard.
                 oak_imu_sample s;
                 s.ts_ns = steady_to_epoch_ns(p.acceleroMeter.getTimestamp(), offset);
-                s.ax = p.acceleroMeter.x; s.ay = p.acceleroMeter.y; s.az = p.acceleroMeter.z;
-                s.gx = p.gyroscope.x;     s.gy = p.gyroscope.y;     s.gz = p.gyroscope.z;
+                const float ax = p.acceleroMeter.x, ay = p.acceleroMeter.y, az = p.acceleroMeter.z;
+                const float gx = p.gyroscope.x,     gy = p.gyroscope.y,     gz = p.gyroscope.z;
+                // R is identity-initialised and only ever replaced by a VALIDATED rotation, so applying
+                // it unconditionally is correct on both paths; imu_aligned survives purely as the
+                // reporting flag behind oak_imu_aligned(). 9 multiply-adds at <=400 Hz is nothing.
+                    // chip frame → camera optical frame (see read_imu_rotation)
+                    const float* R = dev->imu_rot;
+                    s.ax = R[0] * ax + R[1] * ay + R[2] * az;
+                    s.ay = R[3] * ax + R[4] * ay + R[5] * az;
+                    s.az = R[6] * ax + R[7] * ay + R[8] * az;
+                    s.gx = R[0] * gx + R[1] * gy + R[2] * gz;
+                    s.gy = R[3] * gx + R[4] * gy + R[5] * gz;
+                    s.gz = R[6] * gx + R[7] * gy + R[8] * gz;
+                
                 dev->imu_pending.push_back(s);
             }
         }

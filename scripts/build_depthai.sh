@@ -16,9 +16,17 @@ mkdir -p "$VENDOR"
 # Precompiled-once: if the prefix is already installed, do nothing — no clone, no
 # vcpkg, no compile. (DEPTHAI_FORCE=1 to rebuild; `pixi run depthai-unpack` to
 # restore a packaged prefix on a fresh machine instead of building.)
-if ls "$PREFIX"/lib/libdepthai-core.so* >/dev/null 2>&1 && [ -z "${DEPTHAI_FORCE:-}" ]; then
-    echo "[depthai] already installed at $PREFIX — skipping (set DEPTHAI_FORCE=1 to rebuild)"
+# The stamp keys the install on the $TAG it was built from: the old guard was "a .so
+# exists", so a TAG bump silently kept the previous library.
+STAMP="$PREFIX/.build-stamp"
+WANT="$TAG"
+if ls "$PREFIX"/lib/libdepthai-core.so* >/dev/null 2>&1 && [ -z "${DEPTHAI_FORCE:-}" ] \
+   && [ "$(cat "$STAMP" 2>/dev/null)" = "$WANT" ]; then
+    echo "[depthai] already installed at $PREFIX ($TAG) — skipping"
     exit 0
+fi
+if ls "$PREFIX"/lib/libdepthai-core.so* >/dev/null 2>&1 && [ -z "${DEPTHAI_FORCE:-}" ]; then
+    echo "[depthai] prefix exists but was built from a different tag — rebuilding"
 fi
 
 # Source lives in the pinned git submodule (vendor/depthai-core @ $TAG). Init it
@@ -29,6 +37,12 @@ if [ ! -e "$SRC/CMakeLists.txt" ]; then
     git -C "$ROOT" submodule update --init --recursive vendor/depthai-core
 fi
 
+# NO patches are applied here: this repo builds depthai-core AS PINNED. A configuration
+# that needs source changes (e.g. DEPTHAI_OPENCV_SUPPORT=OFF, which does not link upstream
+# as of v3.7.1) is the CALLER's choice, so the caller owns the fixes and applies them to
+# the checkout before invoking this script. The real fix is upstreaming them; until then,
+# nothing in this library repo modifies vendored third-party source.
+
 echo "[depthai] configuring (Release, shared) ..."
 cmake -S "$SRC" -B "$SRC/build" -G Ninja \
     -D CMAKE_BUILD_TYPE=Release \
@@ -37,7 +51,8 @@ cmake -S "$SRC" -B "$SRC/build" -G Ninja \
     -D DEPTHAI_BUILD_TESTS=OFF \
     -D DEPTHAI_BUILD_DOCS=OFF \
     -D CMAKE_INSTALL_PREFIX="$PREFIX" \
-    -D CMAKE_INSTALL_RPATH='$ORIGIN'
+    -D CMAKE_INSTALL_RPATH='$ORIGIN' \
+    ${DEPTHAI_CMAKE_EXTRA:-}
 
 # Parallelism is RAM-bound here, NOT core-bound: depthai-core's TUs (xtensor /
 # nlohmann-json / spdlog templates) peak at ~1.5-2 GB each in cc1plus. On a small
@@ -49,5 +64,6 @@ jobs="${DEPTHAI_JOBS:-$(( mem_gb >= 16 ? 4 : 2 ))}"
 echo "[depthai] building (-j $jobs; ${mem_gb}GB RAM detected) ..."
 cmake --build "$SRC/build" --target install -j "$jobs"
 
+echo "$WANT" > "$STAMP"
 echo "[depthai] installed to $PREFIX"
 ls -la "$PREFIX/lib" 2>/dev/null | grep -i depthai || true

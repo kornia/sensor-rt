@@ -48,7 +48,10 @@ impl Drop for RetainedFrame {
 ///
 /// Both spans are GRAY8 (`w*h`, tightly packed) — these are monochrome sensors, so
 /// one byte per pixel is the whole signal — and are **valid only until the next
-/// [`OakSource::next_stereo`]**. The `'a` lifetime
+/// [`OakSource::next_stereo`]**. That applies to the borrowed *slices*
+/// ([`left`](Self::left) / [`right`](Self::right)) only: the [`Image`]s from
+/// [`left_image`](Self::left_image) / [`right_image`](Self::right_image) carry the frame's own
+/// retain handle and outlive it, so there is no need to copy pixels out defensively. The `'a` lifetime
 /// ties this frame to the `&mut OakSource` borrow, so the borrow checker forbids
 /// pulling the next pair while this one is still held — the same contract, and
 /// the same enforcement, as [`OakRgbFrame`](crate::OakRgbFrame).
@@ -139,28 +142,44 @@ impl OakStereoFrame<'_> {
 }
 
 impl OakSource {
-    /// Open the **stereo + IMU** modality: a Sync'd left/right RGB888 pair at
+    /// Open the **stereo + IMU** modality: a Sync'd left/right GRAY8 pair at
     /// `fps`, plus the IMU at `imu_hz` (accelerometer + gyroscope). `device`
-    /// selects the camera exactly as in [`OakSource::open`].
+    /// selects the camera exactly as in [`OakSource::open_rgbd`].
+    ///
+    /// The pair is **raw**: neither undistorted nor rectified. depthai's Camera
+    /// node can only undistort (its rectifying rotation is hard-wired to
+    /// identity), which no stereo matcher can use, and pre-undistorted pixels
+    /// would then be silently double-corrected by a host rectifier. Pair this
+    /// with [`stereo_calib`](OakSource::stereo_calib) and rectify on the host.
     ///
     /// Takes **no CUDA stream** — see the module docs: the consumer owns the
     /// upload, because it alone knows which stream each eye belongs on.
     ///
-    /// The IMU is optional: a board without one (or whose IMU fails to start)
-    /// still streams stereo, with [`has_imu`](OakSource::has_imu) `false`. A
-    /// device with no CAM_B/CAM_C pair is an error — unlike depth, there is no
-    /// meaningful degraded mode for a *stereo* source.
+    /// The IMU is optional: the shim preflights with `getConnectedIMU()` and only
+    /// builds the IMU node when the board carries one, so an IMU-less board still
+    /// streams stereo, with [`has_imu`](OakSource::has_imu) `false`. When the
+    /// EEPROM carries valid IMU extrinsics, samples come out rotated into the
+    /// **left (CAM_B) optical frame** — check
+    /// [`imu_aligned`](OakSource::imu_aligned); otherwise they stay in the raw
+    /// chip frame. A device with no CAM_B/CAM_C pair is an error — unlike depth,
+    /// there is no meaningful degraded mode for a *stereo* source.
     ///
     /// `imu_hz = 0` skips the IMU node entirely.
+    ///
+    /// `h264` additionally runs the on-device encoder over the COLOUR camera (viz stream,
+    /// drained with [`next_video`](OakSource::next_video)); a board without CAM_A degrades
+    /// to stereo-only ([`has_video`](OakSource::has_video) stays `false`).
     pub fn open_stereo(
         device: Option<&str>,
         width: u32,
         height: u32,
         fps: u32,
         imu_hz: u32,
+        h264: bool,
     ) -> Result<Self, BoxError> {
         let id_c = crate::device_id_cstring(device)?;
         let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
         let dev = unsafe {
             crate::ffi::oak_open_stereo(
                 id_ptr,
@@ -168,6 +187,7 @@ impl OakSource {
                 height as i32,
                 fps as i32,
                 imu_hz as i32,
+                h264 as i32,
             )
         };
         if dev.is_null() {

@@ -11,8 +11,8 @@
  *     it (uint16 mm) + an on-device H.264 colour stream. The colour, depth, and
  *     video are DECOUPLED — each on its own queue, pulled + timestamped
  *     independently (oak_poll_rgb / oak_poll_depth / oak_poll_video), paired
- *     downstream by their shared host-synced timeline. This is the site's camera
- *     producer path (flux-oak). */
+ *     downstream by their shared host-synced timeline. This is the camera-producer
+ *     path: encode + republish, no host-side pairing required. */
 #ifndef OAK_BRIDGE_H
 #define OAK_BRIDGE_H
 
@@ -33,11 +33,62 @@ typedef struct {
     float gx, gy, gz;  /* gyroscope, rad/s */
 } oak_imu_sample;
 
+/* Full factory stereo calibration, read once at oak_open_stereo and cached.
+ *
+ * This is what a HOST rectifier needs, and the stereo pair needs one: depthai's
+ * Camera node can only UNDISTORT (it calls initUndistortRectifyMap with R =
+ * identity), never rectify — only StereoDepth applies the rectification
+ * rotations. So oak_open_stereo delivers RAW distorted GRAY8 and the consumer
+ * builds the rectifying maps from these numbers.
+ *
+ * Both defaults depthai chose for the extrinsics are traps and are NOT used
+ * here: useSpecTranslation defaults to TRUE (board design data, not the measured
+ * calibration) and the length unit defaults to CENTIMETRES. This struct is
+ * always calibrated translation in METRES.
+ *
+ *   width/height  : the resolution the intrinsics are valid at (what
+ *                   oak_open_stereo was asked to stream).
+ *   *_k           : row-major 3x3 [[fx,0,cx],[0,fy,cy],[0,0,1]], pixels.
+ *   *_dist        : OpenCV order [k1,k2,p1,p2,k3,k4,k5,k6,s1,s2,s3,s4,taux,tauy]
+ *                   — note p1,p2 sit at indices 2,3. Resolution-independent.
+ *                   *_n_dist says how many the EEPROM actually carried; a
+ *                   consumer whose model has no thin-prism/tilt terms must check
+ *                   indices 8.. are zero rather than dropping them silently.
+ *   *_model       : dai::CameraModel (0 = Perspective, 1 = Fisheye). A rectifier
+ *                   built on Brown-Conrady must reject anything but 0.
+ *   t_left_right  : row-major 4x4, X_right = T * X_left, translation in METRES.
+ *   baseline_m    : ||translation of t_left_right||, metres. Derived from the
+ *                   SAME extrinsic as the rotation, so it can never disagree
+ *                   with it (getBaselineDistance() can, and defaults to spec cm).
+ *   valid         : 1 only if every field above was read. 0 = wiped/blank EEPROM
+ *                   (the fields are then zeroed, NOT left stale). */
+typedef struct {
+    int   width, height;
+    float left_k[9], right_k[9];
+    float left_dist[14], right_dist[14];
+    int   left_n_dist, right_n_dist;
+    int   left_model, right_model;
+    float t_left_right[16];
+    float baseline_m;
+    int   valid;
+} oak_stereo_calib;
+
+/* Copy out the cached stereo calibration (see oak_stereo_calib). Returns 0 on
+ * success, -1 on a null argument, a non-stereo device, or a device whose
+ * calibration could not be read (reason via oak_last_error). */
+int oak_stereo_calibration(const oak_device *dev, oak_stereo_calib *out);
+
 /* Open an OAK in the STEREO+IMU modality: the two mono cameras (CAM_B = left,
- * CAM_C = right) streamed as a time-synced RGB888 pair, plus the on-board IMU on
- * its own queue. NO colour camera, NO StereoDepth, NO encoder — this is the raw
+ * CAM_C = right) streamed as a time-synced GRAY8 pair, plus the on-board IMU on
+ * its own queue. NO StereoDepth. The colour camera + encoder attach ONLY when
+ * enable_h264 asks (viz stream; degrades to stereo-only without CAM_A) — this is the raw
  * stereo + inertial source for VIO / stereo-feature work, not the depth path
  * (for aligned depth use oak_open with enable_depth).
+ *
+ * The pair is RAW: neither undistorted nor rectified. depthai's Camera node can
+ * only undistort (R = identity), which is not enough for a stereo consumer and
+ * would silently DOUBLE-correct anything the host rectifies afterwards. Pair the
+ * frames with oak_stereo_calibration and rectify on the host.
  *
  * A separate entry point rather than more flags on oak_open: the pipeline shares
  * no nodes with it, and the RGBD/H.264 paths must not regress.
@@ -47,14 +98,18 @@ typedef struct {
  *                  depthai replicate gray across three channels and ship 3x the
  *                  bytes for no extra information — consumers that need RGB expand
  *                  it on the GPU instead.
- *   fps          : stereo pair rate.
+ *   fps          : stereo pair rate (also the H.264 viz stream rate; < 1 becomes 30).
  *   imu_hz       : accelerometer + gyroscope report rate (e.g. 200-400). The IMU
- *                  is OPTIONAL — a device without one (or whose IMU fails to
- *                  start) still streams stereo, with oak_has_imu() == 0.
+ *                  is OPTIONAL — the IMU node is only built after a
+ *                  getConnectedIMU() preflight confirms the board carries one, so
+ *                  an IMU-less device still streams stereo (oak_has_imu() == 0)
+ *                  and a missing IMU never reaches pipeline start. When the EEPROM
+ *                  carries the IMU extrinsics, samples are rotated into the LEFT
+ *                  (CAM_B) optical frame — see oak_imu_aligned().
  *
  * Returns NULL on failure (reason via oak_last_error). */
 oak_device *oak_open_stereo(const char *device_id, int width, int height,
-                            int fps, int imu_hz);
+                            int fps, int imu_hz, int enable_h264);
 
 /* True (1) if the on-board IMU is running (oak_poll_imu yields samples). 0 on a
  * device with no IMU, or when the IMU node failed to start — the stereo pair is
@@ -80,6 +135,12 @@ int oak_has_imu(const oak_device *dev);
  *   video_only   : build ONLY the H.264 encoder (no RGB888/depth): the device ships
  *                  just the small bitstream for low-bandwidth viewing. oak_poll_rgb/
  *                  _depth yield nothing; drain oak_poll_video.
+ *   imu_hz       : accelerometer + gyroscope rate (oak_poll_imu), same semantics as
+ *                  oak_open_stereo's. 0 disables the IMU node; the node is only built
+ *                  after a getConnectedIMU() preflight confirms the board carries an
+ *                  IMU, so a missing IMU never costs the image streams
+ *                  (oak_has_imu()==0, streams run on) and never reaches pipeline
+ *                  start. Works in video_only mode too.
  *
  * Auto-fall-back: if enable_depth is set but the device can't actually produce depth
  * (no stereo pair, or a wiped/blank calibration → fx=0), the pipeline silently drops
@@ -88,7 +149,8 @@ int oak_has_imu(const oak_device *dev);
  *
  * Returns NULL on failure (reason via oak_last_error). */
 oak_device *oak_open_rgbd(const char *device_id, int width, int height, int fps,
-                          int enable_h264, int enable_depth, int video_only);
+                          int enable_h264, int enable_depth, int video_only,
+                          int imu_hz);
 
 /* True (1) if StereoDepth is running (oak_poll_depth can yield aligned depth). */
 int oak_has_depth(const oak_device *dev);
@@ -131,8 +193,10 @@ int oak_poll_depth(oak_device *dev, const uint16_t **depth_mm,
  * never overflows (a dropped P-frame glitches the stream until the next keyframe). */
 int oak_poll_video(oak_device *dev, const uint8_t **data, int *len, uint64_t *ts_ns);
 
-/* Factory intrinsics of the LEFT (CAM_B) camera at the streamed size — the stereo
- * reference frame. Returns 0 on success, -1 on error. */
+/* Factory intrinsics at the STREAMED size of each modality's reference camera: CAM_A on
+ * oak_open_rgbd (the colour camera the depth is aligned to), CAM_B (left) on
+ * oak_open_stereo (the stereo reference frame). Zero on a wiped EEPROM — check before use.
+ * Returns 0 on success, -1 on error. */
 int oak_intrinsics(const oak_device *dev,
                    float *fx, float *fy, float *cx, float *cy);
 
@@ -158,10 +222,22 @@ void oak_frame_release(void *handle);
  * `max` samples, sets *n to how many were written (0 when none are queued or the
  * IMU isn't running). Returns 1 / 0 / -1 (error).
  *
+ * Sample frame: when the device calibration carries the IMU extrinsics
+ * (oak_imu_aligned() == 1), samples are rotated into the modality's reference
+ * camera optical frame — CAM_A (colour) on the RGBD modality, CAM_B (left) on the
+ * stereo modality. Otherwise they are the raw IMU-chip frame, which is
+ * axis-permuted vs the camera by the board mounting.
+ *
  * The IMU reports far faster than the frame rate, so call this in a loop until
  * *n == 0 (or with a generous `max`) each iteration, otherwise the batch queue
  * overflows and samples are silently dropped. */
 int oak_poll_imu(oak_device *dev, oak_imu_sample *out, int max, int *n);
+
+/* True (1) when oak_poll_imu samples are calibration-rotated into the camera
+ * optical frame (CAM_A on the RGBD modality, CAM_B/left on the stereo modality —
+ * IMU extrinsics present in the EEPROM and validated as a proper rotation). 0 =
+ * raw IMU-chip frame; the shim logs WHY to stderr (no extrinsics vs rejected). */
+int oak_imu_aligned(const oak_device *dev);
 
 /* Recover a PoE OAK wedged in bootloader state: reboot it via a bootloader open+drop so the next
  * oak_open succeeds. `target` = IP/name or deviceId (NULL = first wedged device). 1 = kicked (wait ~8s),

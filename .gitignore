@@ -12,3 +12,4 @@
 
 # depthai build cache (scripts/build_depthai.sh) — build output, not committed.
 /.cache/
+.worktrees/

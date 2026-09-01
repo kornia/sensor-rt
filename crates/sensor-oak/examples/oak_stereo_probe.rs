@@ -43,7 +43,7 @@ fn main() -> Result<(), BoxError> {
     let (w, h, fps, imu_hz, frames) = (args.width, args.height, args.fps, args.imu_hz, args.frames);
 
     println!("opening OAK stereo+IMU at {w}×{h}@{fps}, imu={imu_hz}Hz ...");
-    let mut src = OakSource::open_stereo(None, w, h, fps, imu_hz)?;
+    let mut src = OakSource::open_stereo(None, w, h, fps, imu_hz, false)?;
     let intr = src.intrinsics();
     println!(
         "device up: imu={}  CAM_B intrinsics fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
