@@ -74,7 +74,7 @@ impl OakSource {
         video_only: bool,
         imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        let fps = fps.max(1); // 0 fps would poison the encoder preset + requestOutput rate
+        let fps = policy::fps_or_default(fps);
         let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
         // No open-retry here: the IMU is preflighted before the node is built, so an
         // IMU-less board already degrades inside ONE open. A failure at this point is a
@@ -119,7 +119,11 @@ impl OakSource {
             // Set after start() — needs a live device.
             let ir = policy::ir_intensity();
             if ir > 0.0 {
-                let _ = dev.set_ir_laser_dot_projector_intensity(ir, None);
+                // Ok(false) = no projector on this board (fine). Err = a real device
+                // RPC failure: degrade, but say so.
+                if let Err(e) = dev.set_ir_laser_dot_projector_intensity(ir, None) {
+                    eprintln!("sensor-oak: IR dot-projector intensity failed ({e}) — continuing without it");
+                }
             }
         }
 

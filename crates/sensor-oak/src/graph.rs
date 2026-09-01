@@ -31,7 +31,7 @@ pub(crate) fn add_h264_encoder(
     height: u32,
     fps: u32,
 ) -> depthai::Result<OutputQueue<ImgFrame>> {
-    let fps = fps.max(1);
+    let fps = policy::fps_or_default(fps);
     let nv12 = color.request_output(
         (width, height),
         Some(ImgFrameType::Nv12),

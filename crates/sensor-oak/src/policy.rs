@@ -12,6 +12,18 @@ use depthai::UsbSpeed;
 // Environment knobs (same names, defaults and semantics as the old shim)
 // ---------------------------------------------------------------------------
 
+/// A zero/absent frame rate means "default", never "1 fps": it would poison the
+/// encoder preset, the requested output rate and the Sync threshold.
+pub(crate) const DEFAULT_FPS: u32 = 30;
+
+pub(crate) fn fps_or_default(fps: u32) -> u32 {
+    if fps == 0 {
+        DEFAULT_FPS
+    } else {
+        fps
+    }
+}
+
 /// `OAK_USB_SPEED`: cap the USB link. Default HIGH (USB2): the SUPER default boots
 /// the device into a USB3 descriptor, and on a physical USB2 link the host then
 /// can't reconnect to the booted device (X_LINK_DEVICE_NOT_FOUND). `super` opts
@@ -251,6 +263,12 @@ mod tests {
         assert_eq!(clamp_rate(None, 30, 15), 15);
         assert_eq!(parse_positive(Some("0")), None);
         assert_eq!(parse_positive(Some(" 7 ")), Some(7));
+    }
+
+    #[test]
+    fn zero_fps_means_thirty() {
+        assert_eq!(fps_or_default(0), 30);
+        assert_eq!(fps_or_default(15), 15);
     }
 
     #[test]

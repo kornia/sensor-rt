@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use depthai::node::{Camera, Sync as SyncNode};
-use depthai::{CameraBoardSocket, ImgFrame, ImgFrameType, ImgResizeMode, Pipeline};
+use depthai::{
+    CalibrationHandler, CameraBoardSocket, Device, ImgFrame, ImgFrameType, ImgResizeMode, Pipeline,
+};
 use kornia_image::Image;
 use kornia_tensor::resource::MemoryDomain;
 use kornia_tensor::{host_alloc, storage::TensorStorage, Tensor};
@@ -181,9 +183,7 @@ impl OakSource {
         imu_hz: u32,
         h264: bool,
     ) -> Result<Self, BoxError> {
-        // A zero/negative rate would poison the encoder preset and the requestOutput
-        // rate, failing the open for a reason nothing names.
-        let fps = fps.max(1);
+        let fps = policy::fps_or_default(fps);
         let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
         let dev = graph::connect_device(device)?;
         let pipeline = Pipeline::new(&dev).map_err(|e| format!("pipeline failed: {e}"))?;
@@ -201,77 +201,8 @@ impl OakSource {
             return Err("device has no stereo pair (CAM_B/CAM_C) — open_stereo needs both".into());
         }
 
-        let build = || -> depthai::Result<(Queues, depthai::CalibrationHandler)> {
-            // CAM_B/CAM_C are MONOCHROME sensors, so they are requested as GRAY8 — one
-            // byte per pixel. Asking for RGB888i would make depthai replicate the same
-            // gray value across three channels on-device and then ship 3x the bytes
-            // over XLink for no information. Consumers that need 3 channels expand it
-            // on the GPU, where the copy is free next to the inference.
-            let left = pipeline.create::<Camera>()?;
-            left.build(CameraBoardSocket::CamB)?;
-            let right = pipeline.create::<Camera>()?;
-            right.build(CameraBoardSocket::CamC)?;
-            // undistort is deliberately FALSE here (it is true on the RGBD colour path).
-            // depthai's Camera node cannot rectify: its remap uses an identity
-            // rectifying rotation, so the two eyes would come out undistorted but NOT
-            // row-aligned, which is useless to a stereo matcher. A stereo consumer
-            // rectifies on the host from `stereo_calib()`, and feeding it pixels
-            // depthai had already undistorted would apply the correction TWICE,
-            // silently. Raw in, host-rectified out.
-            let lo = left.request_output(
-                (width, height),
-                Some(ImgFrameType::Gray8),
-                ImgResizeMode::Crop,
-                Some(fps as f32),
-                Some(false),
-            )?;
-            let ro = right.request_output(
-                (width, height),
-                Some(ImgFrameType::Gray8),
-                ImgResizeMode::Crop,
-                Some(fps as f32),
-                Some(false),
-            )?;
-
-            // Sync node: emit {left,right} as ONE MessageGroup so the host never has to
-            // pair by timestamp. The eyes are frame-locked by the shared stereo trigger,
-            // so the threshold only has to absorb transport jitter — half a frame
-            // interval is generous.
-            let sync = pipeline.create::<SyncNode>()?;
-            sync.set_sync_threshold(Duration::from_nanos(1_000_000_000 / fps as u64 / 2))?;
-            lo.link(&sync.input("left")?)?;
-            ro.link(&sync.input("right")?)?;
-            let stereo_q = sync.out()?.create_output_queue(4, false)?;
-
-            // One EEPROM read shared by the IMU-extrinsics gate and the intrinsics —
-            // readCalibration() is an RPC per call, and a wiped EEPROM comes back as
-            // an empty handler (its getters then fail, handled at each use).
-            let calib = dev.read_calibration()?;
-
-            // Optional on-device H.264 of the COLOUR camera (CAM_A), viz-only: the
-            // encoder runs on the device and only the ~OAK_H264_KBPS bitstream crosses
-            // the link, so it costs the stereo pair nothing on the host. Same degrade
-            // rule as the IMU: a board without CAM_A skips the stream.
-            let video = if h264 && has_a {
-                let color = pipeline.create::<Camera>()?;
-                color.build(CameraBoardSocket::CamA)?;
-                graph::try_add_h264_encoder(&pipeline, &color, width, height, fps, "stereo")
-            } else {
-                if h264 {
-                    eprintln!("sensor-oak: no CAM_A on this board — skipping the H.264 viz stream");
-                }
-                None
-            };
-            Ok((
-                Queues {
-                    stereo: Some(stereo_q),
-                    video,
-                    ..Default::default()
-                },
-                calib,
-            ))
-        };
-        let (queues, calib) = build().map_err(|e| format!("open_stereo failed: {e}"))?;
+        let (queues, calib) = Self::build_stereo(&dev, &pipeline, width, height, fps, h264, has_a)
+            .map_err(|e| format!("open_stereo failed: {e}"))?;
 
         // IMU is OPTIONAL: a missing IMU never costs the stereo pair (and never
         // reaches pipeline start). Left (CAM_B) is the stereo reference frame, so IMU
@@ -302,6 +233,88 @@ impl OakSource {
             queues,
             imu,
             stereo_calib,
+        ))
+    }
+
+    /// The stereo+IMU graph: two mono cameras as a Sync'd GRAY8 pair, plus the
+    /// optional CAM_A H.264 viz stream. Returns the queues and the calibration
+    /// handler read along the way (shared with the IMU gate and intrinsics).
+    fn build_stereo(
+        dev: &Device,
+        pipeline: &Pipeline,
+        width: u32,
+        height: u32,
+        fps: u32,
+        h264: bool,
+        has_a: bool,
+    ) -> depthai::Result<(Queues, CalibrationHandler)> {
+        // CAM_B/CAM_C are MONOCHROME sensors, so they are requested as GRAY8 — one
+        // byte per pixel. Asking for RGB888i would make depthai replicate the same
+        // gray value across three channels on-device and then ship 3x the bytes
+        // over XLink for no information. Consumers that need 3 channels expand it
+        // on the GPU, where the copy is free next to the inference.
+        let left = pipeline.create::<Camera>()?;
+        left.build(CameraBoardSocket::CamB)?;
+        let right = pipeline.create::<Camera>()?;
+        right.build(CameraBoardSocket::CamC)?;
+        // undistort is deliberately FALSE here (it is true on the RGBD colour path).
+        // depthai's Camera node cannot rectify: its remap uses an identity
+        // rectifying rotation, so the two eyes would come out undistorted but NOT
+        // row-aligned, which is useless to a stereo matcher. A stereo consumer
+        // rectifies on the host from `stereo_calib()`, and feeding it pixels
+        // depthai had already undistorted would apply the correction TWICE,
+        // silently. Raw in, host-rectified out.
+        let lo = left.request_output(
+            (width, height),
+            Some(ImgFrameType::Gray8),
+            ImgResizeMode::Crop,
+            Some(fps as f32),
+            Some(false),
+        )?;
+        let ro = right.request_output(
+            (width, height),
+            Some(ImgFrameType::Gray8),
+            ImgResizeMode::Crop,
+            Some(fps as f32),
+            Some(false),
+        )?;
+
+        // Sync node: emit {left,right} as ONE MessageGroup so the host never has to
+        // pair by timestamp. The eyes are frame-locked by the shared stereo trigger,
+        // so the threshold only has to absorb transport jitter — half a frame
+        // interval is generous.
+        let sync = pipeline.create::<SyncNode>()?;
+        sync.set_sync_threshold(Duration::from_nanos(1_000_000_000 / fps as u64 / 2))?;
+        lo.link(&sync.input("left")?)?;
+        ro.link(&sync.input("right")?)?;
+        let stereo_q = sync.out()?.create_output_queue(4, false)?;
+
+        // One EEPROM read shared by the IMU-extrinsics gate and the intrinsics —
+        // readCalibration() is an RPC per call, and a wiped EEPROM comes back as
+        // an empty handler (its getters then fail, handled at each use).
+        let calib = dev.read_calibration()?;
+
+        // Optional on-device H.264 of the COLOUR camera (CAM_A), viz-only: the
+        // encoder runs on the device and only the ~OAK_H264_KBPS bitstream crosses
+        // the link, so it costs the stereo pair nothing on the host. Same degrade
+        // rule as the IMU: a board without CAM_A skips the stream.
+        let video = if h264 && has_a {
+            let color = pipeline.create::<Camera>()?;
+            color.build(CameraBoardSocket::CamA)?;
+            graph::try_add_h264_encoder(pipeline, &color, width, height, fps, "stereo")
+        } else {
+            if h264 {
+                eprintln!("sensor-oak: no CAM_A on this board — skipping the H.264 viz stream");
+            }
+            None
+        };
+        Ok((
+            Queues {
+                stereo: Some(stereo_q),
+                video,
+                ..Default::default()
+            },
+            calib,
         ))
     }
 
