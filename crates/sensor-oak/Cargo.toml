@@ -23,6 +23,7 @@ name = "sensor_oak"
 # traps, degrade rules — lives here in Rust, where it is unit-testable.
 depthai       = { workspace = true }
 depthai-sys   = { workspace = true }
+thiserror     = { workspace = true }
 kornia-image  = { workspace = true }
 # For the borrowed (zero-copy) image storage — see OakStereoFrame::left_image.
 kornia-tensor = { workspace = true }

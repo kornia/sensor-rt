@@ -17,16 +17,15 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::Duration;
 
-use depthai::node::{Camera, Sync as SyncNode};
-use depthai::{
-    CalibrationHandler, CameraBoardSocket, Device, ImgFrame, ImgFrameType, ImgResizeMode, Pipeline,
-};
+use depthai::node::Sync as SyncNode;
+use depthai::{CameraBoardSocket, ImgFrame, ImgFrameType, ImgResizeMode, MessageGroup};
 use kornia_image::Image;
 use kornia_tensor::resource::MemoryDomain;
 use kornia_tensor::{host_alloc, storage::TensorStorage, Tensor};
 use sensor_types::FrameMeta;
 
-use crate::{graph, policy, BoxError, OakSource, Queues};
+use crate::graph::{self, Session};
+use crate::{policy, BoxError, Built, Ctx, OakSource, Queues};
 
 /// One time-synced stereo pair, borrowed from the source.
 ///
@@ -39,12 +38,9 @@ use crate::{graph, policy, BoxError, OakSource, Queues};
 /// lifetime ties this frame to the `&mut OakSource` borrow, so the borrow checker forbids
 /// pulling the next pair while this one is still held.
 pub struct OakStereoFrame<'a> {
-    /// One per eye, owning the pixel buffers. Sharing one into a borrowed [`Image`]
-    /// is a refcount bump, not a new device call.
-    left: Arc<ImgFrame>,
-    right: Arc<ImgFrame>,
-    width: u32,
-    height: u32,
+    /// The two eyes, validated as tight GRAY8 of equal size.
+    left: ImgFrame,
+    right: ImgFrame,
     meta: FrameMeta,
     _src: std::marker::PhantomData<&'a mut OakSource>,
 }
@@ -53,19 +49,19 @@ impl OakStereoFrame<'_> {
     /// Left eye (CAM_B), GRAY8 `w*h`. The stereo reference frame — the
     /// intrinsics from [`OakSource::intrinsics`] belong to this camera.
     pub fn left(&self) -> &[u8] {
-        &self.left.data()[..(self.width * self.height) as usize]
+        gray8(&self.left)
     }
     /// Right eye (CAM_C), GRAY8 `w*h`, same dimensions as [`left`](Self::left).
     pub fn right(&self) -> &[u8] {
-        &self.right.data()[..(self.width * self.height) as usize]
+        gray8(&self.right)
     }
     /// Per-eye width (both eyes share it).
     pub fn width(&self) -> u32 {
-        self.width
+        self.left.width()
     }
     /// Per-eye height (both eyes share it).
     pub fn height(&self) -> u32 {
-        self.height
+        self.left.height()
     }
     /// Sequence + capture pts (of the left eye).
     pub fn meta(&self) -> &FrameMeta {
@@ -82,69 +78,88 @@ impl OakStereoFrame<'_> {
     ///
     /// Read-only — the underlying storage refuses mutable slice access.
     pub fn left_image(&self) -> Result<Image<u8, 1>, BoxError> {
-        self.eye_image(&self.left)
+        eye_image(&self.left)
     }
 
     /// Right eye as a host [`Image`] — see [`left_image`](Self::left_image).
     pub fn right_image(&self) -> Result<Image<u8, 1>, BoxError> {
-        self.eye_image(&self.right)
-    }
-
-    fn eye_image(&self, keep: &Arc<ImgFrame>) -> Result<Image<u8, 1>, BoxError> {
-        // Sharing the frame's own handle — a refcount bump, no device call, and no way
-        // to end up holding a different frame than the one these pixels came from:
-        // the pointer below comes from the very Arc that is the keepalive.
-        let keepalive: Arc<dyn Any + Send + Sync> = keep.clone();
-        let (w, h) = (self.width as usize, self.height as usize);
-        let span = &keep.data()[..w * h];
-        // SAFETY:
-        //   - `span` points at the retained frame's pixels, non-null and `w*h` long
-        //     (`check_tight_gray8` validated tight GRAY8 before this frame was built).
-        //   - `keepalive` shares the frame's handle, so the memory outlives this storage.
-        //   - Host memory: MemoryDomain::Host, and the OAK delivers frames to host RAM.
-        let storage = unsafe {
-            TensorStorage::from_borrowed_readonly(
-                span.as_ptr(),
-                span.len(),
-                host_alloc(),
-                MemoryDomain::Host,
-                keepalive,
-            )
-        };
-        // Row-major [H, W, 1]; tight rows, so these strides are exact.
-        // (kornia's own `get_strides_from_shape` is not reachable from outside the crate,
-        // which is why its v4l/gstreamer backends spell this out the same way.)
-        let tensor = Tensor {
-            storage,
-            shape: [h, w, 1],
-            strides: [w, 1, 1],
-        };
-        Image::try_from(tensor).map_err(|e| format!("borrowed Image<u8,1>: {e}").into())
+        eye_image(&self.right)
     }
 }
 
-/// Validate one eye: GRAY8 is one byte per pixel, and the Rust side assumes TIGHT
-/// rows (stride == w), so verify that rather than trust it. Returns the dims.
-pub(crate) fn check_tight_gray8(l: &ImgFrame, r: &ImgFrame) -> Result<(u32, u32), String> {
-    let (w, h) = (l.width(), l.height());
-    if w == 0 || h == 0 {
-        return Err("degenerate frame".into());
+/// The tight GRAY8 span of a validated eye.
+fn gray8(f: &ImgFrame) -> &[u8] {
+    &f.data()[..(f.width() * f.height()) as usize]
+}
+
+fn eye_image(frame: &ImgFrame) -> Result<Image<u8, 1>, BoxError> {
+    // The keepalive is a clone of the very frame the pixels come from (a refcount
+    // bump, no device call), so the two can never disagree.
+    let keepalive: Arc<dyn Any + Send + Sync> = Arc::new(frame.clone());
+    let (w, h) = (frame.width() as usize, frame.height() as usize);
+    let span = gray8(frame);
+    // SAFETY:
+    //   - `span` points at the frame's pixels, non-null and `w*h` long
+    //     (`tight_len` validated tight GRAY8 before this frame was built).
+    //   - `keepalive` shares the frame's handle, so the memory outlives this storage.
+    //   - Host memory: MemoryDomain::Host, and the OAK delivers frames to host RAM.
+    let storage = unsafe {
+        TensorStorage::from_borrowed_readonly(
+            span.as_ptr(),
+            span.len(),
+            host_alloc(),
+            MemoryDomain::Host,
+            keepalive,
+        )
+    };
+    // Row-major [H, W, 1]; tight rows, so these strides are exact.
+    // (kornia's own `get_strides_from_shape` is not reachable from outside the crate,
+    // which is why its v4l/gstreamer backends spell this out the same way.)
+    let tensor = Tensor {
+        storage,
+        shape: [h, w, 1],
+        strides: [w, 1, 1],
+    };
+    Image::try_from(tensor).map_err(|e| format!("borrowed Image<u8,1>: {e}").into())
+}
+
+/// Validate that `f` is tightly packed at `bpp` bytes per pixel (depthai may report
+/// stride 0, which the docs single out as "treat as tight only after checking the
+/// length"). Returns the tight byte length.
+pub(crate) fn tight_len(f: &ImgFrame, bpp: u32) -> Result<usize, String> {
+    let (w, h) = (f.width(), f.height());
+    let stride = f.stride();
+    if stride != 0 && stride != w * bpp {
+        return Err(format!(
+            "frame is not tightly packed (stride {stride} != width {w} * {bpp} B/px)"
+        ));
     }
-    if (r.width(), r.height()) != (w, h) {
-        return Err("eyes differ in size".into());
+    let len = (w as usize) * (h as usize) * (bpp as usize);
+    if f.data().len() < len {
+        return Err("frame buffer is shorter than width * height".into());
     }
-    for (name, f) in [("left", l), ("right", r)] {
-        let stride = f.stride();
-        if stride != 0 && stride != w {
-            return Err(format!(
-                "{name} eye is not tightly packed GRAY8 (stride {stride} != w {w})"
-            ));
-        }
-        if f.data().len() < (w * h) as usize {
-            return Err(format!("{name} eye buffer is shorter than w*h"));
-        }
+    Ok(len)
+}
+
+/// Unpack a Sync group into a validated pair. `Ok(None)` = a degenerate (empty)
+/// frame to skip; `Err` = the stream is unusable.
+fn take_pair(group: &MessageGroup) -> Result<Option<(ImgFrame, ImgFrame)>, String> {
+    let eye = |name: &str| -> Result<ImgFrame, String> {
+        group
+            .get::<ImgFrame>(name)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("stereo group missing the {name} eye"))
+    };
+    let (l, r) = (eye("left")?, eye("right")?);
+    if l.width() == 0 || l.height() == 0 {
+        return Ok(None);
     }
-    Ok((w, h))
+    if (l.width(), l.height()) != (r.width(), r.height()) {
+        return Err("stereo eyes differ in size".into());
+    }
+    tight_len(&l, 1).map_err(|e| format!("left {e}"))?;
+    tight_len(&r, 1).map_err(|e| format!("right {e}"))?;
+    Ok(Some((l, r)))
 }
 
 impl OakSource {
@@ -183,145 +198,51 @@ impl OakSource {
         imu_hz: u32,
         h264: bool,
     ) -> Result<Self, BoxError> {
+        Self::open_stereo_inner(device, width, height, fps, imu_hz, h264)
+            .map_err(|e| format!("open_stereo failed: {e}").into())
+    }
+
+    fn open_stereo_inner(
+        device: Option<&str>,
+        width: u32,
+        height: u32,
+        fps: u32,
+        imu_hz: u32,
+        h264: bool,
+    ) -> Result<Self, BoxError> {
         let fps = policy::fps_or_default(fps);
         let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
-        let dev = graph::connect_device(device)?;
-        let pipeline = Pipeline::new(&dev).map_err(|e| format!("pipeline failed: {e}"))?;
-        let cams = dev
-            .connected_cameras()
-            .map_err(|e| format!("getConnectedCameras failed: {e}"))?;
+        let s = Session::connect(device)?;
 
         // The stereo pair is the whole point of this modality — unlike depth (which
         // open_rgbd silently falls back from), a missing mono socket here has no
         // meaningful degraded mode. Fail loudly.
-        let has_a = graph::has_socket(&cams, CameraBoardSocket::CamA);
-        if !graph::has_socket(&cams, CameraBoardSocket::CamB)
-            || !graph::has_socket(&cams, CameraBoardSocket::CamC)
-        {
+        if !s.has(CameraBoardSocket::CamB) || !s.has(CameraBoardSocket::CamC) {
             return Err("device has no stereo pair (CAM_B/CAM_C) — open_stereo needs both".into());
         }
-
-        let (queues, calib) = Self::build_stereo(&dev, &pipeline, width, height, fps, h264, has_a)
-            .map_err(|e| format!("open_stereo failed: {e}"))?;
+        let queues = build_stereo(&s, width, height, fps, h264).ctx("build stereo graph")?;
 
         // IMU is OPTIONAL: a missing IMU never costs the stereo pair (and never
         // reaches pipeline start). Left (CAM_B) is the stereo reference frame, so IMU
         // samples are rotated into ITS optical frame when the EEPROM carries the
         // extrinsics — same gate as RGBD, different reference socket.
-        let imu = graph::attach_imu(&dev, &pipeline, imu_hz, &calib, CameraBoardSocket::CamB);
+        let imu = graph::attach_imu(&s, imu_hz, CameraBoardSocket::CamB);
+        s.pipeline.start().ctx("pipeline start")?;
 
-        pipeline
-            .start()
-            .map_err(|e| format!("open_stereo failed: pipeline start: {e}"))?;
-
-        // Left (CAM_B) is the reference frame of a stereo rig, so `intrinsics()`
-        // reports ITS intrinsics in this modality — never CAM_A's, whose only role
-        // here is the optional viz-only H.264 stream.
-        let intr = graph::read_intrinsics(&calib, CameraBoardSocket::CamB, width, height);
-        // Full stereo calibration for a HOST rectifier (the pair above is raw). Read
-        // from the same handler, so it costs no extra RPC. Failure is non-fatal: a
-        // stereo consumer will refuse to start on `stereo_calib()`, but a plain "two
-        // raw eyes" consumer still works.
-        let stereo_calib = graph::read_stereo_calib(&calib, width, height);
-
-        Ok(Self::assemble(
-            dev,
-            pipeline,
-            width,
-            height,
-            intr,
+        let built = Built {
             queues,
             imu,
-            stereo_calib,
-        ))
-    }
-
-    /// The stereo+IMU graph: two mono cameras as a Sync'd GRAY8 pair, plus the
-    /// optional CAM_A H.264 viz stream. Returns the queues and the calibration
-    /// handler read along the way (shared with the IMU gate and intrinsics).
-    fn build_stereo(
-        dev: &Device,
-        pipeline: &Pipeline,
-        width: u32,
-        height: u32,
-        fps: u32,
-        h264: bool,
-        has_a: bool,
-    ) -> depthai::Result<(Queues, CalibrationHandler)> {
-        // CAM_B/CAM_C are MONOCHROME sensors, so they are requested as GRAY8 — one
-        // byte per pixel. Asking for RGB888i would make depthai replicate the same
-        // gray value across three channels on-device and then ship 3x the bytes
-        // over XLink for no information. Consumers that need 3 channels expand it
-        // on the GPU, where the copy is free next to the inference.
-        let left = pipeline.create::<Camera>()?;
-        left.build(CameraBoardSocket::CamB)?;
-        let right = pipeline.create::<Camera>()?;
-        right.build(CameraBoardSocket::CamC)?;
-        // undistort is deliberately FALSE here (it is true on the RGBD colour path).
-        // depthai's Camera node cannot rectify: its remap uses an identity
-        // rectifying rotation, so the two eyes would come out undistorted but NOT
-        // row-aligned, which is useless to a stereo matcher. A stereo consumer
-        // rectifies on the host from `stereo_calib()`, and feeding it pixels
-        // depthai had already undistorted would apply the correction TWICE,
-        // silently. Raw in, host-rectified out.
-        let lo = left.request_output(
-            (width, height),
-            Some(ImgFrameType::Gray8),
-            ImgResizeMode::Crop,
-            Some(fps as f32),
-            Some(false),
-        )?;
-        let ro = right.request_output(
-            (width, height),
-            Some(ImgFrameType::Gray8),
-            ImgResizeMode::Crop,
-            Some(fps as f32),
-            Some(false),
-        )?;
-
-        // Sync node: emit {left,right} as ONE MessageGroup so the host never has to
-        // pair by timestamp. The eyes are frame-locked by the shared stereo trigger,
-        // so the threshold only has to absorb transport jitter — half a frame
-        // interval is generous.
-        let sync = pipeline.create::<SyncNode>()?;
-        sync.set_sync_threshold(Duration::from_nanos(1_000_000_000 / fps as u64 / 2))?;
-        lo.link(&sync.input("left")?)?;
-        ro.link(&sync.input("right")?)?;
-        let stereo_q = sync.out()?.create_output_queue(4, false)?;
-
-        // One EEPROM read shared by the IMU-extrinsics gate and the intrinsics —
-        // readCalibration() is an RPC per call, and a wiped EEPROM comes back as
-        // an empty handler (its getters then fail, handled at each use).
-        let calib = dev.read_calibration()?;
-
-        // Optional on-device H.264 of the COLOUR camera (CAM_A), viz-only: the
-        // encoder runs on the device and only the ~OAK_H264_KBPS bitstream crosses
-        // the link, so it costs the stereo pair nothing on the host. Same degrade
-        // rule as the IMU: a board without CAM_A skips the stream.
-        let video = if h264 && has_a {
-            let color = pipeline.create::<Camera>()?;
-            color.build(CameraBoardSocket::CamA)?;
-            graph::try_add_h264_encoder(pipeline, &color, width, height, fps, "stereo")
-        } else {
-            if h264 {
-                eprintln!("sensor-oak: no CAM_A on this board — skipping the H.264 viz stream");
-            }
-            None
+            // Left (CAM_B) is the reference frame of a stereo rig, so `intrinsics()`
+            // reports ITS intrinsics in this modality — never CAM_A's, whose only role
+            // here is the optional viz-only H.264 stream.
+            intr: graph::read_intrinsics(&s.calib, CameraBoardSocket::CamB, width, height),
+            // Full stereo calibration for a HOST rectifier (the pair above is raw). Read
+            // from the same handler, so it costs no extra RPC. Failure is non-fatal: a
+            // stereo consumer will refuse to start on `stereo_calib()`, but a plain "two
+            // raw eyes" consumer still works.
+            stereo_calib: graph::read_stereo_calib(&s.calib, width, height),
         };
-        Ok((
-            Queues {
-                stereo: Some(stereo_q),
-                video,
-                ..Default::default()
-            },
-            calib,
-        ))
-    }
-
-    /// Whether the on-board IMU is running (so [`next_imu`](OakSource::next_imu)
-    /// yields samples). `false` on a board with no IMU — degrade, don't abort.
-    pub fn has_imu(&self) -> bool {
-        self.imu_q.is_some()
+        Ok(Self::from_parts(s, width, height, built))
     }
 
     /// Pull the next time-synced stereo pair. Both eyes are borrowed from the
@@ -331,65 +252,105 @@ impl OakSource {
     /// warmup). `None` means
     /// the stream ended: a device error, or ~5 s with no pair.
     pub fn next_stereo(&mut self) -> Option<OakStereoFrame<'_>> {
-        let q = self.stereo_q.as_ref()?;
+        let q = self.stereo_q.clone()?;
         let mut tries = 0;
-        let (left, right, w, h) = loop {
-            let group = match q.get(Duration::from_secs(1)) {
-                Ok(Some(g)) => Some(g),
-                Ok(None) => None,
-                Err(e) => {
-                    eprintln!("sensor-oak: stereo poll failed: {e}");
-                    return None; // device error → stream ended
-                }
-            };
-            if let Some(group) = group {
-                let eyes = (|| -> Result<(ImgFrame, ImgFrame), String> {
-                    let l = group
-                        .get::<ImgFrame>("left")
-                        .map_err(|e| e.to_string())?
-                        .ok_or("stereo group missing an eye")?;
-                    let r = group
-                        .get::<ImgFrame>("right")
-                        .map_err(|e| e.to_string())?
-                        .ok_or("stereo group missing an eye")?;
-                    Ok((l, r))
-                })();
-                match eyes {
-                    Ok((l, r)) => match check_tight_gray8(&l, &r) {
-                        Ok((w, h)) => break (l, r, w, h),
-                        // Degenerate frame — skip, don't kill the stream.
-                        Err(e) if e == "degenerate frame" => {}
-                        Err(e) => {
-                            eprintln!("sensor-oak: {e}");
-                            return None;
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("sensor-oak: {e}");
-                        return None;
-                    }
-                }
+        let (left, right) = loop {
+            // ~1 s per poll → ~5 s with no pair ⇒ treat as ended.
+            if tries >= 5 {
+                return None;
             }
             tries += 1;
-            if tries >= 5 {
-                return None; // ~1s per poll → ~5s with no pair ⇒ treat as ended
+            // A poll error is logged by `pop` and lands here as "no group" until the
+            // retry budget runs out.
+            let Some(group) = self.pop(&q, "stereo", Some(Duration::from_secs(1))) else {
+                continue;
+            };
+            match take_pair(&group) {
+                Ok(Some(pair)) => break pair,
+                Ok(None) => continue, // degenerate frame — skip, don't kill the stream
+                Err(e) => {
+                    degrade!("{e}");
+                    return None;
+                }
             }
         };
 
-        let ts =
-            policy::steady_to_epoch_ns(left.timestamp_ns(), policy::steady_epoch_offset_cached());
         self.seq += 1;
+        let meta = FrameMeta {
+            seq: self.seq,
+            pts_ns: Some(policy::frame_epoch_ns(&left)),
+            source_id: None,
+        };
         Some(OakStereoFrame {
-            left: Arc::new(left),
-            right: Arc::new(right),
-            width: w,
-            height: h,
-            meta: FrameMeta {
-                seq: self.seq,
-                pts_ns: Some(ts),
-                source_id: None,
-            },
+            left,
+            right,
+            meta,
             _src: std::marker::PhantomData,
         })
     }
+}
+
+/// The stereo+IMU graph: two mono cameras as a Sync'd GRAY8 pair, plus the
+/// optional CAM_A H.264 viz stream.
+fn build_stereo(
+    s: &Session,
+    width: u32,
+    height: u32,
+    fps: u32,
+    h264: bool,
+) -> depthai::Result<Queues> {
+    // CAM_B/CAM_C are MONOCHROME sensors, so they are requested as GRAY8 — one byte
+    // per pixel. Asking for RGB888i would make depthai replicate the same gray value
+    // across three channels on-device and then ship 3x the bytes over XLink for no
+    // information. Consumers that need 3 channels expand it on the GPU, where the
+    // copy is free next to the inference.
+    //
+    // undistort is deliberately FALSE here (it is true on the RGBD colour path).
+    // depthai's Camera node cannot rectify: its remap uses an identity rectifying
+    // rotation, so the two eyes would come out undistorted but NOT row-aligned, which
+    // is useless to a stereo matcher. A stereo consumer rectifies on the host from
+    // `stereo_calib()`, and feeding it pixels depthai had already undistorted would
+    // apply the correction TWICE, silently. Raw in, host-rectified out.
+    let mono = |socket| -> depthai::Result<_> {
+        s.camera(socket)?.request_output(
+            (width, height),
+            Some(ImgFrameType::Gray8),
+            ImgResizeMode::Crop,
+            Some(fps as f32),
+            Some(false),
+        )
+    };
+    let lo = mono(CameraBoardSocket::CamB)?;
+    let ro = mono(CameraBoardSocket::CamC)?;
+
+    // Sync node: emit {left,right} as ONE MessageGroup so the host never has to pair
+    // by timestamp. The eyes are frame-locked by the shared stereo trigger, so the
+    // threshold only has to absorb transport jitter — half a frame interval is
+    // generous.
+    let sync = s.pipeline.create::<SyncNode>()?;
+    sync.set_sync_threshold(Duration::from_nanos(1_000_000_000 / fps as u64 / 2))?;
+    lo.link(&sync.input("left")?)?;
+    ro.link(&sync.input("right")?)?;
+    let stereo = sync.out()?.create_output_queue(4, false)?;
+
+    // Optional on-device H.264 of the COLOUR camera (CAM_A), viz-only: the encoder
+    // runs on the device and only the ~OAK_H264_KBPS bitstream crosses the link, so
+    // it costs the stereo pair nothing on the host. Same degrade rule as the IMU: a
+    // board without CAM_A skips the stream.
+    let video = match (h264, s.has(CameraBoardSocket::CamA)) {
+        (true, true) => {
+            let color = s.camera(CameraBoardSocket::CamA)?;
+            graph::try_add_h264_encoder(s, &color, width, height, fps, "stereo")
+        }
+        (true, false) => {
+            degrade!("no CAM_A on this board — skipping the H.264 viz stream");
+            None
+        }
+        (false, _) => None,
+    };
+    Ok(Queues {
+        stereo: Some(stereo),
+        video,
+        ..Default::default()
+    })
 }

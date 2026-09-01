@@ -1,19 +1,19 @@
 //! The OAK-specific **policy** this driver layers on the faithful `depthai`
-//! wrapper: environment knobs, the steady→epoch clock shift, and the IMU
-//! rotation gate. Pure functions where possible, so every decision that used to
-//! sit inside the C++ shim is unit-tested here.
+//! wrapper: the `OAK_*` environment knobs, the steady→epoch clock shift, and the
+//! IMU rotation gate. Pure functions where possible, so every decision is
+//! unit-tested.
 
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use depthai::UsbSpeed;
+use depthai::{ImgFrame, Message, UsbSpeed};
 
 // ---------------------------------------------------------------------------
-// Environment knobs (same names, defaults and semantics as the old shim)
+// Frame rate
 // ---------------------------------------------------------------------------
 
-/// A zero/absent frame rate means "default", never "1 fps": it would poison the
-/// encoder preset, the requested output rate and the Sync threshold.
+/// A zero frame rate means "default", never "1 fps": it would poison the encoder
+/// preset, the requested output rate and the Sync threshold.
 pub(crate) const DEFAULT_FPS: u32 = 30;
 
 pub(crate) fn fps_or_default(fps: u32) -> u32 {
@@ -24,54 +24,75 @@ pub(crate) fn fps_or_default(fps: u32) -> u32 {
     }
 }
 
-/// `OAK_USB_SPEED`: cap the USB link. Default HIGH (USB2): the SUPER default boots
-/// the device into a USB3 descriptor, and on a physical USB2 link the host then
-/// can't reconnect to the booted device (X_LINK_DEVICE_NOT_FOUND). `super` opts
-/// into USB3 on a USB3 cable. Ignored for PoE.
-pub(crate) fn usb_speed_from_env() -> UsbSpeed {
-    parse_usb_speed(std::env::var("OAK_USB_SPEED").ok().as_deref())
+// ---------------------------------------------------------------------------
+// Environment knobs (`OAK_*`), read once per open
+// ---------------------------------------------------------------------------
+
+/// The `OAK_*` environment knobs, parsed once at open and passed down, so the
+/// graph builders are pure functions of their arguments.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Knobs {
+    /// `OAK_USB_SPEED`: cap the USB link. Default HIGH (USB2): the SUPER default
+    /// boots the device into a USB3 descriptor, and on a physical USB2 link the
+    /// host then can't reconnect to the booted device (X_LINK_DEVICE_NOT_FOUND).
+    /// `super` opts into USB3 on a USB3 cable. Ignored for PoE.
+    pub usb_speed: UsbSpeed,
+    /// `OAK_H264_KBPS`: encoder target bitrate. 2000 kbps is comfortable for
+    /// 640x360@30 and a big cut for a phone/Tailscale hop.
+    pub h264_kbps: i32,
+    /// `OAK_DEPTH_FPS`: depth rate on the RGBD path (default = colour fps).
+    pub depth_fps: Option<u32>,
+    /// `OAK_RGB_FPS`: raw-RGB pull rate on the RGBD path (default 10) — raw colour
+    /// is only needed for local compute and is the heaviest XLink stream.
+    pub rgb_fps: Option<u32>,
+    /// `OAK_DEPTH_DIV`: on-device downscale of the aligned depth (default /2 →
+    /// 1/4 the bytes).
+    pub depth_div: u32,
+    /// `OAK_SUBPIXEL`: subpixel disparity (default on). `0`/`false` trades
+    /// precision for rate.
+    pub subpixel: bool,
+    /// `OAK_IR`: IR dot-projector intensity, clamped to `0..=1` (default 0.8;
+    /// 0 disables).
+    pub ir: f32,
 }
 
-pub(crate) fn parse_usb_speed(v: Option<&str>) -> UsbSpeed {
-    match v {
-        Some("super") | Some("SUPER") => UsbSpeed::Super,
-        _ => UsbSpeed::High,
+impl Knobs {
+    pub(crate) fn from_env() -> Self {
+        Self::parse(|k| std::env::var(k).ok())
     }
-}
 
-/// `OAK_H264_KBPS`: encoder target bitrate. 2000 kbps is comfortable for 640x360@30
-/// and a big cut for a phone/Tailscale hop.
-pub(crate) fn h264_kbps() -> i32 {
-    parse_positive(std::env::var("OAK_H264_KBPS").ok().as_deref()).unwrap_or(2000)
-}
+    /// Parse from any key → value source (tests pass a map).
+    pub(crate) fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
+        let positive = |k: &str| {
+            get(k)
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .filter(|&v| v >= 1)
+        };
+        Knobs {
+            usb_speed: match get("OAK_USB_SPEED").as_deref() {
+                Some("super") | Some("SUPER") => UsbSpeed::Super,
+                _ => UsbSpeed::High,
+            },
+            h264_kbps: positive("OAK_H264_KBPS").map_or(2000, |v| v.min(i32::MAX as i64) as i32),
+            depth_fps: positive("OAK_DEPTH_FPS").map(|v| v.min(u32::MAX as i64) as u32),
+            rgb_fps: positive("OAK_RGB_FPS").map(|v| v.min(u32::MAX as i64) as u32),
+            depth_div: positive("OAK_DEPTH_DIV").map_or(2, |v| v.min(u32::MAX as i64) as u32),
+            subpixel: !matches!(get("OAK_SUBPIXEL").as_deref(), Some("0") | Some("false")),
+            ir: get("OAK_IR")
+                .and_then(|s| s.trim().parse::<f32>().ok())
+                .map_or(0.8, |x| x.clamp(0.0, 1.0)),
+        }
+    }
 
-/// `OAK_DEPTH_FPS`: depth rate on the RGBD path (default = colour fps, never above it).
-pub(crate) fn depth_fps(fps: u32) -> u32 {
-    clamp_rate(
-        parse_positive(std::env::var("OAK_DEPTH_FPS").ok().as_deref()),
-        fps,
-        fps,
-    )
-}
+    /// Depth rate on the RGBD path: the knob, else `fps`; never above `fps`.
+    pub(crate) fn depth_fps(&self, fps: u32) -> u32 {
+        self.depth_fps.unwrap_or(fps).min(fps).max(1)
+    }
 
-/// `OAK_RGB_FPS`: raw-RGB pull rate on the RGBD path (default 10, never above fps) —
-/// raw colour is only needed for local compute and is the heaviest XLink stream.
-pub(crate) fn rgb_fps(fps: u32) -> u32 {
-    clamp_rate(
-        parse_positive(std::env::var("OAK_RGB_FPS").ok().as_deref()),
-        10,
-        fps,
-    )
-}
-
-pub(crate) fn clamp_rate(requested: Option<i32>, default: u32, max: u32) -> u32 {
-    let v = requested.map_or(default, |v| v as u32);
-    v.min(max).max(1)
-}
-
-/// `OAK_DEPTH_DIV`: on-device downscale of the aligned depth (default /2 → 1/4 the bytes).
-pub(crate) fn depth_div() -> u32 {
-    parse_positive(std::env::var("OAK_DEPTH_DIV").ok().as_deref()).map_or(2, |v| v as u32)
+    /// Raw-RGB rate on the RGBD path: the knob, else 10; never above `fps`.
+    pub(crate) fn rgb_fps(&self, fps: u32) -> u32 {
+        self.rgb_fps.unwrap_or(10).min(fps).max(1)
+    }
 }
 
 /// XLink requires EVEN depth dims — an odd width/height tears the device
@@ -80,30 +101,6 @@ pub(crate) fn depth_div() -> u32 {
 pub(crate) fn depth_output_size(width: u32, height: u32, div: u32) -> (u32, u32) {
     let div = div.max(1);
     (((width / div) & !1).max(2), ((height / div) & !1).max(2))
-}
-
-/// `OAK_SUBPIXEL`: subpixel disparity (default on). `0`/`false` trades precision for rate.
-pub(crate) fn subpixel() -> bool {
-    parse_bool_default_true(std::env::var("OAK_SUBPIXEL").ok().as_deref())
-}
-
-pub(crate) fn parse_bool_default_true(v: Option<&str>) -> bool {
-    !matches!(v, Some("0") | Some("false"))
-}
-
-/// `OAK_IR`: IR dot-projector intensity, clamped to `0..=1` (default 0.8; 0 disables).
-pub(crate) fn ir_intensity() -> f32 {
-    parse_ir(std::env::var("OAK_IR").ok().as_deref())
-}
-
-pub(crate) fn parse_ir(v: Option<&str>) -> f32 {
-    v.and_then(|s| s.trim().parse::<f32>().ok())
-        .map_or(0.8, |x| x.clamp(0.0, 1.0))
-}
-
-fn parse_positive(v: Option<&str>) -> Option<i32> {
-    v.and_then(|s| s.trim().parse::<i32>().ok())
-        .filter(|&x| x >= 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +135,12 @@ pub(crate) fn steady_epoch_offset_cached() -> i128 {
 
 pub(crate) fn steady_to_epoch_ns(steady_ns: i64, offset: i128) -> u64 {
     (steady_ns as i128 + offset).clamp(0, u64::MAX as i128) as u64
+}
+
+/// A frame's capture time on the epoch timeline (frames use the process-wide
+/// cached offset; the IMU drain uses a per-batch one).
+pub(crate) fn frame_epoch_ns(f: &ImgFrame) -> u64 {
+    steady_to_epoch_ns(f.timestamp_ns(), steady_epoch_offset_cached())
 }
 
 // ---------------------------------------------------------------------------
@@ -195,11 +198,17 @@ pub(crate) fn rotate(r: &[f32; 9], v: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-pub(crate) const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    const IDENTITY: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+    fn knobs(pairs: &[(&str, &str)]) -> Knobs {
+        let map: HashMap<&str, &str> = pairs.iter().copied().collect();
+        Knobs::parse(|k| map.get(k).map(|v| v.to_string()))
+    }
 
     #[test]
     fn rotation_gate_rejects_each_reason() {
@@ -210,17 +219,14 @@ mod tests {
         );
         m[0] = f32::NAN;
         assert_eq!(validate_rotation(&m), Err("non-finite entry"));
-        // Reflection: flip one axis.
         let refl = [-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         assert!(validate_rotation(&refl)
             .unwrap_err()
             .starts_with("determinant <= 0"));
-        // Shear with det = 1.
         let shear = [1.0, 100.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         assert!(validate_rotation(&shear)
             .unwrap_err()
             .starts_with("not orthonormal"));
-        // 3% scale.
         let scale = [1.03, 0.0, 0.0, 0.0, 1.03, 0.0, 0.0, 0.0, 1.03];
         assert!(validate_rotation(&scale)
             .unwrap_err()
@@ -247,22 +253,44 @@ mod tests {
     }
 
     #[test]
-    fn env_parsers_have_the_shim_defaults() {
-        assert_eq!(parse_usb_speed(None), UsbSpeed::High);
-        assert_eq!(parse_usb_speed(Some("super")), UsbSpeed::Super);
-        assert_eq!(parse_usb_speed(Some("nonsense")), UsbSpeed::High);
-        assert!(parse_bool_default_true(None));
-        assert!(!parse_bool_default_true(Some("0")));
-        assert!(!parse_bool_default_true(Some("false")));
-        assert_eq!(parse_ir(None), 0.8);
-        assert_eq!(parse_ir(Some("5")), 1.0);
-        assert_eq!(parse_ir(Some("-1")), 0.0);
-        assert_eq!(parse_ir(Some("abc")), 0.8);
-        assert_eq!(clamp_rate(None, 10, 30), 10);
-        assert_eq!(clamp_rate(Some(60), 10, 30), 30);
-        assert_eq!(clamp_rate(None, 30, 15), 15);
-        assert_eq!(parse_positive(Some("0")), None);
-        assert_eq!(parse_positive(Some(" 7 ")), Some(7));
+    fn knobs_have_documented_defaults() {
+        let k = knobs(&[]);
+        assert_eq!(k.usb_speed, UsbSpeed::High);
+        assert_eq!(k.h264_kbps, 2000);
+        assert_eq!(k.depth_fps, None);
+        assert_eq!(k.rgb_fps, None);
+        assert_eq!(k.depth_div, 2);
+        assert!(k.subpixel);
+        assert_eq!(k.ir, 0.8);
+        assert_eq!(k.depth_fps(30), 30);
+        assert_eq!(k.rgb_fps(30), 10);
+        assert_eq!(k.rgb_fps(5), 5);
+    }
+
+    #[test]
+    fn knobs_parse_and_clamp() {
+        let k = knobs(&[
+            ("OAK_USB_SPEED", "super"),
+            ("OAK_H264_KBPS", " 4000 "),
+            ("OAK_DEPTH_FPS", "60"),
+            ("OAK_RGB_FPS", "0"),
+            ("OAK_DEPTH_DIV", "3"),
+            ("OAK_SUBPIXEL", "false"),
+            ("OAK_IR", "5"),
+        ]);
+        assert_eq!(k.usb_speed, UsbSpeed::Super);
+        assert_eq!(k.h264_kbps, 4000);
+        assert_eq!(k.depth_fps(30), 30); // never above fps
+        assert_eq!(k.rgb_fps, None); // "0" is not a rate
+        assert_eq!(k.depth_div, 3);
+        assert!(!k.subpixel);
+        assert_eq!(k.ir, 1.0);
+        assert_eq!(knobs(&[("OAK_IR", "-1")]).ir, 0.0);
+        assert_eq!(knobs(&[("OAK_IR", "abc")]).ir, 0.8);
+        assert_eq!(
+            knobs(&[("OAK_USB_SPEED", "nonsense")]).usb_speed,
+            UsbSpeed::High
+        );
     }
 
     #[test]

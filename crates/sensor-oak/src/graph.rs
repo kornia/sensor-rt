@@ -1,23 +1,75 @@
-//! Pipeline-building helpers shared by both modalities: device connection,
-//! the optional H.264 encoder, the optional IMU (with its extrinsics gate), and
-//! the calibration readers. Each carries the *degrade* rule of the thing it
-//! attaches, so that rule cannot drift between the two open paths.
+//! Pipeline-building helpers shared by both modalities: the opened [`Session`],
+//! camera/encoder/stereo/IMU attachers (each carrying the *degrade* rule of the
+//! thing it attaches, so that rule cannot drift between the two open paths), and
+//! the calibration readers.
 
-use depthai::node::{Camera, Imu, VideoEncoder};
+use depthai::node::{Camera, Imu, StereoDepth, VideoEncoder};
 use depthai::{
     CalibrationHandler, CameraBoardSocket, Device, ImgFrame, ImgFrameType, ImgResizeMode, ImuData,
-    ImuSensor, LengthUnit, OutputQueue, Pipeline, VideoEncoderProfile,
+    ImuSensor, LengthUnit, Output, OutputQueue, Pipeline, StereoPresetMode, VideoEncoderProfile,
 };
 
-use crate::calib::{OakCameraCalib, OakCameraModel, OakStereoCalib};
-use crate::policy;
-use crate::{BoxError, OakIntrinsics};
+use crate::calib::{OakCameraCalib, OakCameraModel, OakStereoCalib, StereoCalibError};
+use crate::policy::{self, Knobs};
+use crate::{Ctx, OakError, OakIntrinsics};
 
-/// Connect to an OAK by id (`None` = first available), honouring `OAK_USB_SPEED`.
-pub(crate) fn connect_device(id: Option<&str>) -> Result<Device, BoxError> {
-    let id = id.filter(|s| !s.is_empty());
-    Device::open(id, Some(policy::usb_speed_from_env()))
-        .map_err(|e| format!("open device failed: {e}").into())
+/// An opened device with everything both modalities need before building a graph:
+/// the pipeline, the populated sockets, the factory calibration (one EEPROM RPC,
+/// shared by the stereo check, the IMU-extrinsics gate and the intrinsics) and the
+/// `OAK_*` knobs read once.
+pub(crate) struct Session {
+    pub dev: Device,
+    pub pipeline: Pipeline,
+    pub cams: Vec<CameraBoardSocket>,
+    pub calib: CalibrationHandler,
+    pub knobs: Knobs,
+}
+
+impl Session {
+    /// Connect to an OAK by id (`None`/`""` = first available), honouring
+    /// `OAK_USB_SPEED`.
+    pub(crate) fn connect(id: Option<&str>) -> Result<Session, OakError> {
+        let knobs = Knobs::from_env();
+        let id = id.filter(|s| !s.is_empty());
+        let dev = Device::open(id, Some(knobs.usb_speed)).ctx("open device")?;
+        let pipeline = Pipeline::new(&dev).ctx("create pipeline")?;
+        let cams = dev.connected_cameras().ctx("getConnectedCameras")?;
+        // A wiped EEPROM comes back as an empty handler (its getters then fail,
+        // handled at each use) rather than failing here.
+        let calib = dev.read_calibration().ctx("readCalibration")?;
+        Ok(Session {
+            dev,
+            pipeline,
+            cams,
+            calib,
+            knobs,
+        })
+    }
+
+    pub(crate) fn has(&self, socket: CameraBoardSocket) -> bool {
+        self.cams.contains(&socket)
+    }
+
+    /// True only if the device can actually produce aligned depth: it has BOTH
+    /// stereo mono sockets (CAM_B + CAM_C) AND a readable factory calibration (a
+    /// wiped/blank EEPROM reads back fx=0, which makes StereoDepth emit
+    /// garbage/zero-scale depth).
+    pub(crate) fn can_do_depth(&self, width: u32, height: u32) -> bool {
+        self.has(CameraBoardSocket::CamB)
+            && self.has(CameraBoardSocket::CamC)
+            && self
+                .calib
+                .camera_intrinsics(CameraBoardSocket::CamA, Some((width, height)))
+                .map(|k| k[0][0] > 0.0)
+                .unwrap_or(false)
+    }
+
+    /// Create a `Camera` node bound to `socket`.
+    pub(crate) fn camera(&self, socket: CameraBoardSocket) -> depthai::Result<Camera> {
+        let cam = self.pipeline.create::<Camera>()?;
+        cam.build(socket)?;
+        Ok(cam)
+    }
 }
 
 /// Attach an NV12 output of `color` → a hardware H.264 encoder, returning the
@@ -25,13 +77,12 @@ pub(crate) fn connect_device(id: Option<&str>) -> Result<Device, BoxError> {
 /// so their encoder settings (BASELINE for Foxglove's decoder, ~4 keyframes/s for
 /// fast mid-stream join, OAK_H264_KBPS) can never drift apart.
 pub(crate) fn add_h264_encoder(
-    pipeline: &Pipeline,
+    s: &Session,
     color: &Camera,
     width: u32,
     height: u32,
     fps: u32,
 ) -> depthai::Result<OutputQueue<ImgFrame>> {
-    let fps = policy::fps_or_default(fps);
     let nv12 = color.request_output(
         (width, height),
         Some(ImgFrameType::Nv12),
@@ -39,78 +90,157 @@ pub(crate) fn add_h264_encoder(
         Some(fps as f32),
         Some(true),
     )?;
-    let enc = pipeline.create::<VideoEncoder>()?;
+    let enc = s.pipeline.create::<VideoEncoder>()?;
     enc.set_default_profile_preset(fps as f32, VideoEncoderProfile::H264Baseline)?;
     enc.set_keyframe_frequency((fps / 4).max(4) as i32)?;
-    enc.set_bitrate_kbps(policy::h264_kbps())?;
+    enc.set_bitrate_kbps(s.knobs.h264_kbps)?;
     nv12.link(&enc.input()?)?;
     enc.bitstream()?.create_output_queue(30, false)
 }
 
-/// The OPTIONAL attach: same encoder settings, but a board that rejects the colour
-/// node or the requested NV12 output must DEGRADE (no video queue) rather than fail
-/// the whole open. `ctx` names the modality in the log.
+/// The OPTIONAL attach: same encoder settings, but a board that rejects the NV12
+/// output must DEGRADE (no video queue) rather than fail the whole open. `ctx`
+/// names the modality in the log.
 pub(crate) fn try_add_h264_encoder(
-    pipeline: &Pipeline,
+    s: &Session,
     color: &Camera,
     width: u32,
     height: u32,
     fps: u32,
     ctx: &str,
 ) -> Option<OutputQueue<ImgFrame>> {
-    match add_h264_encoder(pipeline, color, width, height, fps) {
-        Ok(q) => Some(q),
-        Err(e) => {
-            eprintln!(
-                "sensor-oak: H.264 viz stream unavailable on the {ctx} path ({e}) — continuing without it"
-            );
-            None
-        }
-    }
+    add_h264_encoder(s, color, width, height, fps)
+        .map_err(|e| {
+            degrade!("H.264 viz stream unavailable on the {ctx} path ({e}) — continuing without it")
+        })
+        .ok()
+}
+
+/// StereoDepth (CAM_B/CAM_C) aligned to `rgb_out`'s grid, downscaled on-device,
+/// returning the depth queue.
+pub(crate) fn add_stereo_depth(
+    s: &Session,
+    rgb_out: &Output<ImgFrame>,
+    width: u32,
+    height: u32,
+    dfps: u32,
+) -> depthai::Result<OutputQueue<ImgFrame>> {
+    let left = s.camera(CameraBoardSocket::CamB)?;
+    let right = s.camera(CameraBoardSocket::CamC)?;
+    let stereo = s.pipeline.create::<StereoDepth>()?;
+    // ROBOTICS preset (depthai v3) is tuned for mobile-robot people/obstacle depth.
+    // Subpixel gives ~8× finer disparity (removes the z-quantization that flickers
+    // a standing person's depth) but ~halves the stereo FPS; OAK_SUBPIXEL=0 trades
+    // precision for rate. LR-check on for occlusion.
+    stereo.set_default_profile_preset(StereoPresetMode::Robotics)?;
+    stereo.set_left_right_check(true)?;
+    stereo.set_subpixel(s.knobs.subpixel)?;
+    // Passive-stereo depth cleanup (no IR projector): SPATIAL edge-preserving
+    // hole-fill + TEMPORAL averaging + THRESHOLD clamp to the useful range
+    // (0.4 m .. 8 m).
+    stereo
+        .post_processing()
+        .set_spatial_filter_enable(true)?
+        .set_temporal_filter_enable(true)?
+        .set_threshold_filter(400, 8000)?;
+    left.request_output(
+        (640, 400),
+        None,
+        ImgResizeMode::Crop,
+        Some(dfps as f32),
+        None,
+    )?
+    .link(&stereo.left()?)?;
+    right
+        .request_output(
+            (640, 400),
+            None,
+            ImgResizeMode::Crop,
+            Some(dfps as f32),
+            None,
+        )?
+        .link(&stereo.right()?)?;
+    // Align depth to the RGB OUTPUT (not just the CAM_A socket), so depth[u,v]
+    // matches RGB[u,v] exactly — same CROP, same size, same intrinsics.
+    rgb_out.link(&stereo.input_align_to()?)?;
+    // Downscale the aligned depth ON-DEVICE before XLink. A room-scale point cloud
+    // doesn't need per-RGB-pixel depth, and the full-res depth pull is the dominant
+    // XLink cost (it caps the co-hosted H.264 on a PoE link). Default /2 → 1/4 the
+    // bytes; still aligned to the RGB grid, so consumers scale coords by
+    // (rgb_w / depth_w).
+    let (dw, dh) = policy::depth_output_size(width, height, s.knobs.depth_div);
+    stereo.set_output_size(dw, dh)?;
+    stereo.depth()?.create_output_queue(4, false)
+}
+
+/// The OPTIONAL attach (e.g. OAK-1: no stereo pair): degrade to colour + video.
+pub(crate) fn try_add_stereo_depth(
+    s: &Session,
+    rgb_out: &Output<ImgFrame>,
+    width: u32,
+    height: u32,
+    dfps: u32,
+) -> Option<OutputQueue<ImgFrame>> {
+    add_stereo_depth(s, rgb_out, width, height, dfps)
+        .map_err(|e| degrade!("StereoDepth unavailable ({e}) — continuing without depth"))
+        .ok()
+}
+
+/// What [`attach_imu`] produced: the queue (absent = no IMU running) and the
+/// validated chip→camera rotation (absent = samples stay in the raw chip frame).
+#[derive(Default)]
+pub(crate) struct ImuAttach {
+    pub queue: Option<OutputQueue<ImuData>>,
+    pub rot: Option<[f32; 9]>,
 }
 
 /// Attach the on-board IMU (ACCELEROMETER_RAW + GYROSCOPE_RAW at `imu_hz`) on its
-/// own queue. The IMU is OPTIONAL: not every OAK carries one, and a missing IMU must
-/// not cost the image streams — so BEFORE creating the node (and thus before it can
-/// ever reach `Pipeline::start`), preflight with `connected_imu()`: a board without
-/// one reports `""`/`"NONE"` and we skip the node. `None` when `imu_hz == 0`.
-pub(crate) fn add_imu_node(
-    device: &Device,
-    pipeline: &Pipeline,
-    imu_hz: u32,
-) -> Option<OutputQueue<ImuData>> {
+/// own queue and load its extrinsics — ALWAYS both, in this order: the rotation is
+/// only meaningful if the IMU actually started, and the reference socket differs
+/// per modality (CAM_A on RGBD, CAM_B on stereo).
+///
+/// The IMU is OPTIONAL: not every OAK carries one, and a missing IMU must not cost
+/// the image streams — so BEFORE creating the node (and thus before it can ever
+/// reach `Pipeline::start`), preflight with `connected_imu()`: a board without one
+/// reports `""`/`"NONE"` and we skip the node. Nothing when `imu_hz == 0`.
+pub(crate) fn attach_imu(s: &Session, imu_hz: u32, socket: CameraBoardSocket) -> ImuAttach {
     if imu_hz == 0 {
-        return None;
+        return ImuAttach::default();
     }
-    let name = match device.connected_imu() {
+    let name = match s.dev.connected_imu() {
         Ok(n) => n,
         Err(e) => {
-            eprintln!("sensor-oak: getConnectedIMU failed ({e}) — skipping the IMU node");
-            return None;
+            degrade!("getConnectedIMU failed ({e}) — skipping the IMU node");
+            return ImuAttach::default();
         }
     };
     if name.is_empty() || name == "NONE" {
-        eprintln!("sensor-oak: no on-board IMU (getConnectedIMU={name:?}) — skipping the IMU node");
-        return None;
+        degrade!("no on-board IMU (getConnectedIMU={name:?}) — skipping the IMU node");
+        return ImuAttach::default();
     }
-    let build = || -> depthai::Result<OutputQueue<ImuData>> {
-        let imu = pipeline.create::<Imu>()?;
-        imu.enable_sensor(ImuSensor::AccelerometerRaw, imu_hz)?;
-        imu.enable_sensor(ImuSensor::GyroscopeRaw, imu_hz)?;
-        // Batch a few reports per message (fewer, larger XLink transfers) but keep
-        // the batch small enough that inertial data stays fresh relative to the
-        // frames. 5 is also the documented maxBatchReports ceiling.
-        imu.set_batch_report_threshold(5)?;
-        imu.set_max_batch_reports(5)?;
-        imu.out()?.create_output_queue(50, false)
-    };
-    match build() {
-        Ok(q) => Some(q),
+    let queue = match add_imu_node(s, imu_hz) {
+        Ok(q) => q,
         Err(e) => {
-            eprintln!("sensor-oak: IMU node setup failed ({e}) — skipping the IMU node");
-            None
+            degrade!("IMU node setup failed ({e}) — skipping the IMU node");
+            return ImuAttach::default();
         }
+    };
+    ImuAttach {
+        queue: Some(queue),
+        rot: read_imu_rotation(&s.calib, socket),
     }
+}
+
+fn add_imu_node(s: &Session, imu_hz: u32) -> depthai::Result<OutputQueue<ImuData>> {
+    let imu = s.pipeline.create::<Imu>()?;
+    imu.enable_sensor(ImuSensor::AccelerometerRaw, imu_hz)?;
+    imu.enable_sensor(ImuSensor::GyroscopeRaw, imu_hz)?;
+    // Batch a few reports per message (fewer, larger XLink transfers) but keep the
+    // batch small enough that inertial data stays fresh relative to the frames. 5
+    // is also the documented maxBatchReports ceiling.
+    imu.set_batch_report_threshold(5)?;
+    imu.set_max_batch_reports(5)?;
+    imu.out()?.create_output_queue(50, false)
 }
 
 /// Resolve the IMU-chip → camera-optical rotation from the device calibration so
@@ -120,14 +250,9 @@ pub(crate) fn add_imu_node(
 /// the EEPROM has no IMU link or the stored matrix is not a proper rotation —
 /// degrade, never abort, but say WHY on stderr so a tilted gravity gauge is
 /// diagnosable without a debugger.
-pub(crate) fn read_imu_rotation(
-    calib: &CalibrationHandler,
-    socket: CameraBoardSocket,
-) -> Option<[f32; 9]> {
+fn read_imu_rotation(calib: &CalibrationHandler, socket: CameraBoardSocket) -> Option<[f32; 9]> {
     let reject = |why: &str| {
-        eprintln!(
-            "sensor-oak: IMU extrinsics rejected ({why}) — IMU samples stay in the raw chip frame"
-        );
+        degrade!("IMU extrinsics rejected ({why}) — IMU samples stay in the raw chip frame");
     };
     // Unit/spec do not matter for the rotation block, but they are mandatory in
     // the wrapper; pass the calibrated one for consistency.
@@ -146,27 +271,6 @@ pub(crate) fn read_imu_rotation(
             reject(why);
             None
         }
-    }
-}
-
-/// Attach the IMU and load its extrinsics — ALWAYS both, in this order: the
-/// rotation is only meaningful if the IMU actually started, and the reference
-/// socket differs per modality (CAM_A on RGBD, CAM_B on stereo). Returns the queue,
-/// the rotation to apply (identity when unaligned) and the `imu_aligned` flag.
-pub(crate) fn attach_imu(
-    device: &Device,
-    pipeline: &Pipeline,
-    imu_hz: u32,
-    calib: &CalibrationHandler,
-    socket: CameraBoardSocket,
-) -> (Option<OutputQueue<ImuData>>, [f32; 9], bool) {
-    let q = add_imu_node(device, pipeline, imu_hz);
-    if q.is_none() {
-        return (None, policy::IDENTITY, false);
-    }
-    match read_imu_rotation(calib, socket) {
-        Some(r) => (q, r, true),
-        None => (q, policy::IDENTITY, false),
     }
 }
 
@@ -189,47 +293,23 @@ pub(crate) fn read_intrinsics(
     }
 }
 
-/// Is `socket` populated on this device?
-pub(crate) fn has_socket(cams: &[CameraBoardSocket], socket: CameraBoardSocket) -> bool {
-    cams.contains(&socket)
-}
-
-/// True only if the device can actually produce aligned depth: it has BOTH stereo
-/// mono sockets (CAM_B + CAM_C) AND a readable factory calibration (a wiped/blank
-/// EEPROM reads back fx=0, which makes StereoDepth emit garbage/zero-scale depth).
-pub(crate) fn device_has_stereo(
-    cams: &[CameraBoardSocket],
-    calib: &CalibrationHandler,
-    width: u32,
-    height: u32,
-) -> bool {
-    if !has_socket(cams, CameraBoardSocket::CamB) || !has_socket(cams, CameraBoardSocket::CamC) {
-        return false;
-    }
-    calib
-        .camera_intrinsics(CameraBoardSocket::CamA, Some((width, height)))
-        .map(|k| k[0][0] > 0.0)
-        .unwrap_or(false)
-}
-
 /// Read the FULL CAM_B/CAM_C calibration for a host stereo rectifier: per-eye
 /// intrinsics at the streamed size, per-eye distortion, and the CALIBRATED
 /// left→right extrinsic in METRES.
 ///
 /// depthai's own getters default the translation source and unit differently per
 /// method (`getCameraExtrinsics` → calibrated/centimetres, `getBaselineDistance` →
-/// spec/centimetres); either mismatch silently rescales the entire
-/// reconstruction, so both are passed explicitly. The baseline is derived from
-/// this same extrinsic so rotation and baseline can never come from different
-/// sources.
+/// spec/centimetres); either mismatch silently rescales the entire reconstruction,
+/// so both are passed explicitly. The baseline is derived from this same extrinsic
+/// so rotation and baseline can never come from different sources.
 ///
-/// A wiped/blank EEPROM yields `Err(reason)`; the caller decides whether that is
-/// fatal (it is, for stereo VIO), so this does not fail the open.
+/// A wiped/blank EEPROM yields an error; the caller decides whether that is fatal
+/// (it is, for stereo VIO), so this does not fail the open.
 pub(crate) fn read_stereo_calib(
     calib: &CalibrationHandler,
     width: u32,
     height: u32,
-) -> Result<OakStereoCalib, String> {
+) -> Result<OakStereoCalib, StereoCalibError> {
     let (l, r) = (CameraBoardSocket::CamB, CameraBoardSocket::CamC);
     let read = || -> depthai::Result<OakStereoCalib> {
         let kl = calib.camera_intrinsics(l, Some((width, height)))?;
@@ -250,20 +330,19 @@ pub(crate) fn read_stereo_calib(
             baseline_m: (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt(),
         })
     };
-    let c = read().map_err(|e| format!("stereo calibration unavailable: {e}"))?;
+    let c = read().map_err(|e| StereoCalibError::Unreadable(e.to_string()))?;
     // A present-but-zero extrinsic passes every read above and reaches a rectifier
     // as NaN remap tables — the exact failure OakStereoCalib promises it cannot carry.
     if c.baseline_m <= 0.0 {
-        return Err("stereo calibration has a zero baseline (extrinsic present but blank)".into());
+        return Err(StereoCalibError::ZeroBaseline);
     }
     Ok(c)
 }
 
 fn eye(k: &[[f32; 3]; 3], d: &[f32], model: depthai::CameraModel) -> OakCameraCalib {
-    let n_dist = d.len().min(14);
     let mut dist = [0f64; 14];
-    for (i, v) in d.iter().take(n_dist).enumerate() {
-        dist[i] = *v as f64;
+    for (o, &v) in dist.iter_mut().zip(d) {
+        *o = v as f64;
     }
     OakCameraCalib {
         fx: k[0][0] as f64,
@@ -271,7 +350,7 @@ fn eye(k: &[[f32; 3]; 3], d: &[f32], model: depthai::CameraModel) -> OakCameraCa
         cx: k[0][2] as f64,
         cy: k[1][2] as f64,
         dist,
-        n_dist,
+        n_dist: d.len().min(14),
         model: OakCameraModel::from_depthai(model),
     }
 }

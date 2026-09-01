@@ -20,6 +20,17 @@
 
 use crate::{BoxError, OakSource};
 
+/// Why a stereo calibration is not available.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum StereoCalibError {
+    #[error("not a stereo device (opened with open_rgbd)")]
+    NotStereo,
+    #[error("stereo calibration unavailable: {0}")]
+    Unreadable(String),
+    #[error("stereo calibration has a zero baseline (extrinsic present but blank)")]
+    ZeroBaseline,
+}
+
 /// Lens model the factory calibration was fitted with. Mirrors `dai::CameraModel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OakCameraModel {
@@ -115,9 +126,7 @@ impl OakSource {
     /// there is no useful degraded mode for a metric stereo consumer, and a zero baseline would
     /// otherwise reach a rectifier as `NaN` remap tables.
     pub fn stereo_calib(&self) -> Result<OakStereoCalib, BoxError> {
-        self.stereo_calib
-            .clone()
-            .map_err(|why| format!("stereo calibration failed: {why}").into())
+        self.stereo_calib.clone().map_err(Into::into)
     }
 }
 

@@ -1080,7 +1080,7 @@ dependencies = [
 [[package]]
 name = "depthai"
 version = "0.1.0"
-source = "git+https://github.com/kornia/depthai-rs?rev=0ba9105b57de2349f850ae19e0353d334d1ab620#0ba9105b57de2349f850ae19e0353d334d1ab620"
+source = "git+https://github.com/kornia/depthai-rs?rev=27a307add67319523f0ea4f55ccd891e4a678ae2#27a307add67319523f0ea4f55ccd891e4a678ae2"
 dependencies = [
  "depthai-sys",
  "thiserror 2.0.18",
@@ -1089,7 +1089,7 @@ dependencies = [
 [[package]]
 name = "depthai-sys"
 version = "0.1.0"
-source = "git+https://github.com/kornia/depthai-rs?rev=0ba9105b57de2349f850ae19e0353d334d1ab620#0ba9105b57de2349f850ae19e0353d334d1ab620"
+source = "git+https://github.com/kornia/depthai-rs?rev=27a307add67319523f0ea4f55ccd891e4a678ae2#27a307add67319523f0ea4f55ccd891e4a678ae2"
 dependencies = [
  "cc",
  "cmake",
@@ -4712,6 +4712,7 @@ dependencies = [
  "kornia-tensor",
  "rerun",
  "sensor-types",
+ "thiserror 2.0.18",
  "vrt",
  "vrt-hub",
  "vrt-xfeat",

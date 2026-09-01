@@ -1,26 +1,55 @@
 //! OAK-D camera source: a time-synced **stereo pair + IMU**, or **RGBD + H.264**,
 //! plus factory intrinsics. Pure Rust on top of the [`depthai`] safe wrapper
-//! (kornia/depthai-rs) — no C++ shim in this crate.
+//! (kornia/depthai-rs).
 //!
 //! Two independent modalities behind one type: see [`stereo`] for the raw pair,
 //! [`rgbd`] for colour/depth/video, and [`imu`] for the inertial stream available
 //! alongside either — drained independently, because the IMU reports far faster
 //! than frames.
 //!
-//! Everything OAK-specific that is a *decision* — env knobs, the steady→epoch
-//! clock shift, the IMU rotation gate, the calibration unit traps, the degrade
-//! rules — lives in [`policy`] and [`graph`], unit-tested, instead of inside a
-//! C++ shim. The `depthai` crate underneath is faithful and unopinionated.
+//! Everything OAK-specific that is a *decision* — the `OAK_*` knobs, the
+//! steady→epoch clock shift, the IMU rotation gate, the calibration unit traps,
+//! the degrade rules — lives in [`policy`] and [`graph`], unit-tested. The
+//! `depthai` crate underneath is faithful and unopinionated.
 //!
 //! **Nothing here touches CUDA**: frames come out on the host and the consumer owns
 //! any upload, so a process that only wants pixels builds no GPU stack.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::time::Duration;
 
-use depthai::{Device, ImgFrame, ImuData, MessageGroup, OutputQueue, Pipeline};
+use depthai::{Device, ImgFrame, ImuData, ImuPacket, Message, MessageGroup, OutputQueue, Pipeline};
 
 /// Boxed error, `Send + Sync` so a source can be moved between threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A depthai failure with what the driver was doing at the time.
+#[derive(Debug, thiserror::Error)]
+#[error("{what}: {source}")]
+pub(crate) struct OakError {
+    what: &'static str,
+    #[source]
+    source: depthai::DepthaiError,
+}
+
+/// `.ctx("what")` on a `depthai::Result` — the one way errors gain context here.
+pub(crate) trait Ctx<T> {
+    fn ctx(self, what: &'static str) -> Result<T, OakError>;
+}
+
+impl<T> Ctx<T> for depthai::Result<T> {
+    fn ctx(self, what: &'static str) -> Result<T, OakError> {
+        self.map_err(|source| OakError { what, source })
+    }
+}
+
+/// Log a degrade decision (a capability the driver is continuing without, and why).
+macro_rules! degrade {
+    ($($t:tt)*) => {
+        eprintln!("sensor-oak: {}", format_args!($($t)*))
+    };
+}
 
 /// Pinhole intrinsics of an OAK camera, in pixels, at the **requested** resolution.
 ///
@@ -52,6 +81,9 @@ pub use calib::{OakCameraCalib, OakCameraModel, OakStereoCalib};
 pub use imu::ImuSample;
 pub use stereo::OakStereoFrame;
 
+use calib::StereoCalibError;
+use graph::{ImuAttach, Session};
+
 /// OAK-D source: [`open_stereo`](Self::open_stereo), then [`next_stereo`](Self::next_stereo)
 /// in a loop, draining [`next_imu`](Self::next_imu) alongside it.
 ///
@@ -74,60 +106,93 @@ pub struct OakSource {
     height: u32,
     seq: u64,
     intr: OakIntrinsics,
-    /// IMU-chip → camera-optical rotation (row-major) applied to every sample in
-    /// `next_imu`. Identity + `imu_aligned = false` when the calibration carries no
-    /// usable IMU extrinsics (samples then stay in the raw chip frame).
-    imu_rot: [f32; 9],
-    imu_aligned: bool,
+    /// Validated IMU-chip → camera-optical rotation (row-major) applied to every
+    /// sample in `next_imu`; `None` = the calibration carries no usable IMU
+    /// extrinsics and samples stay in the raw chip frame.
+    imu_rot: Option<[f32; 9]>,
     /// IMU samples popped off the queue but not yet handed to the caller.
     imu_pending: VecDeque<ImuSample>,
+    /// Reused per-batch staging buffer (no allocation in steady state).
+    imu_packets: Vec<ImuPacket>,
     /// Packets dropped by the zero-timestamp gate — surfaced so a half-rate IMU is
     /// visible instead of reading as "firmware delivers 98 Hz".
     imu_ts_skipped: u64,
-    /// Tightly-packed depth when the device row is stride-padded.
-    depth_repack: Vec<u16>,
-    /// Full CAM_B/CAM_C calibration, read once at `open_stereo`. `Err(why)` on the
-    /// RGBD modality and on a wiped EEPROM; surfaced by `stereo_calib()`.
-    stereo_calib: Result<OakStereoCalib, String>,
+    /// Full CAM_B/CAM_C calibration, read once at `open_stereo`; surfaced by
+    /// `stereo_calib()`.
+    stereo_calib: Result<OakStereoCalib, StereoCalibError>,
+    /// First poll failure is logged, later ones are not (a dying device would
+    /// otherwise spam every drain).
+    poll_warned: Cell<bool>,
+}
+
+/// The image queues an open path produced (all `None` where a modality does not
+/// have that stream, or degraded).
+#[derive(Default)]
+pub(crate) struct Queues {
+    pub(crate) stereo: Option<OutputQueue<MessageGroup>>,
+    pub(crate) rgb: Option<OutputQueue<ImgFrame>>,
+    pub(crate) depth: Option<OutputQueue<ImgFrame>>,
+    pub(crate) video: Option<OutputQueue<ImgFrame>>,
+}
+
+/// Everything an open path produced, beyond the session itself.
+pub(crate) struct Built {
+    pub(crate) queues: Queues,
+    pub(crate) imu: ImuAttach,
+    pub(crate) intr: OakIntrinsics,
+    pub(crate) stereo_calib: Result<OakStereoCalib, StereoCalibError>,
 }
 
 impl OakSource {
-    /// Assemble a source from an opened device + started pipeline and its queues.
-    /// Capabilities are whatever queues the open path managed to create — the IMU
-    /// may be absent on a given board, and `has_sync`/`has_depth` depend on the
-    /// device's calibration, none of which the caller can predict.
+    /// Assemble a source from an opened session (pipeline already started) and
+    /// what its open path built. Capabilities are whatever queues that path managed
+    /// to create — the IMU may be absent on a given board, and `has_sync`/`has_depth`
+    /// depend on the device's calibration, none of which the caller can predict.
     ///
     /// `width`/`height` are the *requested* size and are kept only so callers can size
     /// buffers before the first frame; each frame reports its own actual dimensions.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn assemble(
-        device: Device,
-        pipeline: Pipeline,
-        width: u32,
-        height: u32,
-        intr: OakIntrinsics,
-        queues: Queues,
-        imu: (Option<OutputQueue<ImuData>>, [f32; 9], bool),
-        stereo_calib: Result<OakStereoCalib, String>,
-    ) -> Self {
+    pub(crate) fn from_parts(session: Session, width: u32, height: u32, built: Built) -> Self {
         Self {
-            stereo_q: queues.stereo,
-            rgb_q: queues.rgb,
-            depth_q: queues.depth,
-            video_q: queues.video,
-            imu_q: imu.0,
-            pipeline,
-            device,
+            stereo_q: built.queues.stereo,
+            rgb_q: built.queues.rgb,
+            depth_q: built.queues.depth,
+            video_q: built.queues.video,
+            imu_q: built.imu.queue,
+            pipeline: session.pipeline,
+            device: session.dev,
             width,
             height,
             seq: 0,
-            intr,
-            imu_rot: imu.1,
-            imu_aligned: imu.2,
+            intr: built.intr,
+            imu_rot: built.imu.rot,
             imu_pending: VecDeque::new(),
+            imu_packets: Vec::new(),
             imu_ts_skipped: 0,
-            depth_repack: Vec::new(),
-            stereo_calib,
+            stereo_calib: built.stereo_calib,
+            poll_warned: Cell::new(false),
+        }
+    }
+
+    /// Pop from `q` (blocking up to `timeout`, or non-blocking when `None`),
+    /// logging the first device error and treating it as "nothing".
+    pub(crate) fn pop<M: Message>(
+        &self,
+        q: &OutputQueue<M>,
+        what: &str,
+        timeout: Option<Duration>,
+    ) -> Option<M> {
+        let r = match timeout {
+            Some(t) => q.get(t),
+            None => q.try_get(),
+        };
+        match r {
+            Ok(m) => m,
+            Err(e) => {
+                if !self.poll_warned.replace(true) {
+                    degrade!("{what} poll failed: {e}");
+                }
+                None
+            }
         }
     }
 
@@ -142,16 +207,6 @@ impl OakSource {
     }
 }
 
-/// The image queues an open path produced (all `None` where a modality does not
-/// have that stream, or degraded).
-#[derive(Default)]
-pub(crate) struct Queues {
-    pub(crate) stereo: Option<OutputQueue<MessageGroup>>,
-    pub(crate) rgb: Option<OutputQueue<ImgFrame>>,
-    pub(crate) depth: Option<OutputQueue<ImgFrame>>,
-    pub(crate) video: Option<OutputQueue<ImgFrame>>,
-}
-
 /// Reboot a PoE OAK that has wedged in bootloader state — the failure mode where a camera drops off and
 /// no amount of in-process `open_*` retrying recovers it (the firmware needs a bootloader-triggered
 /// reboot). `target` = the camera's IP/name or deviceId (`None` = first wedged device found). Returns
@@ -159,31 +214,21 @@ pub(crate) struct Queues {
 /// was nothing to kick (target absent or healthy), `Err` on a driver error. Blocking — call from the
 /// reconnect path, not the drain loop.
 pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
-    let infos = Device::all_available().map_err(|e| format!("enumerate devices failed: {e}"))?;
-    for info in &infos {
-        if let Some(t) = target {
-            if info.name != t && info.device_id != t {
-                continue;
-            }
-        }
-        // The wedge: a PoE device stuck in the bootloader. A healthy device enumerates
-        // UNBOOTED / BOOTED / FLASH_BOOTED and opens normally — kicking it would be a
-        // pointless reboot.
-        if info.state != depthai::DeviceState::Bootloader {
-            if target.is_some() {
-                return Ok(false);
-            }
-            continue;
-        }
-        // Open+drop the bootloader connection: construction connects to the wedged
-        // firmware, and destruction reboots the device to an unbooted state (the
-        // manual recovery, in-process).
-        let bl = depthai::DeviceBootloader::open(info)
-            .map_err(|e| format!("bootloader open failed: {e}"))?;
-        drop(bl);
-        return Ok(true);
-    }
-    Ok(false)
+    let infos = Device::all_available().ctx("enumerate devices")?;
+    // The wedge: a PoE device stuck in the bootloader. A healthy device enumerates
+    // UNBOOTED / BOOTED / FLASH_BOOTED and opens normally — kicking it would be a
+    // pointless reboot.
+    let Some(info) = infos.iter().find(|i| {
+        i.state == depthai::DeviceState::Bootloader
+            && target.is_none_or(|t| i.name == t || i.device_id == t)
+    }) else {
+        return Ok(false);
+    };
+    // Open+drop the bootloader connection: construction connects to the wedged
+    // firmware, and destruction reboots the device to an unbooted state (the manual
+    // recovery, in-process).
+    drop(depthai::DeviceBootloader::open(info).ctx("bootloader open")?);
+    Ok(true)
 }
 
 impl Drop for OakSource {
