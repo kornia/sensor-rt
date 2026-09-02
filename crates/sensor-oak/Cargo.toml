@@ -6,10 +6,7 @@ repository.workspace = true
 license.workspace = true
 publish = false
 description = "OAK camera source: RGBD (colour + aligned depth + H.264), a time-synced stereo pair, and the on-board IMU"
-# The depthai-core C shim is built and linked here rather than by a separate `-sys`
-# crate: it has exactly one consumer (this crate), and `links` still guarantees only
-# one copy of the native library in the graph.
-links = "depthai-core"
+
 build = "build.rs"
 
 [lib]
@@ -19,13 +16,18 @@ name = "sensor_oak"
 # Deliberately minimal: this driver is a plain producer that never touches CUDA or
 # an inference runtime, so a process that only wants camera frames builds neither.
 # `cudarc` / `vrt` are dev-dependencies, for the examples that do.
+#
+# depthai-core is reached through the `depthai` safe wrapper (kornia/depthai-rs):
+# no C++ shim in this crate any more. Everything OAK-specific that is POLICY —
+# env knobs, steady->epoch clock shift, IMU rotation gate, calibration unit
+# traps, degrade rules — lives here in Rust, where it is unit-testable.
+depthai       = { workspace = true }
+depthai-sys   = { workspace = true }
+thiserror     = { workspace = true }
 kornia-image  = { workspace = true }
 # For the borrowed (zero-copy) image storage — see OakStereoFrame::left_image.
 kornia-tensor = { workspace = true }
 sensor-types  = { workspace = true }
-
-[build-dependencies]
-cmake = { workspace = true }
 
 [dev-dependencies]
 # Examples only. The driver itself needs none of this — see the note above.

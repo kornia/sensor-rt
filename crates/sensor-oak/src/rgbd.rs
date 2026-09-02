@@ -10,12 +10,15 @@
 //! rate and lets the small H.264 stream ship at full fps while the heavy raw RGBD is
 //! decimated.
 //!
-//! **Host-only, no CUDA, no `vrt`.** Frames come out as owned host buffers (the shim
-//! pins the device buffer only until the next poll, so each `next_*` copies its bytes
-//! out); the consumer owns any GPU upload. A producer that only encodes and
-//! republishes builds no GPU stack at all.
+//! **Host-only, no CUDA, no `vrt`.** Frames come out as owned host buffers (each
+//! `next_*` copies its bytes out of the device frame); the consumer owns any GPU
+//! upload. A producer that only encodes and republishes builds no GPU stack at all.
 
-use crate::{device_id_cstring, ffi, last_error, BoxError, OakSource};
+use depthai::{CameraBoardSocket, ImgFrameType, ImgResizeMode};
+
+use crate::calib::StereoCalibError;
+use crate::graph::{self, Session};
+use crate::{policy, BoxError, Built, Ctx, OakSource, Queues, Which};
 
 impl OakSource {
     /// Open an OAK in the RGBD + H.264 modality: CAM_A colour (RGB888) + an on-device H.264 colour
@@ -29,12 +32,12 @@ impl OakSource {
     ///
     /// `imu_hz > 0` also runs the on-board IMU (accel + gyro) on its own queue, drained with
     /// [`next_imu`](Self::next_imu) on the same host-epoch timeline as the frames; `0` disables it.
-    /// The shim preflights with `getConnectedIMU()` and only builds the IMU node when the board
+    /// The driver preflights with `connected_imu()` and only builds the IMU node when the board
     /// actually carries one, so an IMU-less board degrades ([`has_imu`](Self::has_imu) is `false`)
     /// without ever risking the image streams — never an error. Rates above 400 Hz (the BNO086
     /// gyro maximum) are clamped. When the EEPROM carries valid IMU extrinsics, samples come out
     /// in the CAM_A optical frame — check [`imu_aligned`](Self::imu_aligned); an absent or
-    /// rejected calibration is logged to stderr by the shim with the reason.
+    /// rejected calibration is logged to stderr with the reason.
     pub fn open_rgbd(
         device: Option<&str>,
         width: u32,
@@ -44,6 +47,7 @@ impl OakSource {
         imu_hz: u32,
     ) -> Result<Self, BoxError> {
         Self::open_rgbd_inner(device, width, height, fps, depth, false, imu_hz)
+            .map_err(|e| format!("open_rgbd failed: {e}").into())
     }
 
     /// Open **video-only**: build ONLY the on-device H.264 encoder — no RGB888/depth output — so the
@@ -59,6 +63,7 @@ impl OakSource {
         imu_hz: u32,
     ) -> Result<Self, BoxError> {
         Self::open_rgbd_inner(device, width, height, fps, false, true, imu_hz)
+            .map_err(|e| format!("open_rgbd_video failed: {e}").into())
     }
 
     fn open_rgbd_inner(
@@ -70,47 +75,65 @@ impl OakSource {
         video_only: bool,
         imu_hz: u32,
     ) -> Result<Self, BoxError> {
-        let id_c = device_id_cstring(device)?;
-        let id_ptr = id_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let fps = policy::fps_or_default(fps);
         let imu_hz = crate::imu::clamp_imu_hz(imu_hz);
-        // H.264 is always on in this modality — the whole point is the efficient colour stream.
-        // No open-retry here: the shim preflights the IMU with getConnectedIMU() before building
-        // the node, so an IMU-less board already degrades inside ONE open. A failure at this
-        // point is a real device error, and retrying (especially with `device = None`) could
+        // No open-retry here: the IMU is preflighted before the node is built, so an
+        // IMU-less board already degrades inside ONE open. A failure at this point is a
+        // real device error, and retrying (especially with `device = None`) could
         // silently bind a different physical camera on a multi-OAK rig.
-        let dev = unsafe {
-            ffi::oak_open_rgbd(
-                id_ptr,
-                width as i32,
-                height as i32,
-                fps as i32,
-                1,
-                depth as i32,
-                video_only as i32,
-                imu_hz as i32,
-            )
+        let s = Session::connect(device)?;
+
+        // Auto-fall-back to video-only when depth was requested but the device can't
+        // actually produce it (mono camera, or wiped/blank calibration → fx=0). Pulling
+        // raw RGB over XLink for a "synced RGBD" pair whose depth is garbage just caps
+        // the H.264 stream for nothing — build the lean video-only pipeline instead.
+        // Policy: always ship compressed video; add RGBD only when depth works.
+        let want_video_only = video_only || (depth && !s.can_do_depth(width, height));
+        let queues = if want_video_only {
+            build_video_only(&s, width, height, fps)?
+        } else {
+            build_decoupled(&s, width, height, fps, depth).ctx("build RGBD graph")?
         };
-        if dev.is_null() {
-            return Err(last_error("oak_open_rgbd"));
+
+        let imu = graph::attach_imu(&s, imu_hz, CameraBoardSocket::CamA)?;
+        s.pipeline.start().ctx("pipeline start")?;
+
+        if !want_video_only && s.knobs.ir > 0.0 {
+            // IR dot projector: passive stereo starves on texture-poor / dim scenes
+            // (single-digit valid-depth %). Default 0.8 intensity; OAK_IR=0 disables
+            // (e.g. multi-cam cross-talk), boards without a projector just return false.
+            // Set after start() — needs a live device; an RPC failure here means the
+            // device is already unhealthy, so it fails the open.
+            s.dev
+                .set_ir_laser_dot_projector_intensity(s.knobs.ir, None)
+                .ctx("IR dot projector")?;
         }
-        Self::from_open_device(dev, width, height)
+
+        let built = Built {
+            queues,
+            imu,
+            // Factory intrinsics of the aligned RGB camera.
+            intr: graph::read_intrinsics(&s.calib, CameraBoardSocket::CamA, width, height),
+            stereo_calib: Err(StereoCalibError::NotStereo),
+        };
+        Ok(Self::from_parts(s, width, height, built))
     }
 
     /// Whether `StereoDepth` is running (so [`next_depth`](Self::next_depth) can yield aligned depth).
     pub fn has_depth(&self) -> bool {
-        self.has_depth
+        self.depth_q.is_some()
     }
 
     /// Whether the on-device H.264 colour stream is running (so [`next_video`](Self::next_video) yields).
     pub fn has_video(&self) -> bool {
-        self.has_video
+        self.video_q.is_some()
     }
 
     /// Whether this device runs the colour(+depth) pipeline (so [`next_rgb`](Self::next_rgb) yields).
     /// `false` means it auto-fell-back to video-only (mono / uncalibrated): drain only
     /// [`next_video`](Self::next_video). Always check this after [`open_rgbd`](Self::open_rgbd).
     pub fn has_sync(&self) -> bool {
-        self.has_sync
+        self.rgb_q.is_some()
     }
 
     /// Decoupled raw-colour poll: the next RGB888 frame from its own queue (non-blocking), copied out
@@ -118,33 +141,23 @@ impl OakSource {
     /// [`next_depth`](Self::next_depth) — pair them by timestamp on the consumer. Drain in a loop until
     /// `None` each iteration.
     pub fn next_rgb(&mut self) -> Option<(Vec<u8>, u32, u32, u64)> {
-        let mut rgb: *const u8 = std::ptr::null();
-        let (mut w, mut h, mut len, mut ts) = (0i32, 0i32, 0i32, 0u64);
-        let rc =
-            unsafe { ffi::oak_poll_rgb(self.dev, &mut rgb, &mut w, &mut h, &mut len, &mut ts) };
-        if rc == 1 && !rgb.is_null() && len > 0 {
-            // Copy the span out while the shim still pins it (valid only until the next poll).
-            let bytes = unsafe { std::slice::from_raw_parts(rgb, len as usize) }.to_vec();
-            Some((bytes, w as u32, h as u32, ts))
-        } else {
-            None
-        }
+        let f = self.pop(self.rgb_q.as_ref()?, Which::Rgb, None).ok()??;
+        let (w, h) = (f.width(), f.height());
+        // Tight or row-padded, either way one copy out (the owned-Vec API's copy).
+        let bytes = repack_rows(f.data(), w as usize * 3, h as usize, f.stride() as usize)?;
+        Some((bytes, w, h, policy::frame_epoch_ns(&f)))
     }
 
     /// Decoupled depth poll: the next aligned uint16-mm depth frame from its own queue (non-blocking) at
     /// the stereo rate, copied out with its dims (may be `<` colour size) + capture timestamp. `None`
     /// when none is queued. Drain in a loop until `None`.
     pub fn next_depth(&mut self) -> Option<(Vec<u16>, u32, u32, u64)> {
-        let mut depth: *const u16 = std::ptr::null();
-        let (mut dw, mut dh, mut ts) = (0i32, 0i32, 0u64);
-        let rc = unsafe { ffi::oak_poll_depth(self.dev, &mut depth, &mut dw, &mut dh, &mut ts) };
-        if rc == 1 && !depth.is_null() && dw > 0 && dh > 0 {
-            let n = dw as usize * dh as usize;
-            let vals = unsafe { std::slice::from_raw_parts(depth, n) }.to_vec();
-            Some((vals, dw as u32, dh as u32, ts))
-        } else {
-            None
-        }
+        let d = self
+            .pop(self.depth_q.as_ref()?, Which::Depth, None)
+            .ok()??;
+        let (dw, dh) = (d.width(), d.height());
+        let vals = repack_depth(d.data(), dw, dh, d.stride())?;
+        Some((vals, dw, dh, policy::frame_epoch_ns(&d)))
     }
 
     /// Drain the next on-device **H.264** access unit, if one is ready (non-blocking): the encoded bytes
@@ -152,14 +165,157 @@ impl OakSource {
     /// when no frame is queued or H.264 isn't running. Call in a loop until `None` each iteration so the
     /// encoder queue never overflows — a dropped P-frame glitches the stream until the next keyframe.
     pub fn next_video(&mut self) -> Option<(Vec<u8>, u64)> {
-        let mut data: *const u8 = std::ptr::null();
-        let (mut len, mut ts) = (0i32, 0u64);
-        let rc = unsafe { ffi::oak_poll_video(self.dev, &mut data, &mut len, &mut ts) };
-        if rc == 1 && !data.is_null() && len > 0 {
-            let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) }.to_vec();
-            Some((bytes, ts))
-        } else {
-            None
+        let f = self
+            .pop(self.video_q.as_ref()?, Which::Video, None)
+            .ok()??;
+        if f.data().is_empty() {
+            return None;
         }
+        Some((f.data().to_vec(), policy::frame_epoch_ns(&f)))
+    }
+}
+
+/// VIDEO-ONLY: just the H.264 encoder (CAM_A NV12 → encoder → queue). No
+/// RGB888/depth output, so the device transmits ONLY the small H.264 bitstream.
+/// The encoder is MANDATORY here — the stream is this modality's whole output —
+/// and this path is also where an RGBD request LANDS when the board cannot do
+/// depth, so a failure says that rather than surfacing as a bare device error.
+fn build_video_only(s: &Session, width: u32, height: u32, fps: u32) -> Result<Queues, BoxError> {
+    let color = s.camera(CameraBoardSocket::CamA).ctx("colour camera")?;
+    let video = graph::add_h264_encoder(s, &color, width, height, fps).map_err(|e| {
+        format!("H.264 encoder unavailable and this device cannot produce depth ({e}) — nothing left to stream")
+    })?;
+    // No rgb/depth queues on this path: has_sync + has_depth report false because
+    // the queues are absent.
+    Ok(Queues {
+        video: Some(video),
+        ..Default::default()
+    })
+}
+
+/// DECOUPLED build: raw-RGB and depth are SEPARATE streams (no on-device Sync
+/// node), each pulled at its own rate + timestamped, so the consumer pairs them by
+/// timestamp. Depth runs at the mono/stereo rate (OAK_DEPTH_FPS, default = fps);
+/// raw RGB — needed only for local compute — is pulled at a LOW rate (OAK_RGB_FPS,
+/// default 10) to spare XLink. The H.264 video is a separate full-fps output,
+/// unaffected by either.
+fn build_decoupled(
+    s: &Session,
+    width: u32,
+    height: u32,
+    fps: u32,
+    depth: bool,
+) -> depthai::Result<Queues> {
+    // Colour (CAM_A). Interleaved RGB888 (the ISP's native type) as the raw-RGB
+    // stream AND the depth-alignment reference; undistorted so depth aligns
+    // pixel-perfect and the intrinsics are an exact pinhole.
+    let color = s.camera(CameraBoardSocket::CamA)?;
+    let rgb_out = color.request_output(
+        (width, height),
+        Some(ImgFrameType::Rgb888i),
+        ImgResizeMode::Crop,
+        Some(s.knobs.rgb_fps(fps) as f32),
+        Some(true),
+    )?;
+    // The queue IS the capability: creating it is what makes has_depth true.
+    let depth_q = if depth {
+        graph::try_add_stereo_depth(s, &rgb_out, width, height, s.knobs.depth_fps(fps))
+    } else {
+        None
+    };
+    // Each stream to its OWN non-blocking queue, pulled + published independently
+    // (consumer pairs by timestamp).
+    let rgb = rgb_out.create_output_queue(4, false)?;
+    // H.264 is always on in this modality — the whole point is the efficient colour
+    // stream — but a board that rejects the NV12 output must not cost the caller
+    // depth + RGB. No capability query exists for the encoder the way
+    // connected_imu() preflights the IMU, so the shared helper attempts and catches.
+    let video = graph::try_add_h264_encoder(s, &color, width, height, fps, "RGBD");
+    Ok(Queues {
+        rgb: Some(rgb),
+        depth: depth_q,
+        video,
+        ..Default::default()
+    })
+}
+
+/// Copy `h` rows of `row` bytes out of a frame whose rows are `stride` bytes apart
+/// (`stride == 0` = tight, as depthai reports it), into one tightly packed Vec —
+/// the one copy the owned-Vec API mandates. A downscaled/aligned frame is often
+/// padded to an alignment boundary; honouring the stride instead of dropping every
+/// such frame is what keeps the stream alive. `None` on a malformed (zero-sized or
+/// too short) frame: skip it rather than kill the stream.
+pub(crate) fn repack_rows(data: &[u8], row: usize, h: usize, stride: usize) -> Option<Vec<u8>> {
+    if row == 0 || h == 0 {
+        return None;
+    }
+    let stride = if stride == 0 { row } else { stride };
+    // The last row need not be padded.
+    if stride < row || data.len() < (h - 1) * stride + row {
+        return None;
+    }
+    if stride == row {
+        return Some(data[..row * h].to_vec());
+    }
+    let mut out = Vec::with_capacity(row * h);
+    for y in 0..h {
+        out.extend_from_slice(&data[y * stride..y * stride + row]);
+    }
+    Some(out)
+}
+
+/// [`repack_rows`] for a `RAW16` depth frame, as little-endian `u16` millimetres.
+pub(crate) fn repack_depth(data: &[u8], dw: u32, dh: u32, stride: u32) -> Option<Vec<u16>> {
+    let bytes = repack_rows(data, dw as usize * 2, dh as usize, stride as usize)?;
+    Some(
+        bytes
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{repack_depth, repack_rows};
+
+    #[test]
+    fn repack_rows_accepts_unpadded_last_row() {
+        // 2 rows of 3 bytes, stride 4, last row unpadded: 4 + 3 = 7 bytes suffice.
+        let data = [1u8, 2, 3, 0xEE, 4, 5, 6];
+        assert_eq!(repack_rows(&data, 3, 2, 4).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert!(repack_rows(&data[..6], 3, 2, 4).is_none());
+        assert!(repack_rows(&data, 3, 0, 4).is_none());
+        // Tight input is a straight copy.
+        assert_eq!(
+            repack_rows(&data[..6], 3, 2, 0).unwrap(),
+            vec![1, 2, 3, 0xEE, 4, 5]
+        );
+    }
+
+    #[test]
+    fn repack_honours_padded_stride() {
+        // 3x2 depth, rows padded to 8 bytes (stride 8, row 6).
+        let mut data = Vec::new();
+        for y in 0..2u16 {
+            for x in 0..3u16 {
+                data.extend_from_slice(&(y * 10 + x).to_le_bytes());
+            }
+            data.extend_from_slice(&[0xEE, 0xEE]); // padding
+        }
+        assert_eq!(
+            repack_depth(&data, 3, 2, 8).unwrap(),
+            vec![0, 1, 2, 10, 11, 12]
+        );
+        // Tight (stride 0 = "as reported") also works.
+        let tight: Vec<u8> = [5u16, 6, 7, 8]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(repack_depth(&tight, 2, 2, 0).unwrap(), vec![5, 6, 7, 8]);
+        // Short buffer → skip.
+        assert!(repack_depth(&tight[..6], 2, 2, 0).is_none());
+        // Stride smaller than a row → skip.
+        assert!(repack_depth(&tight, 2, 2, 2).is_none());
     }
 }

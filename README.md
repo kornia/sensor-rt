@@ -28,7 +28,7 @@ the hardware paths are tuned and tested against, not a limit of the design.
 | `crates/nvbuf-sys` | FFI: Jetson `NvBufSurface` → CUDA device ptr from an NVMM DMA-BUF (`links = nvbufsurface`) |
 | `crates/sensor-types` | Frame-timing leaf shared by every driver: `FrameMeta`, `Stamped<T>` (zero deps) |
 | `crates/sensor-rtsp` | RTSP/H.264 source, NVMM → CUDA, emits a device `Image<u8,3>` (GStreamer) |
-| `crates/sensor-oak` | OAK-D **stereo pair + IMU**; bundles the depthai-core v3 C shim (`links = depthai-core`, built from `vendor/`) |
+| `crates/sensor-oak` | OAK-D **stereo pair + IMU** and **RGBD + H.264**; pure Rust on the [`depthai`](https://github.com/kornia/depthai-rs) safe wrapper (depthai-core v3, built from `vendor/`) |
 
 ## Usage
 
