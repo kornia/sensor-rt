@@ -69,7 +69,8 @@ cargo build -j2                                  # -j2: the 7.4 GB Orin OOMs on 
   build one with depthai-rs's `depthai-sys/scripts/build_depthai.sh` (once, ~30-60
   min on an Orin, OpenCV off), or let cargo do it:
   `cargo build -p sensor-oak --features vendored` (needs cmake/ninja/pkg-config,
-  e.g. from `pixi shell`). depthai-sys bakes the prefix's rpath into every binary,
+  e.g. from `pixi shell`, and `CARGO_NET_GIT_FETCH_WITH_CLI=true` so cargo pulls
+  depthai-rs's source submodule). depthai-sys bakes the prefix's rpath into every binary,
   so no `LD_LIBRARY_PATH` is needed; rebuild if the prefix moves.
   `DEPTHAI_SYS_SKIP_NATIVE=1` gives a check-only build without any prefix.
 
