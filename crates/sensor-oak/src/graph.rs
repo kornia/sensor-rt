@@ -83,20 +83,18 @@ impl Session {
 }
 
 /// The on-device H.264 path: the bitstream queue and the control queue of the
-/// gate in front of the encoder.
+/// gate in front of the encoder (takes [`GateControl`]s).
 pub(crate) struct H264 {
     pub(crate) queue: OutputQueue<ImgFrame>,
-    /// Sends [`GateControl`]s: closed = the encoder idles and no video bytes
-    /// cross the link; the camera keeps serving the other outputs.
-    pub(crate) gate: InputQueue,
+    pub(crate) control: InputQueue,
 }
 
 /// Attach an NV12 output of `color` → `Gate` → hardware H.264 encoder. Shared by
 /// the video-only, decoupled RGBD and stereo-viz paths so their encoder settings
 /// (BASELINE for Foxglove's decoder, ~4 keyframes/s for fast mid-stream join,
-/// OAK_H264_KBPS) can never drift apart. The gate starts open unless
-/// `OAK_VIDEO_GATED` says otherwise, so the stream behaves as it always has until
-/// someone toggles it.
+/// OAK_H264_KBPS) can never drift apart. The gate is always there (a parked
+/// device thread + a host input-queue thread) so `set_video_streaming` works on
+/// every source with video; `OAK_VIDEO_GATED` only picks its starting state.
 pub(crate) fn add_h264_encoder(
     s: &Session,
     color: &Camera,
@@ -112,20 +110,29 @@ pub(crate) fn add_h264_encoder(
         Some(true),
     )?;
     let gate = s.pipeline.create::<Gate>()?;
-    nv12.link(&gate.input()?)?;
-    if s.knobs.video_gated {
-        gate.set_initial_config(&GateControl::close()?)?;
-    }
-    let control = gate.input_control()?.create_input_queue(4, false)?;
     let enc = s.pipeline.create::<VideoEncoder>()?;
-    enc.set_default_profile_preset(fps as f32, VideoEncoderProfile::H264Baseline)?;
-    enc.set_keyframe_frequency((fps / 4).max(4) as i32)?;
-    enc.set_bitrate_kbps(s.knobs.h264_kbps)?;
-    gate.output()?.cast::<ImgFrame>().link(&enc.input()?)?;
-    Ok(H264 {
-        queue: enc.bitstream()?.create_output_queue(30, false)?,
-        gate: control,
-    })
+    let wire = || -> depthai::Result<H264> {
+        // Same shape as the encoder's own input (3 deep, blocking) so the camera
+        // is back-pressured exactly as it was when it fed the encoder directly,
+        // instead of the gate's default 1-deep overwrite queue dropping frames.
+        let gate_in = gate.input()?;
+        gate_in.set_max_size(3)?;
+        gate_in.set_blocking(true)?;
+        nv12.link(&gate_in)?;
+        if s.knobs.video_gated {
+            gate.set_initial_config(&GateControl::close()?)?;
+        }
+        enc.set_default_profile_preset(fps as f32, VideoEncoderProfile::H264Baseline)?;
+        enc.set_keyframe_frequency((fps / 4).max(4) as i32)?;
+        enc.set_bitrate_kbps(s.knobs.h264_kbps)?;
+        gate.output()?.cast::<ImgFrame>().link(&enc.input()?)?;
+        Ok(H264 {
+            queue: enc.bitstream()?.create_output_queue(30, false)?,
+            control: gate.input_control()?.create_input_queue(4, false)?,
+        })
+    };
+    // A half-wired gate/encoder must not poison `Pipeline::start` on the degrade path.
+    wire().inspect_err(|_| s.remove_all(&[gate.handle(), enc.handle()]))
 }
 
 /// The OPTIONAL attach: same encoder settings, but a board that rejects the NV12

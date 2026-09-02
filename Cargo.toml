@@ -62,10 +62,10 @@ kornia-io      = { git = "https://github.com/kornia/kornia-rs", branch = "main" 
 # depthai-core, via the safe `depthai` wrapper (kornia/depthai-rs). sensor-oak
 # holds no C++ any more; depthai-sys builds/links the native shim against the
 # prefix named by DEPTHAI_PREFIX (see CLAUDE.md). Pinned by rev like vision-rt.
-depthai     = { git = "https://github.com/kornia/depthai-rs", rev = "51c6d02d3de208a80be892e3e426c05e0dbde671" }
+depthai     = { git = "https://github.com/kornia/depthai-rs", rev = "b50c3ae172cc45a2d0ecfbdca16bff7155d8d192" }
 # Direct dep only so sensor-oak's build.rs can read DEP_DEPTHAI_CORE_RPATH and bake
 # the depthai-core rpath into its examples (cargo does not propagate link args).
-depthai-sys = { git = "https://github.com/kornia/depthai-rs", rev = "51c6d02d3de208a80be892e3e426c05e0dbde671" }
+depthai-sys = { git = "https://github.com/kornia/depthai-rs", rev = "b50c3ae172cc45a2d0ecfbdca16bff7155d8d192" }
 # sensor-rt internal crates
 nvbuf-sys    = { path = "crates/nvbuf-sys" }
 sensor-types = { path = "crates/sensor-types" }

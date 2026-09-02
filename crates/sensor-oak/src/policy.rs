@@ -56,7 +56,8 @@ pub(crate) struct Knobs {
     pub ir: f32,
     /// `OAK_VIDEO_GATED`: start with the H.264 stream switched OFF (default on),
     /// for consumers that call `set_video_streaming` / `video_burst` and want no
-    /// bytes on the link before they ask.
+    /// bytes on the link before they ask. Opt-in, so a truthy integer (unlike
+    /// `OAK_SUBPIXEL`, an opt-out).
     pub video_gated: bool,
 }
 

@@ -56,14 +56,11 @@ already tight RGB8 (zero extra copies).
   **driver crates must not depend on `vrt`**, so nothing that merely wants frames has
   to build TensorRT. Upstream model crates are **submit-only** (`alloc_result` +
   `submit` + an explicit `stream.synchronize()`); there is no `run()`.
-- **H.264 is gated on the device.** `add_h264_encoder` puts a depthai `Gate`
-  between the colour camera and the encoder; `OakSource::set_video_streaming` /
-  `video_burst` drive it (off = zero video bytes on the link, camera untouched).
-  Default open; `OAK_VIDEO_GATED=1` starts it closed. Policy stays in sensor-oak.
 - **Two OAK modalities, both first-class.** `sensor-oak` exposes stereo+IMU
   (`open_stereo`) AND the restored RGBD + H.264 path (`open_rgbd` /
   `open_rgbd_video` — colour, aligned depth, on-device H.264, all unconditional since
-  d89fa82), with the on-board IMU available in both. The repo lives at the
+  d89fa82), with the on-board IMU available in both. The H.264 stream sits behind a
+  device-side depthai `Gate` (`OakSource::set_video_streaming` / `video_burst`). The repo lives at the
   **kornia org** (`kornia/sensor-rt`); downstream consumers no longer need the
   old `edgarriba/sensor-rt` pin.
 - **Build cap**: `-j2` (`CARGO_BUILD_JOBS=2`) — parallel heavy builds OOM the 7.4 GB Orin.

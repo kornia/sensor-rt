@@ -1080,7 +1080,7 @@ dependencies = [
 [[package]]
 name = "depthai"
 version = "0.1.0"
-source = "git+https://github.com/kornia/depthai-rs?rev=51c6d02d3de208a80be892e3e426c05e0dbde671#51c6d02d3de208a80be892e3e426c05e0dbde671"
+source = "git+https://github.com/kornia/depthai-rs?rev=b50c3ae172cc45a2d0ecfbdca16bff7155d8d192#b50c3ae172cc45a2d0ecfbdca16bff7155d8d192"
 dependencies = [
  "depthai-sys",
  "thiserror 2.0.18",
@@ -1089,7 +1089,7 @@ dependencies = [
 [[package]]
 name = "depthai-sys"
 version = "0.1.0"
-source = "git+https://github.com/kornia/depthai-rs?rev=51c6d02d3de208a80be892e3e426c05e0dbde671#51c6d02d3de208a80be892e3e426c05e0dbde671"
+source = "git+https://github.com/kornia/depthai-rs?rev=b50c3ae172cc45a2d0ecfbdca16bff7155d8d192#b50c3ae172cc45a2d0ecfbdca16bff7155d8d192"
 dependencies = [
  "cc",
  "cmake",

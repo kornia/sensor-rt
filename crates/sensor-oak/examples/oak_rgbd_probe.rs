@@ -113,25 +113,14 @@ fn main() -> Result<(), BoxError> {
         imu_n as f32 / s,
     );
     if a.gate && src.has_video() {
-        let window = |src: &mut OakSource, what: &str| {
-            let t = Instant::now();
-            let mut n = 0u32;
-            while t.elapsed() < Duration::from_secs(2) {
-                while src.next_video().is_some() {
-                    n += 1;
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            println!("video gate {what}: {n} frames in 2 s");
-        };
         src.set_video_streaming(false)?;
-        window(&mut src, "off");
+        video_window(&mut src, "off");
         src.set_video_streaming(true)?;
-        window(&mut src, "on");
+        video_window(&mut src, "on");
         src.set_video_streaming(false)?;
-        window(&mut src, "off again");
+        video_window(&mut src, "off again");
         src.video_burst(10, None)?;
-        window(&mut src, "burst(10)");
+        video_window(&mut src, "burst(10)");
     }
     if rgb > 1 {
         println!(
@@ -144,4 +133,19 @@ fn main() -> Result<(), BoxError> {
         assert_eq!(depth_dims.1 % 2, 0, "depth height must be even (XLink)");
     }
     Ok(())
+}
+
+const GATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Drain the video queue for one window and print what arrived.
+fn video_window(src: &mut OakSource, what: &str) {
+    let t = Instant::now();
+    let mut n = 0u32;
+    while t.elapsed() < GATE_WINDOW {
+        while src.next_video().is_some() {
+            n += 1;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    println!("video gate {what}: {n} frames in {:?}", GATE_WINDOW);
 }

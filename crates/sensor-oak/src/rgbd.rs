@@ -126,7 +126,7 @@ impl OakSource {
 
     /// Whether the on-device H.264 colour stream is running (so [`next_video`](Self::next_video) yields).
     pub fn has_video(&self) -> bool {
-        self.video_q.is_some()
+        self.video.is_some()
     }
 
     /// Whether this device runs the colour(+depth) pipeline (so [`next_rgb`](Self::next_rgb) yields).
@@ -166,7 +166,7 @@ impl OakSource {
     /// encoder queue never overflows — a dropped P-frame glitches the stream until the next keyframe.
     pub fn next_video(&mut self) -> Option<(Vec<u8>, u64)> {
         let f = self
-            .pop(self.video_q.as_ref()?, Which::Video, None)
+            .pop(&self.video.as_ref()?.queue, Which::Video, None)
             .ok()??;
         if f.data().is_empty() {
             return None;
