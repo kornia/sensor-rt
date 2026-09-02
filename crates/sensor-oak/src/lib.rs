@@ -20,7 +20,10 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use depthai::{Device, ImgFrame, ImuData, ImuPacket, Message, MessageGroup, OutputQueue, Pipeline};
+use depthai::{
+    Device, GateControl, ImgFrame, ImuData, ImuPacket, InputQueue, Message, MessageGroup,
+    OutputQueue, Pipeline,
+};
 
 /// Boxed error, `Send + Sync` so a source can be moved between threads.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -98,6 +101,8 @@ pub struct OakSource {
     rgb_q: Option<OutputQueue<ImgFrame>>,
     depth_q: Option<OutputQueue<ImgFrame>>,
     video_q: Option<OutputQueue<ImgFrame>>,
+    /// Control queue of the gate in front of the H.264 encoder (present iff `video_q`).
+    video_gate: Option<InputQueue>,
     // On-board IMU, SHARED by both modalities (optional in each). The `has_*`
     // accessors derive from these queue options: a present queue IS the capability.
     imu_q: Option<OutputQueue<ImuData>>,
@@ -155,7 +160,7 @@ pub(crate) struct Queues {
     pub(crate) stereo: Option<OutputQueue<MessageGroup>>,
     pub(crate) rgb: Option<OutputQueue<ImgFrame>>,
     pub(crate) depth: Option<OutputQueue<ImgFrame>>,
-    pub(crate) video: Option<OutputQueue<ImgFrame>>,
+    pub(crate) video: Option<graph::H264>,
 }
 
 /// Everything an open path produced, beyond the session itself.
@@ -175,11 +180,16 @@ impl OakSource {
     /// `width`/`height` are the *requested* size and are kept only so callers can size
     /// buffers before the first frame; each frame reports its own actual dimensions.
     pub(crate) fn from_parts(session: Session, width: u32, height: u32, built: Built) -> Self {
+        let (video_q, video_gate) = built
+            .queues
+            .video
+            .map_or((None, None), |v| (Some(v.queue), Some(v.gate)));
         Self {
             stereo_q: built.queues.stereo,
             rgb_q: built.queues.rgb,
             depth_q: built.queues.depth,
-            video_q: built.queues.video,
+            video_q,
+            video_gate,
             imu_q: built.imu.queue,
             pipeline: session.pipeline,
             device: session.dev,
@@ -220,6 +230,33 @@ impl OakSource {
 
     pub fn intrinsics(&self) -> OakIntrinsics {
         self.intr
+    }
+
+    /// Switch the on-device H.264 stream on or off at runtime. Off, the encoder
+    /// idles and **no video bytes cross the link** (the colour camera keeps serving
+    /// RGB/depth); on, encoding resumes at the next keyframe interval. Use it to
+    /// spare a saturated PoE/USB2 link, or stream only while something is worth
+    /// watching. `Err` when the source has no video stream
+    /// ([`has_video`](Self::has_video)). Starts on unless `OAK_VIDEO_GATED=1`.
+    pub fn set_video_streaming(&self, on: bool) -> Result<(), BoxError> {
+        self.send_gate(GateControl::new(on, None, None))
+    }
+
+    /// Pass the next `frames` encoded frames (optionally throttled to `fps`), then
+    /// switch the stream off again: the "record a clip on detection" pattern. A
+    /// burst replaces any earlier burst still in progress.
+    pub fn video_burst(&self, frames: u32, fps: Option<u32>) -> Result<(), BoxError> {
+        self.send_gate(GateControl::open_for(frames, fps))
+    }
+
+    fn send_gate(&self, control: depthai::Result<GateControl>) -> Result<(), BoxError> {
+        let gate = self
+            .video_gate
+            .as_ref()
+            .ok_or("this source has no H.264 stream")?;
+        gate.send(&control.ctx("video gate control")?)
+            .ctx("video gate send")?;
+        Ok(())
     }
     pub fn width(&self) -> u32 {
         self.width

@@ -54,6 +54,10 @@ pub(crate) struct Knobs {
     /// `OAK_IR`: IR dot-projector intensity, clamped to `0..=1` (default 0.8;
     /// 0 disables).
     pub ir: f32,
+    /// `OAK_VIDEO_GATED`: start with the H.264 stream switched OFF (default on),
+    /// for consumers that call `set_video_streaming` / `video_burst` and want no
+    /// bytes on the link before they ask.
+    pub video_gated: bool,
 }
 
 impl Knobs {
@@ -78,6 +82,7 @@ impl Knobs {
             depth_div: int("OAK_DEPTH_DIV").map_or(2, |v| v.min(u32::MAX as i64) as u32),
             subpixel: !matches!(get("OAK_SUBPIXEL").as_deref(), Some("0") | Some("false")),
             ir: get("OAK_IR").map_or(0.8, |s| atof(&s).clamp(0.0, 1.0)),
+            video_gated: int("OAK_VIDEO_GATED").is_some(),
         }
     }
 
@@ -294,6 +299,7 @@ mod tests {
         assert_eq!(k.depth_div, 2);
         assert!(k.subpixel);
         assert_eq!(k.ir, 0.8);
+        assert!(!k.video_gated);
         assert_eq!(k.depth_fps(30), 30);
         assert_eq!(k.rgb_fps(30), 10);
         assert_eq!(k.rgb_fps(5), 5);
@@ -326,6 +332,9 @@ mod tests {
         // atoi semantics: leading integer, junk ignored.
         assert_eq!(knobs(&[("OAK_DEPTH_FPS", "7.5")]).depth_fps(30), 7);
         assert_eq!(knobs(&[("OAK_H264_KBPS", "1500k")]).h264_kbps, 1500);
+        assert!(knobs(&[("OAK_VIDEO_GATED", "1")]).video_gated);
+        assert!(!knobs(&[("OAK_VIDEO_GATED", "0")]).video_gated);
+        assert!(!knobs(&[("OAK_VIDEO_GATED", "off")]).video_gated);
         assert_eq!(knobs(&[("OAK_DEPTH_DIV", "x")]).depth_div, 2);
         assert_eq!(
             knobs(&[("OAK_USB_SPEED", "nonsense")]).usb_speed,

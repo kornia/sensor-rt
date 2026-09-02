@@ -3,11 +3,12 @@
 //! thing it attaches, so that rule cannot drift between the two open paths), and
 //! the calibration readers.
 
-use depthai::node::{Camera, Imu, Node, StereoDepth, VideoEncoder};
+use depthai::node::{Camera, Gate, Imu, Node, StereoDepth, VideoEncoder};
 use depthai::NodeHandle;
 use depthai::{
-    CalibrationHandler, CameraBoardSocket, Device, ImgFrame, ImgFrameType, ImgResizeMode, ImuData,
-    ImuSensor, LengthUnit, Output, OutputQueue, Pipeline, StereoPresetMode, VideoEncoderProfile,
+    CalibrationHandler, CameraBoardSocket, Device, GateControl, ImgFrame, ImgFrameType,
+    ImgResizeMode, ImuData, ImuSensor, InputQueue, LengthUnit, Output, OutputQueue, Pipeline,
+    StereoPresetMode, VideoEncoderProfile,
 };
 
 use crate::calib::{OakCameraCalib, OakCameraModel, OakStereoCalib, StereoCalibError};
@@ -81,17 +82,28 @@ impl Session {
     }
 }
 
-/// Attach an NV12 output of `color` → a hardware H.264 encoder, returning the
-/// bitstream queue. Shared by the video-only, decoupled RGBD and stereo-viz paths
-/// so their encoder settings (BASELINE for Foxglove's decoder, ~4 keyframes/s for
-/// fast mid-stream join, OAK_H264_KBPS) can never drift apart.
+/// The on-device H.264 path: the bitstream queue and the control queue of the
+/// gate in front of the encoder.
+pub(crate) struct H264 {
+    pub(crate) queue: OutputQueue<ImgFrame>,
+    /// Sends [`GateControl`]s: closed = the encoder idles and no video bytes
+    /// cross the link; the camera keeps serving the other outputs.
+    pub(crate) gate: InputQueue,
+}
+
+/// Attach an NV12 output of `color` → `Gate` → hardware H.264 encoder. Shared by
+/// the video-only, decoupled RGBD and stereo-viz paths so their encoder settings
+/// (BASELINE for Foxglove's decoder, ~4 keyframes/s for fast mid-stream join,
+/// OAK_H264_KBPS) can never drift apart. The gate starts open unless
+/// `OAK_VIDEO_GATED` says otherwise, so the stream behaves as it always has until
+/// someone toggles it.
 pub(crate) fn add_h264_encoder(
     s: &Session,
     color: &Camera,
     width: u32,
     height: u32,
     fps: u32,
-) -> depthai::Result<OutputQueue<ImgFrame>> {
+) -> depthai::Result<H264> {
     let nv12 = color.request_output(
         (width, height),
         Some(ImgFrameType::Nv12),
@@ -99,12 +111,21 @@ pub(crate) fn add_h264_encoder(
         Some(fps as f32),
         Some(true),
     )?;
+    let gate = s.pipeline.create::<Gate>()?;
+    nv12.link(&gate.input()?)?;
+    if s.knobs.video_gated {
+        gate.set_initial_config(&GateControl::close()?)?;
+    }
+    let control = gate.input_control()?.create_input_queue(4, false)?;
     let enc = s.pipeline.create::<VideoEncoder>()?;
     enc.set_default_profile_preset(fps as f32, VideoEncoderProfile::H264Baseline)?;
     enc.set_keyframe_frequency((fps / 4).max(4) as i32)?;
     enc.set_bitrate_kbps(s.knobs.h264_kbps)?;
-    nv12.link(&enc.input()?)?;
-    enc.bitstream()?.create_output_queue(30, false)
+    gate.output()?.cast::<ImgFrame>().link(&enc.input()?)?;
+    Ok(H264 {
+        queue: enc.bitstream()?.create_output_queue(30, false)?,
+        gate: control,
+    })
 }
 
 /// The OPTIONAL attach: same encoder settings, but a board that rejects the NV12
@@ -117,7 +138,7 @@ pub(crate) fn try_add_h264_encoder(
     height: u32,
     fps: u32,
     ctx: &str,
-) -> Option<OutputQueue<ImgFrame>> {
+) -> Option<H264> {
     add_h264_encoder(s, color, width, height, fps)
         .map_err(|e| {
             degrade!("H.264 viz stream unavailable on the {ctx} path ({e}) — continuing without it")
