@@ -35,14 +35,13 @@ already tight RGB8 (zero extra copies).
 ## Hard constraints
 
 - **GStreamer + libnvbufsurface are system/JetPack** (build + runtime) — NOT conda.
-- **OAK-D needs the depthai prefix** under `vendor/depthai` (or `DEPTHAI_PREFIX=…`);
-  runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath). The native
-  link now happens in **`depthai-sys`** (kornia/depthai-rs), which bakes an absolute
-  rpath — rebuild from scratch if `vendor/` moves. The source is still the
-  **`vendor/depthai-core` git submodule** pinned to `v3.7.1`:
-  `git submodule update --init --recursive` then `pixi run depthai-build` to
-  produce the prefix. `DEPTHAI_SYS_SKIP_NATIVE=1` gives a check-only build
-  (error-only stub) on a machine without the prefix.
+- **OAK-D needs a depthai-core prefix**: `DEPTHAI_PREFIX=…` (`lib/cmake/depthai`
+  inside), or `cargo build -p sensor-oak --features vendored` to have
+  `depthai-sys` (kornia/depthai-rs) build the pinned source itself. That crate
+  owns the source, the tag pin and the build script now — this repo carries no
+  submodule. It bakes an absolute rpath into every binary (no `LD_LIBRARY_PATH`);
+  rebuild from scratch if the prefix moves. `DEPTHAI_SYS_SKIP_NATIVE=1` gives a
+  check-only build (error-only stub) on a machine without a prefix.
 - **sensor-oak has no C++.** Everything OAK-specific that is a *decision* is Rust:
   the pure rules (`OAK_*` knobs, steady→epoch clock shift, IMU rotation gate, depth
   sizing) in `src/policy.rs` with unit tests; the calibration readers with their
@@ -69,8 +68,7 @@ already tight RGB8 (zero extra copies).
 
 ```bash
 export CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_BUILD_JOBS=2
-export DEPTHAI_PREFIX="$PWD/vendor/depthai"   # or a prefix built by kornia/depthai-rs
-export LD_LIBRARY_PATH=$DEPTHAI_PREFIX/lib
+export DEPTHAI_PREFIX=/path/to/depthai/prefix   # built by kornia/depthai-rs (or --features vendored)
 cargo build -j2
 cargo fmt --all --check
 ```

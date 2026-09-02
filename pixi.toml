@@ -3,8 +3,10 @@ name = "sensor-rt"
 channels = ["conda-forge"]
 platforms = ["linux-aarch64", "linux-64"]
 
-# pixi pins the native toolchain for the OAK-D path (depthai-core v3 builds from source). GStreamer
-# + libnvbufsurface (for sensor-rtsp/nvbuf-sys) are SYSTEM/JetPack, not conda — not listed here.
+# pixi pins the native toolchain the OAK-D path needs when depthai-core is built from source
+# (`cargo build -p sensor-oak --features vendored`, done by kornia/depthai-rs's build script).
+# GStreamer + libnvbufsurface (for sensor-rtsp/nvbuf-sys) are SYSTEM/JetPack, not conda — not
+# listed here.
 # conda-forge / linux-aarch64 / CARGO_BUILD_JOBS cap.
 [dependencies]
 cmake = ">=3.28"
@@ -21,14 +23,3 @@ CARGO_BUILD_JOBS = "2"
 build = "cargo build --release"
 check = "cargo check"
 fmt = "cargo fmt --all"
-
-# --- OAK-D / depthai (moved from vision-rt) ---
-# One-time (~10-30 min, RAM-capped): clone + build depthai-core v3 into vendor/depthai.
-depthai-build = "bash scripts/build_depthai.sh"
-# Archive the prebuilt prefix so it redeploys to another same-arch Jetson WITHOUT rebuilding.
-depthai-pack = "tar -C vendor -czf vendor/depthai-prefix-aarch64.tar.gz depthai"
-# Restore a packaged prefix on a fresh checkout/machine (instead of depthai-build).
-depthai-unpack = "tar -C vendor -xzf vendor/depthai-prefix-aarch64.tar.gz"
-# Build / run the OAK example (links the prebuilt libdepthai-core.so; libusb at runtime from pixi).
-oakd-build = "cargo build --release -p oakd_track3d"
-oakd = "cargo run --release -p oakd_track3d"
