@@ -1,3 +1,0 @@
-[submodule "vendor/depthai-core"]
-	path = vendor/depthai-core
-	url = https://github.com/luxonis/depthai-core.git

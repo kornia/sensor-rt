@@ -28,7 +28,7 @@ the hardware paths are tuned and tested against, not a limit of the design.
 | `crates/nvbuf-sys` | FFI: Jetson `NvBufSurface` → CUDA device ptr from an NVMM DMA-BUF (`links = nvbufsurface`) |
 | `crates/sensor-types` | Frame-timing leaf shared by every driver: `FrameMeta`, `Stamped<T>` (zero deps) |
 | `crates/sensor-rtsp` | RTSP/H.264 source, NVMM → CUDA, emits a device `Image<u8,3>` (GStreamer) |
-| `crates/sensor-oak` | OAK-D **stereo pair + IMU** and **RGBD + H.264**; pure Rust on the [`depthai`](https://github.com/kornia/depthai-rs) safe wrapper (depthai-core v3, built from `vendor/`) |
+| `crates/sensor-oak` | OAK-D **stereo pair + IMU** and **RGBD + H.264**; pure Rust on the [`depthai`](https://github.com/kornia/depthai-rs) safe wrapper (depthai-core v3) |
 
 ## Usage
 
@@ -55,22 +55,23 @@ loop {
 
 ## Building
 
-Native, Jetson-only. All dependencies are public. depthai-core is a git submodule
-built into a local prefix:
+Native, Jetson-only. All dependencies are public. depthai-core comes through
+[kornia/depthai-rs](https://github.com/kornia/depthai-rs), which owns the pinned
+source and the build:
 
 ```bash
-git submodule update --init --recursive
-pixi run depthai-build                # produces vendor/depthai (gitignored)
-cargo build -j2                       # -j2: the 7.4 GB Orin OOMs on parallel native builds
+export DEPTHAI_PREFIX=/path/to/depthai/prefix   # lib/cmake/depthai inside
+cargo build -j2                                  # -j2: the 7.4 GB Orin OOMs on parallel native builds
 ```
 
 - **GStreamer + libnvbufsurface** are system/JetPack (build + runtime), not conda.
-- **OAK-D** builds depthai-core from `vendor/depthai-core` — a git **submodule**
-  pinned to a release tag (currently `v3.7.1`). Fetch it on a fresh checkout with
-  `git clone --recursive …` (or `git submodule update --init --recursive`), then
-  build the install prefix once: `pixi run depthai-build` (→ `vendor/depthai`).
-  Runtime needs `LD_LIBRARY_PATH=…/vendor/depthai/lib` (libusb rpath); override
-  the prefix with `DEPTHAI_PREFIX=…`.
+- **OAK-D** links `libdepthai-core.so` from `DEPTHAI_PREFIX`. No prefix yet? Either
+  build one with depthai-rs's `depthai-sys/scripts/build_depthai.sh` (once, ~30-60
+  min on an Orin, OpenCV off), or let cargo do it:
+  `cargo build -p sensor-oak --features vendored` (needs cmake/ninja/pkg-config,
+  e.g. from `pixi shell`). depthai-sys bakes the prefix's rpath into every binary,
+  so no `LD_LIBRARY_PATH` is needed; rebuild if the prefix moves.
+  `DEPTHAI_SYS_SKIP_NATIVE=1` gives a check-only build without any prefix.
 
 CI runs `cargo fmt --all --check` on a hosted runner (fmt resolves no deps); the
 real build/clippy/test job is gated on a self-hosted Jetson runner (it needs

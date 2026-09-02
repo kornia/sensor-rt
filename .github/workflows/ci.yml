@@ -33,10 +33,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo metadata --locked --format-version 1 > /dev/null
 
-  # Self-hosted Jetson runner: real CUDA + NVMM (GStreamer) + depthai-core, and
-  # the depthai vendor libs available.
-  # Register a runner on the Orin with labels [self-hosted, jetson] and provide
-  # the depthai vendor libs, then remove the `if: false` guard.
+  # Self-hosted Jetson runner: real CUDA + NVMM (GStreamer) and a depthai-core
+  # prefix (built once by kornia/depthai-rs's build script, or `--features vendored`).
+  # Register a runner on the Orin with labels [self-hosted, jetson], set
+  # DEPTHAI_PREFIX on it, then remove the `if: false` guard.
   jetson:
     # NOTE: while this is disabled, NOTHING in CI compiles — `fmt` only parses and
     # `deps` only resolves. A signature change that misses a caller reaches main.
@@ -44,11 +44,9 @@ jobs:
     runs-on: [self-hosted, jetson]
     env:
       CARGO_BUILD_JOBS: "2" # 7.4 GB RAM — parallel native builds OOM the box
-      LD_LIBRARY_PATH: ${{ github.workspace }}/vendor/depthai/lib
+      DEPTHAI_PREFIX: /opt/depthai # lib/cmake/depthai inside; depthai-sys bakes the rpath
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive # depthai-core source for the native shim build
       - name: Build workspace
         run: cargo build -j2
       - name: Clippy

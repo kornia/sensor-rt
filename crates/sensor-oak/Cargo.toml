@@ -28,6 +28,10 @@ kornia-image  = { workspace = true }
 # For the borrowed (zero-copy) image storage — see OakStereoFrame::left_image.
 sensor-types  = { workspace = true }
 
+[features]
+# Build depthai-core from depthai-rs's pinned source instead of linking DEPTHAI_PREFIX.
+vendored = ["depthai-sys/vendored"]
+
 [dev-dependencies]
 # Examples only. The driver itself needs none of this — see the note above.
 vrt        = { workspace = true }
