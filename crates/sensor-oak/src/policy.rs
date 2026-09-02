@@ -14,7 +14,7 @@ use depthai::{ImgFrame, Message, UsbSpeed};
 
 /// A zero frame rate means "default", never "1 fps": it would poison the encoder
 /// preset, the requested output rate and the Sync threshold.
-pub(crate) const DEFAULT_FPS: u32 = 30;
+const DEFAULT_FPS: u32 = 30;
 
 pub(crate) fn fps_or_default(fps: u32) -> u32 {
     if fps == 0 {
@@ -24,13 +24,29 @@ pub(crate) fn fps_or_default(fps: u32) -> u32 {
     }
 }
 
+/// The BNO086 gyro tops out at 400 Hz; a wilder rate makes the firmware's
+/// sensor-enable throw at `pipeline.start()`, which fails the WHOLE open — losing
+/// the imagery over an IMU rate. Clamped rather than surfaced as a device error.
+pub(crate) fn clamp_imu_hz(imu_hz: u32) -> u32 {
+    if imu_hz > 400 {
+        degrade!("imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
+        return 400;
+    }
+    imu_hz
+}
+
+/// A device selector as the public API takes it: `None` or `""` = any device.
+pub(crate) fn device_id(id: Option<&str>) -> Option<&str> {
+    id.filter(|s| !s.is_empty())
+}
+
 // ---------------------------------------------------------------------------
 // Environment knobs (`OAK_*`), read once per open
 // ---------------------------------------------------------------------------
 
 /// The `OAK_*` environment knobs, parsed once at open and passed down, so the
 /// graph builders are pure functions of their arguments.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct Knobs {
     /// `OAK_USB_SPEED`: cap the USB link. Default HIGH (USB2): the SUPER default
     /// boots the device into a USB3 descriptor, and on a physical USB2 link the
@@ -54,6 +70,11 @@ pub(crate) struct Knobs {
     /// `OAK_IR`: IR dot-projector intensity, clamped to `0..=1` (default 0.8;
     /// 0 disables).
     pub ir: f32,
+    /// `OAK_VIDEO_GATED`: start with the H.264 stream switched OFF (default on),
+    /// for consumers that call `set_video_streaming` / `video_burst` and want no
+    /// bytes on the link before they ask. Opt-in, so a truthy integer (unlike
+    /// `OAK_SUBPIXEL`, an opt-out).
+    pub video_gated: bool,
 }
 
 impl Knobs {
@@ -67,17 +88,19 @@ impl Knobs {
     /// OFF), exactly as they always were.
     pub(crate) fn parse(get: impl Fn(&str) -> Option<String>) -> Self {
         let int = |k: &str| get(k).map(|s| atoi(&s)).filter(|&v| v >= 1);
+        let u32_knob = |k: &str| int(k).map(|v| u32::try_from(v).unwrap_or(u32::MAX));
         Knobs {
             usb_speed: match get("OAK_USB_SPEED").as_deref() {
                 Some("super") | Some("SUPER") => UsbSpeed::Super,
                 _ => UsbSpeed::High,
             },
-            h264_kbps: int("OAK_H264_KBPS").map_or(2000, |v| v.min(i32::MAX as i64) as i32),
-            depth_fps: int("OAK_DEPTH_FPS").map(|v| v.min(u32::MAX as i64) as u32),
-            rgb_fps: int("OAK_RGB_FPS").map(|v| v.min(u32::MAX as i64) as u32),
-            depth_div: int("OAK_DEPTH_DIV").map_or(2, |v| v.min(u32::MAX as i64) as u32),
+            h264_kbps: int("OAK_H264_KBPS").map_or(2000, |v| i32::try_from(v).unwrap_or(i32::MAX)),
+            depth_fps: u32_knob("OAK_DEPTH_FPS"),
+            rgb_fps: u32_knob("OAK_RGB_FPS"),
+            depth_div: u32_knob("OAK_DEPTH_DIV").unwrap_or(2),
             subpixel: !matches!(get("OAK_SUBPIXEL").as_deref(), Some("0") | Some("false")),
             ir: get("OAK_IR").map_or(0.8, |s| atof(&s).clamp(0.0, 1.0)),
+            video_gated: int("OAK_VIDEO_GATED").is_some(),
         }
     }
 
@@ -170,7 +193,7 @@ pub(crate) fn steady_to_epoch_ns(steady_ns: i64, offset: i128) -> u64 {
 }
 
 /// A frame's capture time on the epoch timeline (frames use the process-wide
-/// cached offset; the IMU drain uses a per-batch one).
+/// cached offset; the IMU drain takes one per call, as the shim always did).
 pub(crate) fn frame_epoch_ns(f: &ImgFrame) -> u64 {
     steady_to_epoch_ns(f.timestamp_ns(), steady_epoch_offset_cached())
 }
@@ -285,6 +308,13 @@ mod tests {
     }
 
     #[test]
+    fn clamp_caps_at_bno086_maximum() {
+        assert_eq!(clamp_imu_hz(200), 200);
+        assert_eq!(clamp_imu_hz(400), 400);
+        assert_eq!(clamp_imu_hz(1000), 400);
+    }
+
+    #[test]
     fn knobs_have_documented_defaults() {
         let k = knobs(&[]);
         assert_eq!(k.usb_speed, UsbSpeed::High);
@@ -294,6 +324,7 @@ mod tests {
         assert_eq!(k.depth_div, 2);
         assert!(k.subpixel);
         assert_eq!(k.ir, 0.8);
+        assert!(!k.video_gated);
         assert_eq!(k.depth_fps(30), 30);
         assert_eq!(k.rgb_fps(30), 10);
         assert_eq!(k.rgb_fps(5), 5);
@@ -326,6 +357,9 @@ mod tests {
         // atoi semantics: leading integer, junk ignored.
         assert_eq!(knobs(&[("OAK_DEPTH_FPS", "7.5")]).depth_fps(30), 7);
         assert_eq!(knobs(&[("OAK_H264_KBPS", "1500k")]).h264_kbps, 1500);
+        assert!(knobs(&[("OAK_VIDEO_GATED", "1")]).video_gated);
+        assert!(!knobs(&[("OAK_VIDEO_GATED", "0")]).video_gated);
+        assert!(!knobs(&[("OAK_VIDEO_GATED", "off")]).video_gated);
         assert_eq!(knobs(&[("OAK_DEPTH_DIV", "x")]).depth_div, 2);
         assert_eq!(
             knobs(&[("OAK_USB_SPEED", "nonsense")]).usb_speed,

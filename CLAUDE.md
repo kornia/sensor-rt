@@ -45,8 +45,8 @@ already tight RGB8 (zero extra copies).
   (error-only stub) on a machine without the prefix.
 - **sensor-oak has no C++.** Everything OAK-specific that is a *decision* is Rust:
   the pure rules (`OAK_*` knobs, steady→epoch clock shift, IMU rotation gate, depth
-  sizing, stride repacks) in `src/policy.rs` / `src/rgbd.rs` with unit tests; the
-  graph builders with their degrade rules and the calibration unit/spec traps in
+  sizing) in `src/policy.rs` with unit tests; the calibration readers with their
+  unit/spec traps in `src/calib.rs`; the graph builders with their degrade rules in
   `src/graph.rs` (device-bound, exercised by the probe examples). The `depthai` crate
   underneath is faithful and unopinionated; do not push policy down into it.
 - **Upstream only**: all `vrt-*` deps come from the public `kornia/vision-rt`. Do
@@ -58,8 +58,9 @@ already tight RGB8 (zero extra copies).
   `submit` + an explicit `stream.synchronize()`); there is no `run()`.
 - **Two OAK modalities, both first-class.** `sensor-oak` exposes stereo+IMU
   (`open_stereo`) AND the restored RGBD + H.264 path (`open_rgbd` /
-  `open_rgbd_video` — colour, aligned depth, on-device H.264, all un-gated since
-  d89fa82), with the on-board IMU available in both. The repo lives at the
+  `open_rgbd_video` — colour, aligned depth, on-device H.264, all unconditional since
+  d89fa82), with the on-board IMU available in both. The H.264 stream sits behind a
+  device-side depthai `Gate` (`OakSource::set_video_streaming` / `video_burst`). The repo lives at the
   **kornia org** (`kornia/sensor-rt`); downstream consumers no longer need the
   old `edgarriba/sensor-rt` pin.
 - **Build cap**: `-j2` (`CARGO_BUILD_JOBS=2`) — parallel heavy builds OOM the 7.4 GB Orin.

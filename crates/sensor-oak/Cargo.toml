@@ -26,7 +26,6 @@ depthai-sys   = { workspace = true }
 thiserror     = { workspace = true }
 kornia-image  = { workspace = true }
 # For the borrowed (zero-copy) image storage — see OakStereoFrame::left_image.
-kornia-tensor = { workspace = true }
 sensor-types  = { workspace = true }
 
 [dev-dependencies]

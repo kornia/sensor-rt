@@ -3,7 +3,7 @@
 //! check for `open_rgbd` after a driver change — compare its numbers before and
 //! after.
 //!
-//! `cargo run --release --example oak_rgbd_probe -- [--device <id>] [--seconds 5] [--no-depth] [--video-only]`
+//! `cargo run --release --example oak_rgbd_probe -- [--device <id>] [--seconds 5] [--no-depth] [--video-only] [--gate]`
 
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,10 @@ struct Args {
     /// video-only pipeline (open_rgbd_video)
     #[argh(switch)]
     video_only: bool,
+    /// after the drain: H.264 off for 2 s, on for 2 s, off, then a 10-frame burst,
+    /// printing what arrived in each window
+    #[argh(switch)]
+    gate: bool,
 }
 
 fn main() -> Result<(), BoxError> {
@@ -108,6 +112,16 @@ fn main() -> Result<(), BoxError> {
         video_bytes / 1024,
         imu_n as f32 / s,
     );
+    if a.gate && src.has_video() {
+        src.set_video_streaming(false)?;
+        video_window(&mut src, "off");
+        src.set_video_streaming(true)?;
+        video_window(&mut src, "on");
+        src.set_video_streaming(false)?;
+        video_window(&mut src, "off again");
+        src.video_burst(10, None)?;
+        video_window(&mut src, "burst(10)");
+    }
     if rgb > 1 {
         println!(
             "rgb timestamps span {:.2}s (epoch ns {first_ts}..{last_ts})",
@@ -119,4 +133,19 @@ fn main() -> Result<(), BoxError> {
         assert_eq!(depth_dims.1 % 2, 0, "depth height must be even (XLink)");
     }
     Ok(())
+}
+
+const GATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// Drain the video queue for one window and print what arrived.
+fn video_window(src: &mut OakSource, what: &str) {
+    let t = Instant::now();
+    let mut n = 0u32;
+    while t.elapsed() < GATE_WINDOW {
+        while src.next_video().is_some() {
+            n += 1;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    println!("video gate {what}: {n} frames in {:?}", GATE_WINDOW);
 }
