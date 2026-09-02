@@ -9,9 +9,9 @@
 //!
 //! Everything OAK-specific that is a *decision* lives in Rust here: the pure
 //! rules (`OAK_*` knobs, the steady→epoch clock shift, the IMU rotation gate,
-//! depth sizing, stride repacks) in [`policy`] / [`rgbd`] with unit tests, and
-//! the graph builders with their degrade rules in [`graph`]. The `depthai` crate
-//! underneath is faithful and unopinionated.
+//! depth sizing) in [`policy`] with unit tests, the calibration readers with their
+//! unit/spec traps in [`calib`], and the graph builders with their degrade rules
+//! in [`graph`]. The `depthai` crate underneath is faithful and unopinionated.
 //!
 //! **Nothing here touches CUDA**: frames come out on the host and the consumer owns
 //! any upload, so a process that only wants pixels builds no GPU stack.
@@ -60,12 +60,6 @@ macro_rules! degrade {
 /// are always the RAW factory ones: distorted, and on the stereo path unrectified, so they are
 /// *not* the intrinsics a rectified stereo consumer should use (see
 /// [`OakStereoCalib`]). A wiped EEPROM yields all zeros without an error, so check `fx > 0`.
-///
-/// Defined here rather than pulled from an inference crate: this driver is a plain
-/// producer and must not drag a TensorRT runtime into anything that merely wants
-/// camera frames. Consumers that need a richer camera model (unprojection,
-/// distortion) convert these four numbers into their own type — it is the same
-/// `fx, fy, cx, cy` everywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct OakIntrinsics {
     pub fx: f32,
@@ -85,26 +79,75 @@ pub use imu::ImuSample;
 pub use stereo::OakStereoFrame;
 
 use calib::StereoCalibError;
-use graph::{ImuAttach, Session};
+use graph::H264;
+
+/// One output queue with its "first poll failure logged" latch (a dying device
+/// would otherwise spam every drain).
+pub(crate) struct Q<M: Message> {
+    q: OutputQueue<M>,
+    name: &'static str,
+    warned: Cell<bool>,
+}
+
+impl<M: Message> Q<M> {
+    pub(crate) fn new(q: OutputQueue<M>, name: &'static str) -> Self {
+        Q {
+            q,
+            name,
+            warned: Cell::new(false),
+        }
+    }
+
+    /// Pop (blocking up to `timeout`, or non-blocking when `None`). `Err(())` = a
+    /// device/queue error (logged once): the stream is unusable. `Ok(None)` =
+    /// nothing queued / timed out.
+    pub(crate) fn pop(&self, timeout: Option<Duration>) -> Result<Option<M>, ()> {
+        let r = match timeout {
+            Some(t) => self.q.get(t),
+            None => self.q.try_get(),
+        };
+        r.map_err(|e| {
+            if !self.warned.replace(true) {
+                degrade!("{} poll failed: {e}", self.name);
+            }
+        })
+    }
+}
+
+/// Normalise a frame's row pitch: `stride == 0` is how depthai reports "tight".
+/// `None` when the frame is degenerate (zero-sized), its rows would overlap, or
+/// the buffer is too short (the last row need not be padded).
+pub(crate) fn row_pitch(row: usize, h: usize, stride: usize, len: usize) -> Option<usize> {
+    if row == 0 || h == 0 {
+        return None;
+    }
+    let stride = if stride == 0 { row } else { stride };
+    (stride >= row && len >= (h - 1) * stride + row).then_some(stride)
+}
+
+/// The image queues an open path produced (`None` where a modality does not have
+/// that stream, or degraded). A present queue IS the capability the `has_*`
+/// accessors report.
+#[derive(Default)]
+pub(crate) struct Queues {
+    pub(crate) stereo: Option<Q<MessageGroup>>,
+    pub(crate) rgb: Option<Q<ImgFrame>>,
+    pub(crate) depth: Option<Q<ImgFrame>>,
+    pub(crate) video: Option<H264>,
+}
 
 /// OAK-D source: [`open_stereo`](Self::open_stereo), then [`next_stereo`](Self::next_stereo)
 /// in a loop, draining [`next_imu`](Self::next_imu) alongside it.
-///
-/// Field order matters for drop order: queues first, then the pipeline (stopped
-/// in [`Drop`]), then the device (closed there too).
 pub struct OakSource {
-    // STEREO+IMU modality (open_stereo): Sync'd {left,right} MessageGroup.
-    stereo_q: Option<OutputQueue<MessageGroup>>,
-    // RGBD+H.264 modality (open_rgbd): colour, depth, and video are DECOUPLED — each
-    // on its own queue, pulled independently and paired downstream by timestamp.
-    rgb_q: Option<OutputQueue<ImgFrame>>,
-    depth_q: Option<OutputQueue<ImgFrame>>,
-    video: Option<graph::H264>,
-    // On-board IMU, SHARED by both modalities (optional in each). The `has_*`
-    // accessors derive from these queue options: a present queue IS the capability.
-    imu_q: Option<OutputQueue<ImuData>>,
+    /// STEREO+IMU modality: Sync'd {left,right}. RGBD+H.264 modality: colour, depth
+    /// and video, each on its own queue, paired downstream by timestamp. The IMU is
+    /// optional in both.
+    queues: Queues,
+    imu_q: Option<Q<ImuData>>,
     pipeline: Pipeline,
     device: Device,
+    /// The *requested* size, so callers can size buffers before the first frame;
+    /// each frame reports its own actual dimensions.
     width: u32,
     height: u32,
     seq: u64,
@@ -123,103 +166,9 @@ pub struct OakSource {
     /// Full CAM_B/CAM_C calibration, read once at `open_stereo`; surfaced by
     /// `stereo_calib()`.
     stereo_calib: Result<OakStereoCalib, StereoCalibError>,
-    /// Per-queue "first poll failure logged" latch (a dying device would
-    /// otherwise spam every drain).
-    poll_warned: Cell<u8>,
-}
-
-/// Which queue a poll is for — its bit in `poll_warned`.
-#[derive(Clone, Copy)]
-pub(crate) enum Which {
-    Stereo = 1,
-    Rgb = 2,
-    Depth = 4,
-    Video = 8,
-    Imu = 16,
-}
-
-impl Which {
-    fn name(self) -> &'static str {
-        match self {
-            Which::Stereo => "stereo",
-            Which::Rgb => "rgb",
-            Which::Depth => "depth",
-            Which::Video => "video",
-            Which::Imu => "IMU",
-        }
-    }
-}
-
-/// The image queues an open path produced (all `None` where a modality does not
-/// have that stream, or degraded).
-#[derive(Default)]
-pub(crate) struct Queues {
-    pub(crate) stereo: Option<OutputQueue<MessageGroup>>,
-    pub(crate) rgb: Option<OutputQueue<ImgFrame>>,
-    pub(crate) depth: Option<OutputQueue<ImgFrame>>,
-    pub(crate) video: Option<graph::H264>,
-}
-
-/// Everything an open path produced, beyond the session itself.
-pub(crate) struct Built {
-    pub(crate) queues: Queues,
-    pub(crate) imu: ImuAttach,
-    pub(crate) intr: OakIntrinsics,
-    pub(crate) stereo_calib: Result<OakStereoCalib, StereoCalibError>,
 }
 
 impl OakSource {
-    /// Assemble a source from an opened session (pipeline already started) and
-    /// what its open path built. Capabilities are whatever queues that path managed
-    /// to create — the IMU may be absent on a given board, and `has_sync`/`has_depth`
-    /// depend on the device's calibration, none of which the caller can predict.
-    ///
-    /// `width`/`height` are the *requested* size and are kept only so callers can size
-    /// buffers before the first frame; each frame reports its own actual dimensions.
-    pub(crate) fn from_parts(session: Session, width: u32, height: u32, built: Built) -> Self {
-        Self {
-            stereo_q: built.queues.stereo,
-            rgb_q: built.queues.rgb,
-            depth_q: built.queues.depth,
-            video: built.queues.video,
-            imu_q: built.imu.queue,
-            pipeline: session.pipeline,
-            device: session.dev,
-            width,
-            height,
-            seq: 0,
-            intr: built.intr,
-            imu_rot: built.imu.rot,
-            imu_pending: VecDeque::new(),
-            imu_packets: Vec::new(),
-            imu_ts_skipped: 0,
-            stereo_calib: built.stereo_calib,
-            poll_warned: Cell::new(0),
-        }
-    }
-
-    /// Pop from `q` (blocking up to `timeout`, or non-blocking when `None`).
-    /// `Err(())` = a device/queue error (logged once per queue): the stream is
-    /// unusable. `Ok(None)` = nothing queued / timed out.
-    pub(crate) fn pop<M: Message>(
-        &self,
-        q: &OutputQueue<M>,
-        which: Which,
-        timeout: Option<Duration>,
-    ) -> Result<Option<M>, ()> {
-        let r = match timeout {
-            Some(t) => q.get(t),
-            None => q.try_get(),
-        };
-        r.map_err(|e| {
-            let bit = which as u8;
-            if self.poll_warned.get() & bit == 0 {
-                self.poll_warned.set(self.poll_warned.get() | bit);
-                degrade!("{} poll failed: {e}", which.name());
-            }
-        })
-    }
-
     pub fn intrinsics(&self) -> OakIntrinsics {
         self.intr
     }
@@ -248,6 +197,7 @@ impl OakSource {
 
     fn video_control(&self) -> Result<&depthai::InputQueue, BoxError> {
         Ok(&self
+            .queues
             .video
             .as_ref()
             .ok_or("this source has no H.264 stream")?
@@ -269,7 +219,7 @@ impl OakSource {
 /// was nothing to kick (target absent or healthy), `Err` on a driver error. Blocking — call from the
 /// reconnect path, not the drain loop.
 pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
-    let target = target.filter(|t| !t.is_empty()); // "" = any, like open_*
+    let target = policy::device_id(target);
     let infos = Device::all_available().ctx("enumerate devices")?;
     // The wedge: a PoE device stuck in the bootloader. A healthy device enumerates
     // UNBOOTED / BOOTED / FLASH_BOOTED and opens normally — kicking it would be a
@@ -289,9 +239,10 @@ pub fn kick_wedged_oak(target: Option<&str>) -> Result<bool, BoxError> {
 
 impl Drop for OakSource {
     fn drop(&mut self) {
-        // Stop the pipeline, then gracefully close the XLink connection before the
-        // handles are released, so the firmware isn't torn down mid-stream (avoids a
-        // spurious crash-dump on USB2 disconnect). Errors are irrelevant on the way out.
+        // Stop the pipeline, then gracefully close the XLink connection while every
+        // queue handle is still alive, so the firmware isn't torn down mid-stream
+        // (avoids a spurious crash-dump on USB2 disconnect). Errors are irrelevant on
+        // the way out; field drop order does not matter after this.
         let _ = self.pipeline.stop();
         let _ = self.device.close();
     }

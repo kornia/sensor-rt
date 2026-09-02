@@ -15,10 +15,12 @@
 //! * it is in **metres**, not depthai's default centimetres.
 //!
 //! [`OakStereoCalib::baseline_m`] is derived from the very same extrinsic as the rotation, so the
-//! two can never come from different sources. The read itself lives in
-//! `graph::read_stereo_calib`, where both choices are passed explicitly.
+//! two can never come from different sources; [`read_stereo_calib`] passes both choices
+//! explicitly. The other calibration readers (intrinsics, IMU rotation) live here too.
 
-use crate::{BoxError, OakSource};
+use depthai::{CalibrationHandler, CameraBoardSocket, LengthUnit};
+
+use crate::{policy, BoxError, OakIntrinsics, OakSource};
 
 /// Why a stereo calibration is not available.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -114,6 +116,117 @@ pub struct OakStereoCalib {
     /// `‖t_left_right‖`, metres. ~0.075 on an OAK-D-S2/PRO/Lite; a value near 7.5 or 0.000075
     /// means a unit conversion went wrong somewhere.
     pub baseline_m: f64,
+}
+
+/// Pinhole terms of a depthai 3x3.
+fn pinhole(k: &[[f32; 3]; 3]) -> OakIntrinsics {
+    OakIntrinsics {
+        fx: k[0][0],
+        fy: k[1][1],
+        cx: k[0][2],
+        cy: k[1][2],
+    }
+}
+
+/// One socket's factory intrinsics at the streamed size. A wiped EEPROM or a
+/// missing socket yields ZEROS — fine for viewing, so the failure is swallowed.
+pub(crate) fn read_intrinsics(
+    calib: &CalibrationHandler,
+    socket: CameraBoardSocket,
+    width: u32,
+    height: u32,
+) -> OakIntrinsics {
+    calib
+        .camera_intrinsics(socket, Some((width, height)))
+        .map(|k| pinhole(&k))
+        .unwrap_or_default()
+}
+
+/// Read the FULL CAM_B/CAM_C calibration for a host stereo rectifier: per-eye
+/// intrinsics at the streamed size, per-eye distortion, and the CALIBRATED
+/// left→right extrinsic in METRES.
+///
+/// depthai's own getters default the translation source and unit differently per
+/// method (`getCameraExtrinsics` → calibrated/centimetres, `getBaselineDistance` →
+/// spec/centimetres); either mismatch silently rescales the entire reconstruction,
+/// so both are passed explicitly. A wiped/blank EEPROM yields an error; the caller
+/// decides whether that is fatal (it is, for stereo VIO), so this does not fail
+/// the open.
+pub(crate) fn read_stereo_calib(
+    calib: &CalibrationHandler,
+    width: u32,
+    height: u32,
+) -> Result<OakStereoCalib, StereoCalibError> {
+    let (l, r) = (CameraBoardSocket::CamB, CameraBoardSocket::CamC);
+    let read = || -> depthai::Result<OakStereoCalib> {
+        let kl = calib.camera_intrinsics(l, Some((width, height)))?;
+        let kr = calib.camera_intrinsics(r, Some((width, height)))?;
+        let dl = calib.distortion_coefficients(l)?;
+        let dr = calib.distortion_coefficients(r)?;
+        let ml = calib.distortion_model(l)?;
+        let mr = calib.distortion_model(r)?;
+        let e = calib.camera_extrinsics(l, r, false, LengthUnit::Meter)?;
+        let t = [e[0][3] as f64, e[1][3] as f64, e[2][3] as f64];
+        Ok(OakStereoCalib {
+            width,
+            height,
+            left: eye(&kl, &dl, ml),
+            right: eye(&kr, &dr, mr),
+            r_left_right: std::array::from_fn(|i| std::array::from_fn(|j| e[i][j] as f64)),
+            t_left_right: t,
+            baseline_m: (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt(),
+        })
+    };
+    let c = read().map_err(|e| StereoCalibError::Unreadable(e.to_string()))?;
+    // A present-but-zero extrinsic passes every read above and reaches a rectifier
+    // as NaN remap tables — the exact failure OakStereoCalib promises it cannot carry.
+    if c.baseline_m <= 0.0 {
+        return Err(StereoCalibError::ZeroBaseline);
+    }
+    Ok(c)
+}
+
+fn eye(k: &[[f32; 3]; 3], d: &[f32], model: depthai::CameraModel) -> OakCameraCalib {
+    let p = pinhole(k);
+    let mut dist = [0f64; 14];
+    for (o, &v) in dist.iter_mut().zip(d) {
+        *o = v as f64;
+    }
+    OakCameraCalib {
+        fx: p.fx as f64,
+        fy: p.fy as f64,
+        cx: p.cx as f64,
+        cy: p.cy as f64,
+        dist,
+        n_dist: d.len().min(14),
+        model: OakCameraModel::from_depthai(model),
+    }
+}
+
+/// The IMU-chip → camera-optical rotation from the device calibration, so
+/// `next_imu` can report samples in the camera frame (what gyro priors / gravity
+/// alignment consume). `None` (logged, with the reason) when the EEPROM has no IMU
+/// link or the stored matrix is not a proper rotation: samples then stay in the
+/// raw chip frame.
+pub(crate) fn read_imu_rotation(
+    calib: &CalibrationHandler,
+    socket: CameraBoardSocket,
+) -> Option<[f32; 9]> {
+    let read = || -> Result<[f32; 9], String> {
+        // Unit/spec do not matter for the rotation block, but they are mandatory in
+        // the wrapper; pass the calibrated one for consistency.
+        let t = calib
+            .imu_to_camera_extrinsics(socket, false, LengthUnit::Meter)
+            .map_err(|e| e.to_string())?;
+        let r: [f32; 9] = std::array::from_fn(|i| t[i / 3][i % 3]);
+        policy::validate_rotation(&r).map_err(String::from)?;
+        Ok(r)
+    };
+    read()
+        .map_err(|why| {
+            degrade!("IMU extrinsics rejected ({why}) — IMU samples stay in the raw chip frame")
+        })
+        .ok()
 }
 
 impl OakSource {

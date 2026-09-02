@@ -37,7 +37,7 @@ use sensor_oak::{ImuSample, OakSource};
 
 // 640x400 per eye @30 fps, IMU at 200 Hz. No CUDA stream: the driver never
 // touches the GPU, so the consumer owns any upload.
-let mut cam = OakSource::open_stereo(None, 640, 400, 30, 200)?;
+let mut cam = OakSource::open_stereo(None, 640, 400, 30, 200, false)?;
 let mut imu: Vec<ImuSample> = Vec::new();
 
 loop {

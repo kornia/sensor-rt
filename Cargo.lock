@@ -4709,7 +4709,6 @@ dependencies = [
  "env_logger",
  "kornia-image",
  "kornia-imgproc",
- "kornia-tensor",
  "rerun",
  "sensor-types",
  "thiserror 2.0.18",

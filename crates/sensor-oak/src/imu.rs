@@ -6,22 +6,11 @@
 //! with frames by timestamp.
 //!
 //! Both land on the SAME host-synced epoch timeline (depthai's steady clock shifted
-//! once per drain batch), so no clock alignment step is needed.
+//! by one offset per drain), so no clock alignment step is needed.
 
 use depthai::ImuPacket;
 
 use crate::{policy, OakSource};
-
-/// The BNO086 gyro tops out at 400 Hz; a wilder rate makes the firmware's sensor-enable
-/// throw at `pipeline.start()`, which fails the WHOLE open — losing the imagery over an
-/// IMU rate. Clamped on both open paths rather than surfaced as a device error.
-pub(crate) fn clamp_imu_hz(imu_hz: u32) -> u32 {
-    if imu_hz > 400 {
-        degrade!("imu_hz {imu_hz} clamped to 400 (BNO086 gyro maximum)");
-        return 400;
-    }
-    imu_hz
-}
 
 /// One IMU reading: accelerometer + gyroscope, sampled together.
 ///
@@ -94,12 +83,9 @@ impl OakSource {
     /// Takes `&mut self` like every other poll, so drain it **outside** a held
     /// [`OakStereoFrame`](crate::OakStereoFrame).
     pub fn next_imu(&mut self, out: &mut Vec<ImuSample>, cap: usize) -> usize {
-        let Some(q) = self.imu_q.clone() else {
+        let Some(q) = self.imu_q.as_ref() else {
             return 0;
         };
-        if cap == 0 {
-            return 0;
-        }
         let start = out.len();
         // Leftovers from an earlier over-budget batch go first, in order.
         let take = self.imu_pending.len().min(cap);
@@ -107,33 +93,37 @@ impl OakSource {
 
         // One clock pair for the whole drain, taken only if a batch actually arrives.
         let mut offset: Option<i128> = None;
+        let mut skipped = 0u64;
         while out.len() - start < cap {
-            let Some(batch) = self.pop(&q, crate::Which::Imu, None).ok().flatten() else {
+            let Some(batch) = q.pop(None).ok().flatten() else {
                 break;
             };
             let offset = *offset.get_or_insert_with(policy::steady_epoch_offset_now);
             // A batch pops destructively: convert all of it, hand out what fits, and
             // keep the remainder (in order) for the next call.
-            let mut packets = std::mem::take(&mut self.imu_packets);
-            packets.clear();
-            if let Err(e) = batch.packets_into(&mut packets) {
+            self.imu_packets.clear();
+            if let Err(e) = batch.packets_into(&mut self.imu_packets) {
                 degrade!("IMU batch unreadable: {e}");
             }
-            for p in &packets {
+            for p in &self.imu_packets {
                 match convert_packet(p, self.imu_rot.as_ref(), offset) {
                     Some(s) if out.len() - start < cap => out.push(s),
                     Some(s) => self.imu_pending.push_back(s),
-                    None => self.note_ts_skipped(),
+                    None => skipped += 1,
                 }
             }
-            self.imu_packets = packets;
+        }
+        if skipped > 0 {
+            self.note_ts_skipped(skipped);
         }
         out.len() - start
     }
 
-    fn note_ts_skipped(&mut self) {
-        self.imu_ts_skipped += 1;
-        if self.imu_ts_skipped == 1 || self.imu_ts_skipped.is_multiple_of(1000) {
+    /// Log the running hole count: at the first one, then every 1000th.
+    fn note_ts_skipped(&mut self, n: u64) {
+        let before = self.imu_ts_skipped;
+        self.imu_ts_skipped += n;
+        if before == 0 || self.imu_ts_skipped / 1000 != before / 1000 {
             degrade!(
                 "{} IMU packet(s) skipped (zero-timestamp report hole); a count near half the \
                  requested rate means the gate, not the firmware, sets your IMU rate",
@@ -208,12 +198,5 @@ mod tests {
         let s = convert_packet(&p, Some(&r), 0).unwrap();
         assert_eq!(s.accel, [0.0, 1.0, 0.0]);
         assert_eq!(s.gyro, [-2.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn clamp_caps_at_bno086_maximum() {
-        assert_eq!(clamp_imu_hz(200), 200);
-        assert_eq!(clamp_imu_hz(400), 400);
-        assert_eq!(clamp_imu_hz(1000), 400);
     }
 }

@@ -45,8 +45,8 @@ already tight RGB8 (zero extra copies).
   (error-only stub) on a machine without the prefix.
 - **sensor-oak has no C++.** Everything OAK-specific that is a *decision* is Rust:
   the pure rules (`OAK_*` knobs, steady→epoch clock shift, IMU rotation gate, depth
-  sizing, stride repacks) in `src/policy.rs` / `src/rgbd.rs` with unit tests; the
-  graph builders with their degrade rules and the calibration unit/spec traps in
+  sizing) in `src/policy.rs` with unit tests; the calibration readers with their
+  unit/spec traps in `src/calib.rs`; the graph builders with their degrade rules in
   `src/graph.rs` (device-bound, exercised by the probe examples). The `depthai` crate
   underneath is faithful and unopinionated; do not push policy down into it.
 - **Upstream only**: all `vrt-*` deps come from the public `kornia/vision-rt`. Do
