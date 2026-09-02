@@ -192,8 +192,8 @@ pub(crate) fn steady_to_epoch_ns(steady_ns: i64, offset: i128) -> u64 {
     (steady_ns as i128 + offset).clamp(0, u64::MAX as i128) as u64
 }
 
-/// A frame's capture time on the epoch timeline (frames use the process-wide
-/// cached offset; the IMU drain takes one per call, as the shim always did).
+/// A frame's capture time on the epoch timeline. Frames AND the IMU drain both use the
+/// process-wide cached offset, which is what makes their stamps comparable.
 pub(crate) fn frame_epoch_ns(f: &ImgFrame) -> u64 {
     steady_to_epoch_ns(f.timestamp_ns(), steady_epoch_offset_cached())
 }

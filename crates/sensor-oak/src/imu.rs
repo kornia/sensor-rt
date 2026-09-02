@@ -91,14 +91,15 @@ impl OakSource {
         let take = self.imu_pending.len().min(cap);
         out.extend(self.imu_pending.drain(..take));
 
-        // One clock pair for the whole drain, taken only if a batch actually arrives.
-        let mut offset: Option<i128> = None;
+        // The PROCESS-WIDE cached offset, the same one frames use. Not one pair per drain:
+        // two independently sampled offsets are exactly what `steady_epoch_offset_cached`'s
+        // doc warns about, and this is the IMU half of the pair it is protecting.
+        let offset = policy::steady_epoch_offset_cached();
         let mut skipped = 0u64;
         while out.len() - start < cap {
             let Some(batch) = q.pop(None).ok().flatten() else {
                 break;
             };
-            let offset = *offset.get_or_insert_with(policy::steady_epoch_offset_now);
             // A batch pops destructively: convert all of it, hand out what fits, and
             // keep the remainder (in order) for the next call.
             self.imu_packets.clear();
