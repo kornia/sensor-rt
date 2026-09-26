@@ -9,8 +9,8 @@ rev); `vrt` has no dependency back on sensors.
 
 ## Workspace layout
 
-Flat `crates/` + `examples/`. `vrt`/`kornia` come from git (see root
-`[workspace.dependencies]`); cudarc is 0.19 across the graph to match vision-rt
+Flat `crates/` + `examples/`. `vrt` comes from git (rev-pinned), `kornia` from crates.io (see
+root `[workspace.dependencies]`); cudarc is 0.19 across the graph to match vision-rt
 (shared `CudaStream`/`CudaSlice` for zero-copy interop).
 
 | Crate | lib | Role |
