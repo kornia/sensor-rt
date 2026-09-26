@@ -44,9 +44,9 @@ vrt        = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb3332
 vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
 vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
 vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
-# kornia: the crates.io release, the SAME version vision-rt (branch
-# `chore/kornia-0.1.15-on-xfeat`, spec-only on the rev this crate validates against) and flux
-# name. Any other spec anywhere in the graph yields two Image/Tensor types.
+# kornia from crates.io, as vision-rt (at the rev above) and flux take it: registry versions unify
+# by semver, but a git or path kornia anywhere in the graph is a different package and splits
+# Image/Tensor into two types.
 kornia-image   = { version = "0.1.15", features = ["cuda"] }
 kornia-tensor  = { version = "0.1.15", features = ["cuda"] }
 # One `cuda` feature since rc.5 (it merged the old cudarc/gpu-cuda/gpu-cubecl split).
