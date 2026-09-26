@@ -2282,9 +2282,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kornia-algebra"
-version = "0.1.15"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fe45106513f38d33c31fa96e89287077e774987d447eb4cc358efd9b93c58b0"
+checksum = "38badefbffb6b402e956af3908ea1658438e692502db5d7f01d9798f63e1a3af"
 dependencies = [
  "glam 0.33.2",
  "nalgebra",
@@ -2294,9 +2294,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-image"
-version = "0.1.15"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b076b9d5d73cbade7dfc5c3a220a1cb69121d4cb05273c536457ba858969cc7"
+checksum = "7baeb89055e61de6ca0580e9dd04893052ff4da619836f993dd7ec998b4a128b"
 dependencies = [
  "cudarc",
  "kornia-tensor",
@@ -2307,9 +2307,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-imgproc"
-version = "0.1.15"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54b48689b5e6c96147370cfd6470cf6a3be2d6c258ed774f4a1c040ebc07be1b"
+checksum = "3eeca083d17c225e16b40dde8153d00e846a655c9d250e8690ce6a9ee22070cb"
 dependencies = [
  "cudarc",
  "half",
@@ -2324,9 +2324,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-io"
-version = "0.1.15"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72c93cf25908ea8e34b1e4d4fe3212feb305f0bffa2d54c46a68886749207b57"
+checksum = "d6c8ffe23b6781f704817483d051af459078446b0c79b53b816b87f2d32cf69c"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -2342,9 +2342,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-tensor"
-version = "0.1.15"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c16dcd252915bf9f8a0ed17009b54de2f65a95738cfe5fc63791c7ec557eb1a7"
+checksum = "2e7dc445092435019b0fe1599c95ab4c23aa17f1a8a092403c08765cf059d06a"
 dependencies = [
  "cudarc",
  "num-traits",
@@ -5513,7 +5513,7 @@ dependencies = [
 [[package]]
 name = "trt-sys"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
+source = "git+https://github.com/kornia/vision-rt?rev=a18c363f9c81df09569bd205a3cd1f74f26ae81d#a18c363f9c81df09569bd205a3cd1f74f26ae81d"
 dependencies = [
  "bindgen",
  "cc",
@@ -5714,7 +5714,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vrt"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
+source = "git+https://github.com/kornia/vision-rt?rev=a18c363f9c81df09569bd205a3cd1f74f26ae81d#a18c363f9c81df09569bd205a3cd1f74f26ae81d"
 dependencies = [
  "cudarc",
  "half",
@@ -5727,7 +5727,7 @@ dependencies = [
 [[package]]
 name = "vrt-hub"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
+source = "git+https://github.com/kornia/vision-rt?rev=a18c363f9c81df09569bd205a3cd1f74f26ae81d#a18c363f9c81df09569bd205a3cd1f74f26ae81d"
 dependencies = [
  "cudarc",
  "hf-hub",
@@ -5739,7 +5739,7 @@ dependencies = [
 [[package]]
 name = "vrt-rfdetr"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
+source = "git+https://github.com/kornia/vision-rt?rev=a18c363f9c81df09569bd205a3cd1f74f26ae81d#a18c363f9c81df09569bd205a3cd1f74f26ae81d"
 dependencies = [
  "cudarc",
  "kornia-image",
@@ -5752,7 +5752,7 @@ dependencies = [
 [[package]]
 name = "vrt-xfeat"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
+source = "git+https://github.com/kornia/vision-rt?rev=a18c363f9c81df09569bd205a3cd1f74f26ae81d#a18c363f9c81df09569bd205a3cd1f74f26ae81d"
 dependencies = [
  "cudarc",
  "kornia-image",
