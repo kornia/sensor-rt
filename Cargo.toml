@@ -40,25 +40,20 @@ cudarc = { version = "0.19", default-features = false, features = [
 #     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
 # NOTE: upstream's core crate is named `vrt` outright; the fork called it
 # `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
-vrt        = { git = "https://github.com/kornia/vision-rt", rev = "439fb20c503383ecc666810bb8282335555e4c23" }
-vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "439fb20c503383ecc666810bb8282335555e4c23" }
-vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "439fb20c503383ecc666810bb8282335555e4c23" }
-vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "439fb20c503383ecc666810bb8282335555e4c23" }
-# kornia GPU image/tensor types — the IDENTICAL `branch = "main"` spec string vision-rt
-# now uses (vision-rt `chore/kornia-spec-on-xfeat`, a spec-only commit on the rev this crate
-# already validates against — main has diverged on the vrt-xfeat API): cargo keys a git source on the exact spec, so a
-# differently-spelled pin yields two Image/Tensor types in one graph.
-kornia-image   = { git = "https://github.com/kornia/kornia-rs", branch = "main", features = ["cuda"] }
-kornia-tensor  = { git = "https://github.com/kornia/kornia-rs", branch = "main", features = ["cuda"] }
+vrt        = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
+vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
+vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
+vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
+# kornia: the crates.io release, the SAME version vision-rt (branch
+# `chore/kornia-0.1.15-on-xfeat`, spec-only on the rev this crate validates against) and flux
+# name. Any other spec anywhere in the graph yields two Image/Tensor types.
+kornia-image   = { version = "0.1.15", features = ["cuda"] }
+kornia-tensor  = { version = "0.1.15", features = ["cuda"] }
 # One `cuda` feature since rc.5 (it merged the old cudarc/gpu-cuda/gpu-cubecl split).
 # It covers both the device backend + custom kernels and the residency-aware colour
 # dispatch this workspace needs for gray -> RGB on device.
-#
-# This tag MUST match the one vision-rt pins: two kornia versions in one graph means
-# two distinct Image/Tensor types, which breaks the shared-type interop. Bump both
-# repos together, or neither.
-kornia-imgproc = { git = "https://github.com/kornia/kornia-rs", branch = "main", features = ["cuda"] }
-kornia-io      = { git = "https://github.com/kornia/kornia-rs", branch = "main" }
+kornia-imgproc = { version = "0.1.15", features = ["cuda"] }
+kornia-io      = "0.1.15"
 # depthai-core, via the safe `depthai` wrapper (kornia/depthai-rs). sensor-oak
 # holds no C++ any more; depthai-sys builds/links the native shim against the
 # prefix named by DEPTHAI_PREFIX (see CLAUDE.md). Pinned by rev like vision-rt.

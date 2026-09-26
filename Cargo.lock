@@ -2282,8 +2282,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kornia-algebra"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fe45106513f38d33c31fa96e89287077e774987d447eb4cc358efd9b93c58b0"
 dependencies = [
  "glam 0.33.2",
  "nalgebra",
@@ -2293,8 +2294,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-image"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b076b9d5d73cbade7dfc5c3a220a1cb69121d4cb05273c536457ba858969cc7"
 dependencies = [
  "cudarc",
  "kornia-tensor",
@@ -2305,8 +2307,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-imgproc"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54b48689b5e6c96147370cfd6470cf6a3be2d6c258ed774f4a1c040ebc07be1b"
 dependencies = [
  "cudarc",
  "half",
@@ -2321,8 +2324,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-io"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72c93cf25908ea8e34b1e4d4fe3212feb305f0bffa2d54c46a68886749207b57"
 dependencies = [
  "image-webp",
  "jpeg-encoder",
@@ -2338,8 +2342,9 @@ dependencies = [
 
 [[package]]
 name = "kornia-tensor"
-version = "0.1.15-rc.5"
-source = "git+https://github.com/kornia/kornia-rs?branch=main#e2148e864a1b63a8fe094b89175273ef08823183"
+version = "0.1.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c16dcd252915bf9f8a0ed17009b54de2f65a95738cfe5fc63791c7ec557eb1a7"
 dependencies = [
  "cudarc",
  "num-traits",
@@ -3250,7 +3255,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -5508,7 +5513,7 @@ dependencies = [
 [[package]]
 name = "trt-sys"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
+source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
 dependencies = [
  "bindgen",
  "cc",
@@ -5709,7 +5714,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 [[package]]
 name = "vrt"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
+source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
 dependencies = [
  "cudarc",
  "half",
@@ -5722,7 +5727,7 @@ dependencies = [
 [[package]]
 name = "vrt-hub"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
+source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
 dependencies = [
  "cudarc",
  "hf-hub",
@@ -5734,7 +5739,7 @@ dependencies = [
 [[package]]
 name = "vrt-rfdetr"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
+source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
 dependencies = [
  "cudarc",
  "kornia-image",
@@ -5747,7 +5752,7 @@ dependencies = [
 [[package]]
 name = "vrt-xfeat"
 version = "0.1.0"
-source = "git+https://github.com/kornia/vision-rt?rev=439fb20c503383ecc666810bb8282335555e4c23#439fb20c503383ecc666810bb8282335555e4c23"
+source = "git+https://github.com/kornia/vision-rt?rev=3a867d4fb33321c0e68cb067c817d89dc897b6b3#3a867d4fb33321c0e68cb067c817d89dc897b6b3"
 dependencies = [
  "cudarc",
  "kornia-image",
