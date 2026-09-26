@@ -40,20 +40,20 @@ cudarc = { version = "0.19", default-features = false, features = [
 #     sensor-rt needs NO patch to vision-rt to keep several frames in flight.
 # NOTE: upstream's core crate is named `vrt` outright; the fork called it
 # `vision-rt` and remapped it with `package = "vision-rt"`. That remap is gone.
-vrt        = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
-vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
-vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
-vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "3a867d4fb33321c0e68cb067c817d89dc897b6b3" }
+vrt        = { git = "https://github.com/kornia/vision-rt", rev = "a18c363f9c81df09569bd205a3cd1f74f26ae81d" }
+vrt-xfeat  = { git = "https://github.com/kornia/vision-rt", rev = "a18c363f9c81df09569bd205a3cd1f74f26ae81d" }
+vrt-rfdetr = { git = "https://github.com/kornia/vision-rt", rev = "a18c363f9c81df09569bd205a3cd1f74f26ae81d" }
+vrt-hub    = { git = "https://github.com/kornia/vision-rt", rev = "a18c363f9c81df09569bd205a3cd1f74f26ae81d" }
 # kornia from crates.io, as vision-rt (at the rev above) and flux take it: registry versions unify
 # by semver, but a git or path kornia anywhere in the graph is a different package and splits
 # Image/Tensor into two types.
-kornia-image   = { version = "0.1.15", features = ["cuda"] }
-kornia-tensor  = { version = "0.1.15", features = ["cuda"] }
+kornia-image   = { version = "0.2.0", features = ["cuda"] }
+kornia-tensor  = { version = "0.2.0", features = ["cuda"] }
 # One `cuda` feature since rc.5 (it merged the old cudarc/gpu-cuda/gpu-cubecl split).
 # It covers both the device backend + custom kernels and the residency-aware colour
 # dispatch this workspace needs for gray -> RGB on device.
-kornia-imgproc = { version = "0.1.15", features = ["cuda"] }
-kornia-io      = "0.1.15"
+kornia-imgproc = { version = "0.2.0", features = ["cuda"] }
+kornia-io      = "0.2.0"
 # depthai-core, via the safe `depthai` wrapper (kornia/depthai-rs). sensor-oak
 # holds no C++ any more; depthai-sys builds/links the native shim against the
 # prefix named by DEPTHAI_PREFIX (see CLAUDE.md). Pinned by rev like vision-rt.
